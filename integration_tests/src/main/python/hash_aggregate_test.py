@@ -827,14 +827,15 @@ def test_hash_groupby_collect_partial_replace_with_distinct_fallback(data_gen,
                'HashAggregateExec', 'HashPartitioning',
                'ApproximatePercentile', 'Alias', 'Literal', 'AggregateExpression')
 def test_hash_groupby_typed_imperative_agg_without_gpu_implementation_fallback():
+    stmt = "select k, approx_percentile(v, array(0.25, 0.5, 0.75)) from table group by k"
     assert_cpu_and_gpu_are_equal_sql_with_capture(
         lambda spark: gen_df(spark, [('k', RepeatSeqGen(LongGen(), length=20)),
                                      ('v', LongRangeGen())], length=100),
         exist_classes='ApproximatePercentile,ObjectHashAggregateExec',
         non_exist_classes='GpuApproximatePercentile,GpuObjectHashAggregateExec',
         table_name='table',
-        sql="""select k,
-        approx_percentile(v, array(0.25, 0.5, 0.75)) from table group by k""")
+        sql=stmt,
+        conf={'spark.rapids.sql.incompatibleOps.enabled': 'false'})
 
 @approximate_float
 @ignore_order
