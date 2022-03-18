@@ -955,6 +955,12 @@ private case class GpuOrcFileFilterHandler(
       val isCaseSensitive = readerOpts.getIsSchemaEvolutionCaseAware
       val updatedReadSchema = checkSchemaCompatibility(orcReader.getSchema, readerOpts.getSchema,
         isCaseSensitive)
+
+      val includes = readerOpts.getInclude
+      val indices = readerOpts.getSchema.getFieldNames.asScala.zipWithIndex.toMap
+      val updatedIncludes = updatedReadSchema.getFieldNames.asScala.map(i => includes(indices(i)))
+      readerOpts.include(updatedIncludes.toArray)
+
       val evolution = new SchemaEvolution(orcReader.getSchema, updatedReadSchema, readerOpts)
       val (sargApp, sargColumns) = getSearchApplier(evolution,
         orcFileReaderOpts.getUseUTCTimestamp,
