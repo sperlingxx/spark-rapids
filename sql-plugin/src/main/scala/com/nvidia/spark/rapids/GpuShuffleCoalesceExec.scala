@@ -233,28 +233,55 @@ class GpuShuffleCoalesceIterator2(child: Iterator[ColumnarBatch],
 
   private val hostIterator = new HostShuffleCoalesceIterator(child,
     targetSize, dataTypes, metricsMap)
-  @volatile @transient private var deck: HostConcatResult = _
-  @transient private var hostThread: Thread = _
   private var started = false
-  private val lock = new util.concurrent.locks.ReentrantLock()
-  private val notFull = lock.newCondition()
-  private val notEmpty = lock.newCondition()
+  @transient private lazy val buffer = new OneSizeBuffer()
+
+  private class OneSizeBuffer {
+    private val lock = new util.concurrent.locks.ReentrantLock()
+    private val notFull = lock.newCondition()
+    private val notEmpty = lock.newCondition()
+    private var deck: HostConcatResult = _
+
+    def hasNext(): Boolean = {
+      hostIterator.hasNext() || {
+        lock.lock()
+        try {
+          deck != null
+        } finally {
+          lock.unlock()
+        }
+      }
+    }
+
+    def offer(): Unit = {
+      lock.lock()
+      try {
+        while (deck != null) notFull.await()
+        deck = hostIterator.next()
+        notEmpty.signal()
+      } finally {
+        lock.unlock()
+      }
+    }
+
+    def take(): HostConcatResult = {
+      lock.lock()
+      try {
+        while (deck == null) notEmpty.await()
+        val ret = deck
+        deck = null
+        notFull.signal()
+        ret
+      } finally {
+        lock.unlock()
+      }
+    }
+  }
 
   private val hostRunner = new Runnable {
     override def run(): Unit = {
-      lock.lockInterruptibly();
-      try {
-        while (hostIterator.hasNext()) {
-          while (deck != null) {
-            notFull.await()
-          }
-          if (hostIterator.hasNext()) {
-            deck = hostIterator.next()
-            notEmpty.signal()
-          }
-        }
-      } finally {
-        lock.unlock()
+      while (hostIterator.hasNext()) {
+        buffer.offer()
       }
     }
   }
@@ -273,31 +300,16 @@ class GpuShuffleCoalesceIterator2(child: Iterator[ColumnarBatch],
     }
   }
 
-  override def hasNext: Boolean = child.hasNext || deck != null
+  override def hasNext: Boolean = buffer.hasNext()
 
   override def next(): ColumnarBatch = {
     if (!hasNext) {
       throw new NoSuchElementException("No more columnar batches")
     }
-
     if (!started) {
       started = true
-      hostThread = new Thread(hostRunner)
-      hostThread.start()
+      new Thread(hostRunner).start()
     }
-
-    lock.lock()
-    try {
-      while (deck == null) {
-        notEmpty.await()
-      }
-    } finally {
-      lock.unlock()
-    }
-
-    val hostConcatResult = deck
-    deck = null
-    notFull.signal()
-    convertHostBatchToDevice(hostConcatResult)
+    convertHostBatchToDevice(buffer.take())
   }
 }
