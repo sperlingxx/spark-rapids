@@ -18,6 +18,9 @@ package com.nvidia.spark.rapids
 
 import java.util
 
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.Future
+
 import ai.rapids.cudf.{HostConcatResultUtil, HostMemoryBuffer, JCudfSerialization, NvtxColor, NvtxRange}
 import ai.rapids.cudf.JCudfSerialization.{HostConcatResult, SerializedTableHeader}
 import com.nvidia.spark.rapids.shims.ShimUnaryExecNode
@@ -278,11 +281,9 @@ class GpuShuffleCoalesceIterator2(child: Iterator[ColumnarBatch],
     }
   }
 
-  private val hostRunner = new Runnable {
-    override def run(): Unit = {
+  @transient private lazy val hostRunner: Future[Unit] = Future {
       while (hostIterator.hasNext()) {
         buffer.offer()
-      }
     }
   }
 
@@ -306,10 +307,7 @@ class GpuShuffleCoalesceIterator2(child: Iterator[ColumnarBatch],
     if (!hasNext) {
       throw new NoSuchElementException("No more columnar batches")
     }
-    if (!started) {
-      started = true
-      new Thread(hostRunner).start()
-    }
+    hostRunner
     convertHostBatchToDevice(buffer.take())
   }
 }
