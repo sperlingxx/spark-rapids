@@ -31,6 +31,7 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
+
 /**
  * Coalesces serialized tables on the host up to the target batch size before transferring
  * the coalesced result to the GPU. This reduces the overhead of copying data to the GPU
@@ -64,9 +65,7 @@ case class GpuShuffleCoalesceExec(child: SparkPlan, targetBatchByteSize: Long)
     val dataTypes = GpuColumnVector.extractTypes(schema)
 
     child.executeColumnar().mapPartitions { iter =>
-      new GpuShuffleCoalesceIterator(
-        new HostShuffleCoalesceIterator(iter, targetSize, dataTypes, metricsMap),
-        dataTypes, metricsMap)
+      new GpuShuffleCoalesceIterator2(iter, targetSize, dataTypes, metricsMap)
     }
   }
 }
@@ -218,5 +217,87 @@ class GpuShuffleCoalesceIterator(iter: Iterator[HostConcatResult],
         }
       }
     }
+  }
+}
+
+class GpuShuffleCoalesceIterator2(child: Iterator[ColumnarBatch],
+                                  targetSize: Long,
+                                  dataTypes: Array[DataType],
+                                  metricsMap: Map[String, GpuMetric])
+  extends Iterator[ColumnarBatch] with Arm {
+
+  private[this] val semWaitTime = metricsMap(GpuMetric.SEMAPHORE_WAIT_TIME)
+  private[this] val opTimeMetric = metricsMap(GpuMetric.OP_TIME)
+  private[this] val outputBatchesMetric = metricsMap(GpuMetric.NUM_OUTPUT_BATCHES)
+  private[this] val outputRowsMetric = metricsMap(GpuMetric.NUM_OUTPUT_ROWS)
+
+  private val hostIterator = new HostShuffleCoalesceIterator(child,
+    targetSize, dataTypes, metricsMap)
+  @volatile @transient private var deck: HostConcatResult = _
+  @transient private var hostThread: Thread = _
+  private var started = false
+  private val lock = new util.concurrent.locks.ReentrantLock()
+  private val notFull = lock.newCondition()
+  private val notEmpty = lock.newCondition()
+
+  private val hostRunner = new Runnable {
+    override def run(): Unit = {
+      lock.lockInterruptibly();
+      try {
+        while (hostIterator.hasNext()) {
+          while (deck != null) {
+            notFull.await()
+          }
+          if (hostIterator.hasNext()) {
+            deck = hostIterator.next()
+            notEmpty.signal()
+          }
+        }
+      } finally {
+        lock.unlock()
+      }
+    }
+  }
+
+  private def convertHostBatchToDevice(hostConcatResult: HostConcatResult) = {
+    // We acquire the GPU regardless of whether `hostConcatResult`
+    // is an empty batch or not, because the downstream tasks expect
+    // the `GpuShuffleCoalesceIterator` to acquire the semaphore and may
+    // generate GPU data from batches that are empty.
+    GpuSemaphore.acquireIfNecessary(TaskContext.get(), semWaitTime)
+    withResource(new MetricRange(opTimeMetric)) { _ =>
+      val batch = HostConcatResultUtil.getColumnarBatch(hostConcatResult, dataTypes)
+      outputBatchesMetric += 1
+      outputRowsMetric += batch.numRows()
+      batch
+    }
+  }
+
+  override def hasNext: Boolean = child.hasNext || deck != null
+
+  override def next(): ColumnarBatch = {
+    if (!hasNext) {
+      throw new NoSuchElementException("No more columnar batches")
+    }
+
+    if (!started) {
+      started = true
+      hostThread = new Thread(hostRunner)
+      hostThread.start()
+    }
+
+    lock.lock()
+    try {
+      while (deck == null) {
+        notEmpty.await()
+      }
+    } finally {
+      lock.unlock()
+    }
+
+    val hostConcatResult = deck
+    deck = null
+    notFull.signal()
+    convertHostBatchToDevice(hostConcatResult)
   }
 }
