@@ -1306,7 +1306,7 @@ object RapidsConf {
     .doc("test123")
     .internal()
     .booleanConf
-    .createWithDefault(false)
+    .createWithDefault(true)
 
   val FORCE_SHIMCALLER_CLASSLOADER = conf("spark.rapids.force.caller.classloader")
     .doc("Option to statically add shim's parallel world classloader URLs to " +
