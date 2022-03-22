@@ -259,8 +259,8 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     def offer(): Unit = {
       lock.lock()
       try {
-        while (deck != null) notFull.await()
         hasProcessingOne = true
+        while (deck != null) notFull.await()
         deck = child.next()
         notEmpty.signal()
         hasProcessingOne = false
