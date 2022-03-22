@@ -253,24 +253,24 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
     private val lock = new util.concurrent.locks.ReentrantLock()
     private val notFull = lock.newCondition()
     private val notEmpty = lock.newCondition()
-    private var deck: HostConcatResult = _
+    @volatile private var deck: HostConcatResult = _
+    private var hasNext: Option[Boolean] = None
 
-    def nonEmpty: Boolean = {
-      hostIterator.hasNext() || {
-        lock.lock()
-        try {
-          deck != null
-        } finally {
-          lock.unlock()
-        }
-      }
+    def childHasNext: Boolean = hasNext match {
+      case Some(v) => v
+      case None =>
+        hasNext = Some(hostIterator.hasNext())
+        hasNext.get
     }
+
+    def nonEmpty: Boolean = (deck != null) || childHasNext
 
     def offer(): Unit = {
       lock.lock()
       try {
         while (deck != null) notFull.await()
         deck = hostIterator.next()
+        hasNext = None
         notEmpty.signal()
       } finally {
         lock.unlock()
@@ -292,7 +292,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
   }
 
   @transient private lazy val hostRunner: Future[Unit] = Future {
-      while (hostIterator.hasNext()) {
+      while (buffer.childHasNext) {
         buffer.offer()
     }
   }
