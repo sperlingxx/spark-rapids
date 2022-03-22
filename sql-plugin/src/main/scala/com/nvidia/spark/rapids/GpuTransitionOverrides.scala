@@ -70,7 +70,8 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
     if (GpuShuffleEnv.shouldUseRapidsShuffle(rapidsConf)) {
       GpuCoalesceBatches(plan, TargetSize(rapidsConf.gpuTargetBatchSizeBytes))
     } else {
-      GpuShuffleCoalesceExec(plan, rapidsConf.gpuTargetBatchSizeBytes)
+      GpuShuffleCoalesceExec(plan,
+        rapidsConf.gpuTargetBatchSizeBytes, rapidsConf.useAsyncShuffleCoalesce)
     }
   }
 
@@ -119,7 +120,7 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
         // because we need to return an operator that implements `BroadcastExchangeLike` or
         // `ShuffleExchangeLike`.
         bb.child match {
-          case GpuShuffleCoalesceExec(e: GpuShuffleExchangeExecBase, _) if parent.isEmpty =>
+          case GpuShuffleCoalesceExec(e: GpuShuffleExchangeExecBase, _, _) if parent.isEmpty =>
             // The coalesce step gets added back into the plan later on, in a
             // future query stage that reads the output from this query stage. This
             // is handled in the case clauses below.
@@ -249,12 +250,12 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
     case x@GpuShuffledHashJoinExec(
          _, _, _, buildSide, _,
         left: GpuShuffleCoalesceExec,
-        GpuCoalesceBatches(GpuShuffleCoalesceExec(rc, _), _),_) if buildSide == GpuBuildRight =>
+        GpuCoalesceBatches(GpuShuffleCoalesceExec(rc, _, _), _),_) if buildSide == GpuBuildRight =>
       x.withNewChildren(
         Seq(shuffledHashJoinOptimizeShuffle(left), shuffledHashJoinOptimizeShuffle(rc)))
     case x@GpuShuffledHashJoinExec(
          _, _, _, buildSide, _,
-        GpuCoalesceBatches(GpuShuffleCoalesceExec(lc, _), _),
+        GpuCoalesceBatches(GpuShuffleCoalesceExec(lc, _, _), _),
         right: GpuShuffleCoalesceExec, _) if buildSide == GpuBuildLeft =>
       x.withNewChildren(
         Seq(shuffledHashJoinOptimizeShuffle(lc), shuffledHashJoinOptimizeShuffle(right)))
@@ -390,7 +391,7 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
     case exec: GpuShuffleExchangeExecBase =>
       // always follow a GPU shuffle with a shuffle coalesce
       GpuShuffleCoalesceExec(exec.withNewChildren(exec.children.map(insertShuffleCoalesce)),
-        rapidsConf.gpuTargetBatchSizeBytes)
+        rapidsConf.gpuTargetBatchSizeBytes, rapidsConf.useAsyncShuffleCoalesce)
     case exec => exec.withNewChildren(plan.children.map(insertShuffleCoalesce))
   }
 

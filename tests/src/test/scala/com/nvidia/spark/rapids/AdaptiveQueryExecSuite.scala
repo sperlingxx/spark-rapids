@@ -221,8 +221,8 @@ class AdaptiveQueryExecSuite
           shj.children
         }
         assert(childrenToCheck.forall {
-          case GpuShuffleCoalesceExec(_, _) => true
-          case GpuCoalesceBatches(GpuShuffleCoalesceExec(_, _), _) => true
+          case GpuShuffleCoalesceExec(_, _, _) => true
+          case GpuCoalesceBatches(GpuShuffleCoalesceExec(_, _, _), _) => true
           case _ => false
         })
       }

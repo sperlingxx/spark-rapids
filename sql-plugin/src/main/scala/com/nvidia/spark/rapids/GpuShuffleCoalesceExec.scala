@@ -42,7 +42,9 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
  * @note This should ALWAYS appear in the plan after a GPU shuffle when RAPIDS shuffle is
  *       not being used.
  */
-case class GpuShuffleCoalesceExec(child: SparkPlan, targetBatchByteSize: Long)
+case class GpuShuffleCoalesceExec(child: SparkPlan,
+                                  targetBatchByteSize: Long,
+                                  runHostAsync: Boolean)
     extends ShimUnaryExecNode with GpuExec {
 
   import GpuMetric._
@@ -62,28 +64,21 @@ case class GpuShuffleCoalesceExec(child: SparkPlan, targetBatchByteSize: Long)
     throw new IllegalStateException("ROW BASED PROCESSING IS NOT SUPPORTED")
   }
 
-  private val useAsyncShuffleCoalesce = new RapidsConf(child.conf).useAsyncShuffleCoalesce
-
-  private def createShuffleCoalesceIterator(childIterator: Iterator[ColumnarBatch],
-                                            targetSize: Long,
-                                            dataTypes: Array[DataType],
-                                            metricsMap: Map[String, GpuMetric]) = {
-    if (useAsyncShuffleCoalesce) {
-      new GpuAsyncShuffleCoalesceIterator(childIterator, targetSize, dataTypes, metricsMap)
-    } else {
-      new GpuShuffleCoalesceIterator(
-        new HostShuffleCoalesceIterator(childIterator, targetSize, dataTypes, metricsMap),
-        dataTypes, metricsMap)
-    }
-  }
-
   override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val metricsMap = allMetrics
     val targetSize = targetBatchByteSize
     val dataTypes = GpuColumnVector.extractTypes(schema)
 
-    child.executeColumnar().mapPartitions { iter =>
-      createShuffleCoalesceIterator(iter, targetSize, dataTypes, metricsMap)
+    if (runHostAsync) {
+      child.executeColumnar().mapPartitions { iter =>
+        new GpuAsyncShuffleCoalesceIterator(iter, targetSize, dataTypes, metricsMap)
+      }
+    } else {
+      child.executeColumnar().mapPartitions { iter =>
+        new GpuShuffleCoalesceIterator(
+          new HostShuffleCoalesceIterator(iter, targetSize, dataTypes, metricsMap),
+          dataTypes, metricsMap)
+      }
     }
   }
 }
@@ -251,6 +246,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
 
   private val hostIterator = new HostShuffleCoalesceIterator(child,
     targetSize, dataTypes, metricsMap)
+
   @transient private lazy val buffer = new OneSizeBuffer()
 
   private class OneSizeBuffer {
@@ -259,7 +255,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
     private val notEmpty = lock.newCondition()
     private var deck: HostConcatResult = _
 
-    def hasNext(): Boolean = {
+    def nonEmpty: Boolean = {
       hostIterator.hasNext() || {
         lock.lock()
         try {
@@ -315,7 +311,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
     }
   }
 
-  override def hasNext: Boolean = buffer.hasNext()
+  override def hasNext: Boolean = buffer.nonEmpty
 
   override def next(): ColumnarBatch = {
     if (!hasNext) {
