@@ -253,8 +253,9 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     private val notEmpty = lock.newCondition()
     private var deck: HostConcatResult = _
     @volatile private var hasProcessingOne = false
+    private var childIsOpen = true
 
-    def nonEmpty: Boolean = deck != null || hasProcessingOne || child.hasNext
+    def nonEmpty: Boolean =  deck != null || hasProcessingOne || (childIsOpen && child.hasNext)
 
     def offer(): Unit = {
       lock.lock()
@@ -281,12 +282,17 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
         lock.unlock()
       }
     }
+
+    def closeHostIterator(): Unit = {
+      childIsOpen = false
+    }
   }
 
   @transient private lazy val hostRunner: Future[Unit] = Future {
       while (child.hasNext) {
         buffer.offer()
     }
+    buffer.closeHostIterator()
   }
 
   private def convertHostBatchToDevice(hostConcatResult: HostConcatResult) = {
