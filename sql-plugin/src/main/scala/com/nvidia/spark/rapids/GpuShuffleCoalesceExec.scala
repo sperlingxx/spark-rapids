@@ -71,7 +71,9 @@ case class GpuShuffleCoalesceExec(child: SparkPlan,
 
     if (runHostAsync) {
       child.executeColumnar().mapPartitions { iter =>
-        new GpuAsyncShuffleCoalesceIterator(iter, targetSize, dataTypes, metricsMap)
+        new GpuAsyncShuffleCoalesceIterator(
+          new HostShuffleCoalesceIterator(iter, targetSize, dataTypes, metricsMap),
+          dataTypes, metricsMap)
       }
     } else {
       child.executeColumnar().mapPartitions { iter =>
@@ -233,8 +235,7 @@ class GpuShuffleCoalesceIterator(iter: Iterator[HostConcatResult],
   }
 }
 
-class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
-                                      targetSize: Long,
+class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
                                       dataTypes: Array[DataType],
                                       metricsMap: Map[String, GpuMetric])
   extends Iterator[ColumnarBatch] with Arm {
@@ -244,9 +245,6 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
   private[this] val outputBatchesMetric = metricsMap(GpuMetric.NUM_OUTPUT_BATCHES)
   private[this] val outputRowsMetric = metricsMap(GpuMetric.NUM_OUTPUT_ROWS)
 
-  private val hostIterator = new HostShuffleCoalesceIterator(child,
-    targetSize, dataTypes, metricsMap)
-
   @transient private lazy val buffer = new OneSizeBuffer()
 
   private class OneSizeBuffer {
@@ -254,15 +252,18 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
     private val notFull = lock.newCondition()
     private val notEmpty = lock.newCondition()
     private var deck: HostConcatResult = _
+    @volatile private var hasProcessingOne = false
 
-    def nonEmpty: Boolean = deck != null || hostIterator.hasNext()
+    def nonEmpty: Boolean = deck != null || hasProcessingOne || child.hasNext
 
     def offer(): Unit = {
       lock.lock()
       try {
         while (deck != null) notFull.await()
-        deck = hostIterator.next()
+        hasProcessingOne = true
+        deck = child.next()
         notEmpty.signal()
+        hasProcessingOne = false
       } finally {
         lock.unlock()
       }
@@ -283,7 +284,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
   }
 
   @transient private lazy val hostRunner: Future[Unit] = Future {
-      while (hostIterator.hasNext()) {
+      while (child.hasNext) {
         buffer.offer()
     }
   }
@@ -307,9 +308,9 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
   override def hasNext: Boolean = buffer.nonEmpty
 
   override def next(): ColumnarBatch = {
-//    if (!hasNext) {
-//      throw new NoSuchElementException("No more columnar batches")
-//    }
+    if (!hasNext) {
+      throw new NoSuchElementException("No more columnar batches")
+    }
     hostRunner
     convertHostBatchToDevice(buffer.take())
   }
