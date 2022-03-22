@@ -257,6 +257,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     def nonEmpty: Boolean = childIsOpen || deck != null
 
     def offer(): Unit = {
+      println("===== offer start =====")
       lock.lock()
       try {
         while (deck != null) notFull.await()
@@ -264,10 +265,12 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
         notEmpty.signal()
       } finally {
         lock.unlock()
+        println("===== offer end =====")
       }
     }
 
     def take(): HostConcatResult = {
+      println("===== take start =====")
       lock.lock()
       try {
         while (deck == null) notEmpty.await()
@@ -277,6 +280,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
         ret
       } finally {
         lock.unlock()
+        println("===== take end =====")
       }
     }
 
