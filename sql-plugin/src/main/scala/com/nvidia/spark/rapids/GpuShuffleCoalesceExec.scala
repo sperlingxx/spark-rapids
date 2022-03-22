@@ -251,7 +251,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     private val lock = new util.concurrent.locks.ReentrantLock()
     private val notFull = lock.newCondition()
     private val notEmpty = lock.newCondition()
-    private var deck: HostConcatResult = _
+    @volatile private var deck: HostConcatResult = _
     @volatile private var childIsOpen = true
 
     def nonEmpty: Boolean = childIsOpen || deck != null
@@ -293,8 +293,10 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     if (child.hasNext) {
       buffer.offer()
       Future {
+        println("===== Host Runner enter =====")
         while (child.hasNext) buffer.offer()
         buffer.closeHostIterator()
+        println("===== Host Runner exit =====")
       }
       true
     } else {
