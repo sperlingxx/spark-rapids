@@ -304,10 +304,12 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
     // generate GPU data from batches that are empty.
     GpuSemaphore.acquireIfNecessary(TaskContext.get(), semWaitTime)
     withResource(new MetricRange(opTimeMetric)) { _ =>
-      val batch = HostConcatResultUtil.getColumnarBatch(hostConcatResult, dataTypes)
-      outputBatchesMetric += 1
-      outputRowsMetric += batch.numRows()
-      batch
+      withResource(hostConcatResult) { hostConcatBatch =>
+        val batch = HostConcatResultUtil.getColumnarBatch(hostConcatBatch, dataTypes)
+        outputBatchesMetric += 1
+        outputRowsMetric += batch.numRows()
+        batch
+      }
     }
   }
 
