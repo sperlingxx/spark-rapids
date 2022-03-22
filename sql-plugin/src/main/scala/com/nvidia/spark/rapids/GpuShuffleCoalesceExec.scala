@@ -285,12 +285,17 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     }
   }
 
-  @transient private lazy val hostRunner: Future[Unit] = Future {
-      while (child.hasNext) {
-        buffer.offer()
+  @transient private lazy val childIsEmpty: Boolean =
+    if (child.hasNext) {
+      buffer.offer()
+      Future {
+        while (child.hasNext) buffer.offer()
+        buffer.closeHostIterator()
+      }
+      false
+    } else {
+      true
     }
-    buffer.closeHostIterator()
-  }
 
   private def convertHostBatchToDevice(hostConcatResult: HostConcatResult) = {
     // We acquire the GPU regardless of whether `hostConcatResult`
@@ -308,14 +313,13 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     }
   }
 
-  override def hasNext: Boolean = buffer.nonEmpty
+  override def hasNext: Boolean = childIsEmpty && buffer.nonEmpty
 
   override def next(): ColumnarBatch = {
     if (!hasNext) {
       throw new NoSuchElementException("No more columnar batches")
     }
     println("called AsyncShuffleCoalesce.next: ")
-    hostRunner
     convertHostBatchToDevice(buffer.take())
   }
 }
