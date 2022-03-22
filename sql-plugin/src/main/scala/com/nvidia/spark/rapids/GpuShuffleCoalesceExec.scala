@@ -255,16 +255,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
     private val notEmpty = lock.newCondition()
     private var deck: HostConcatResult = _
 
-    def nonEmpty: Boolean = {
-      hostIterator.hasNext() || {
-        lock.lock()
-        try {
-          deck != null
-        } finally {
-          lock.unlock()
-        }
-      }
-    }
+    def nonEmpty: Boolean = deck != null || hostIterator.hasNext()
 
     def offer(): Unit = {
       lock.lock()
@@ -316,9 +307,9 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
   override def hasNext: Boolean = buffer.nonEmpty
 
   override def next(): ColumnarBatch = {
-    if (!hasNext) {
-      throw new NoSuchElementException("No more columnar batches")
-    }
+//    if (!hasNext) {
+//      throw new NoSuchElementException("No more columnar batches")
+//    }
     hostRunner
     convertHostBatchToDevice(buffer.take())
   }
