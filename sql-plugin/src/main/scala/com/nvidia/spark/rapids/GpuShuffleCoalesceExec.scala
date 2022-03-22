@@ -289,19 +289,22 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     }
   }
 
-  @transient private lazy val childNonEmpty: Boolean =
-    if (child.hasNext) {
-      buffer.offer()
-      Future {
-        println("===== Host Runner enter =====")
-        while (child.hasNext) buffer.offer()
-        buffer.closeHostIterator()
-        println("===== Host Runner exit =====")
-      }
-      true
-    } else {
-      false
-    }
+  private var isFirstBatch: Boolean = true
+  private var childIsEmpty: Boolean = _
+
+//  @transient private lazy val childNonEmpty: Boolean =
+//    if (child.hasNext) {
+//      buffer.offer()
+//      Future {
+//        println("===== Host Runner enter =====")
+//        while (child.hasNext) buffer.offer()
+//        buffer.closeHostIterator()
+//        println("===== Host Runner exit =====")
+//      }
+//      true
+//    } else {
+//      false
+//    }
 
   private def convertHostBatchToDevice(hostConcatResult: HostConcatResult) = {
     // We acquire the GPU regardless of whether `hostConcatResult`
@@ -319,7 +322,26 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     }
   }
 
-  override def hasNext: Boolean = childNonEmpty && buffer.nonEmpty
+  override def hasNext: Boolean = {
+    if (isFirstBatch) {
+      isFirstBatch = false
+      if (child.hasNext) {
+        buffer.offer()
+        Future {
+          println("===== Host Runner enter =====")
+          while (child.hasNext) buffer.offer()
+          buffer.closeHostIterator()
+          println("===== Host Runner exit =====")
+        }
+        childIsEmpty = false
+      } else {
+        childIsEmpty = true
+      }
+      !childIsEmpty
+    } else {
+      !childIsEmpty && buffer.nonEmpty
+    }
+  }
 
   override def next(): ColumnarBatch = {
     if (!hasNext) {
