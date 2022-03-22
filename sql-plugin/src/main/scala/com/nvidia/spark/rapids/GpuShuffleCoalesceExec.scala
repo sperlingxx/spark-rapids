@@ -18,9 +18,6 @@ package com.nvidia.spark.rapids
 
 import java.util
 
-import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.Future
-
 import ai.rapids.cudf.{HostConcatResultUtil, HostMemoryBuffer, JCudfSerialization, NvtxColor, NvtxRange}
 import ai.rapids.cudf.JCudfSerialization.{HostConcatResult, SerializedTableHeader}
 import com.nvidia.spark.rapids.shims.ShimUnaryExecNode
@@ -327,12 +324,12 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
       isFirstBatch = false
       if (child.hasNext) {
         buffer.offer()
-        Future {
+        new Thread(() => {
           println("===== Host Runner enter =====")
           while (child.hasNext) buffer.offer()
           buffer.closeHostIterator()
           println("===== Host Runner exit =====")
-        }
+        }).start()
         childIsEmpty = false
       } else {
         childIsEmpty = true
