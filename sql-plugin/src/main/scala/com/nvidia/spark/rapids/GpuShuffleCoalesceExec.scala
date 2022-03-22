@@ -62,13 +62,28 @@ case class GpuShuffleCoalesceExec(child: SparkPlan, targetBatchByteSize: Long)
     throw new IllegalStateException("ROW BASED PROCESSING IS NOT SUPPORTED")
   }
 
+  private val useAsyncShuffleCoalesce = new RapidsConf(child.conf).useAsyncShuffleCoalesce
+
+  private def createShuffleCoalesceIterator(childIterator: Iterator[ColumnarBatch],
+                                            targetSize: Long,
+                                            dataTypes: Array[DataType],
+                                            metricsMap: Map[String, GpuMetric]) = {
+    if (useAsyncShuffleCoalesce) {
+      new GpuAsyncShuffleCoalesceIterator(childIterator, targetSize, dataTypes, metricsMap)
+    } else {
+      new GpuShuffleCoalesceIterator(
+        new HostShuffleCoalesceIterator(childIterator, targetSize, dataTypes, metricsMap),
+        dataTypes, metricsMap)
+    }
+  }
+
   override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val metricsMap = allMetrics
     val targetSize = targetBatchByteSize
     val dataTypes = GpuColumnVector.extractTypes(schema)
 
     child.executeColumnar().mapPartitions { iter =>
-      new GpuShuffleCoalesceIterator2(iter, targetSize, dataTypes, metricsMap)
+      createShuffleCoalesceIterator(iter, targetSize, dataTypes, metricsMap)
     }
   }
 }
@@ -223,10 +238,10 @@ class GpuShuffleCoalesceIterator(iter: Iterator[HostConcatResult],
   }
 }
 
-class GpuShuffleCoalesceIterator2(child: Iterator[ColumnarBatch],
-                                  targetSize: Long,
-                                  dataTypes: Array[DataType],
-                                  metricsMap: Map[String, GpuMetric])
+class GpuAsyncShuffleCoalesceIterator(child: Iterator[ColumnarBatch],
+                                      targetSize: Long,
+                                      dataTypes: Array[DataType],
+                                      metricsMap: Map[String, GpuMetric])
   extends Iterator[ColumnarBatch] with Arm {
 
   private[this] val semWaitTime = metricsMap(GpuMetric.SEMAPHORE_WAIT_TIME)
@@ -236,7 +251,6 @@ class GpuShuffleCoalesceIterator2(child: Iterator[ColumnarBatch],
 
   private val hostIterator = new HostShuffleCoalesceIterator(child,
     targetSize, dataTypes, metricsMap)
-  private var started = false
   @transient private lazy val buffer = new OneSizeBuffer()
 
   private class OneSizeBuffer {

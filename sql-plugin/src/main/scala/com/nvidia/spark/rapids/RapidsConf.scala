@@ -1302,6 +1302,12 @@ object RapidsConf {
     .booleanConf
     .createWithDefault(true)
 
+  val USE_ASYNC_SHUFFLE_COALESCE = conf("spark.rapids.sql.useAsyncShuffleCoalesce")
+    .doc("test123")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
   val FORCE_SHIMCALLER_CLASSLOADER = conf("spark.rapids.force.caller.classloader")
     .doc("Option to statically add shim's parallel world classloader URLs to " +
       "the classloader of the ShimLoader class, typically Bootstrap classloader. This option" +
@@ -1714,6 +1720,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val allowDisableEntirePlan: Boolean = get(ALLOW_DISABLE_ENTIRE_PLAN)
 
   lazy val useArrowCopyOptimization: Boolean = get(USE_ARROW_OPT)
+
+  lazy val useAsyncShuffleCoalesce: Boolean = get(USE_ASYNC_SHUFFLE_COALESCE)
 
   lazy val getCloudSchemes: Seq[String] =
     DEFAULT_CLOUD_SCHEMES ++ get(CLOUD_SCHEMES).getOrElse(Seq.empty)
