@@ -15,12 +15,13 @@
 import pytest
 
 from marks import allow_non_gpu
-from spark_session import with_cpu_session
+from spark_session import with_cpu_session, with_gpu_session
 
 
 @allow_non_gpu('FileSourceScanExec')
 def test_coalesce_perf():
-    from pyspark.sql.functions import col, sum
+    from pyspark.sql.functions import col, collect_list, size
+    from pyspark.sql import SparkSession
 
     def gen_data(spark, data_path, n_part=10, rows_per_part=100000):
         from pyspark.sql.types import IntegerType, StructField, StructType
@@ -45,4 +46,15 @@ def test_coalesce_perf():
         df.write.parquet(data_path)
 
     path = 'PARQUET_DATA_1234'
-    with_cpu_session(lambda spark: gen_data(spark, path, n_part=1000, rows_per_part=1000000))
+    # with_cpu_session(lambda spark: gen_data(spark, path, n_part=1000, rows_per_part=1000000))
+
+    def fn(spark: SparkSession):
+        return spark.read.parquet(path) \
+            .groupby("a") \
+            .agg(collect_list(col('a')).alias('cc')) \
+            .selectExpr("a", "size(cc)")
+
+    with_gpu_session(
+        lambda spark: fn(spark).collect(),
+        conf={'spark.rapids.shuffle.enabled': 'false',
+              'spark.rapids.sql.useAsyncShuffleCoalesce': 'true'})
