@@ -252,24 +252,16 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     private val notFull = lock.newCondition()
     private val notEmpty = lock.newCondition()
     private var deck: HostConcatResult = _
-    @volatile private var hasProcessingOne = false
-    private var childIsOpen = true
+    @volatile private var childIsOpen = true
 
-    def nonEmpty: Boolean = {
-      deck != null || hasProcessingOne || (childIsOpen && {
-        println("called child.hasNext: ")
-        child.hasNext
-      })
-    }
+    def nonEmpty: Boolean = childIsOpen || deck != null
 
     def offer(): Unit = {
       lock.lock()
       try {
-        hasProcessingOne = true
         while (deck != null) notFull.await()
         deck = child.next()
         notEmpty.signal()
-        hasProcessingOne = false
       } finally {
         lock.unlock()
       }
