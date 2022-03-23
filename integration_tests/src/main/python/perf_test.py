@@ -17,11 +17,12 @@ import pytest
 from marks import allow_non_gpu
 from spark_session import with_cpu_session, with_gpu_session
 
+from pyspark.sql.functions import *
+from pyspark.sql import SparkSession
+
 
 @allow_non_gpu('FileSourceScanExec')
 def test_coalesce_perf():
-    from pyspark.sql.functions import col, collect_list, size
-    from pyspark.sql import SparkSession
 
     def gen_data(spark, data_path, n_part=10, rows_per_part=100000):
         from pyspark.sql.types import IntegerType, StructField, StructType
@@ -33,28 +34,29 @@ def test_coalesce_perf():
             from pyspark.sql import Row
             rd = Random(next(seed_iter))
             for _ in range(rows_per_part):
-                rdVal = rd.randint(0, 10)
-                if rdVal < 6:
-                    yield Row(a=100)
-                elif rdVal < 9:
-                    yield Row(a=200)
+                rdVal = rd.randint(0, 100000)
+                if rdVal % 2 == 0 or rdVal % 3 == 0 or rdVal % 5 == 0 or rdVal % 7 == 0:
+                    yield Row(a=100, b=rdVal)
                 else:
-                    yield Row(a=300)
+                    yield Row(a=200, b=rdVal)
 
         rows = rdd.mapPartitions(rand_gen)
-        df = spark.createDataFrame(rows, StructType([StructField('a', IntegerType(), True)]))
+        schema = StructType([
+            StructField('a', IntegerType(), False), StructField('b', IntegerType(), False)])
+        df = spark.createDataFrame(rows, schema)
         df.write.parquet(data_path)
 
-    path = 'PARQUET_DATA_1234'
-    # with_cpu_session(lambda spark: gen_data(spark, path, n_part=1000, rows_per_part=1000000))
+    path = 'PARQUET_DATA_22'
+    with_cpu_session(lambda spark: gen_data(spark, path, n_part=1000, rows_per_part=1000000))
 
     def fn(spark: SparkSession):
         return spark.read.parquet(path) \
             .groupby("a") \
-            .agg(collect_list(col('a')).alias('cc')) \
+            .agg(collect_set(col('a')).alias('cc')) \
             .selectExpr("a", "size(cc)")
 
     with_gpu_session(
         lambda spark: fn(spark).collect(),
         conf={'spark.rapids.shuffle.enabled': 'false',
-              'spark.rapids.sql.useAsyncShuffleCoalesce': 'true'})
+              'spark.rapids.sql.useAsyncShuffleCoalesce': 'true',
+              'spark.rapids.sql.batchSizeBytes': str(1 << 25)})

@@ -300,20 +300,6 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
   private var isFirstBatch: Boolean = true
   private var childIsEmpty: Boolean = _
 
-//  @transient private lazy val childNonEmpty: Boolean =
-//    if (child.hasNext) {
-//      buffer.offer()
-//      Future {
-//        println("===== Host Runner enter =====")
-//        while (child.hasNext) buffer.offer()
-//        buffer.closeHostIterator()
-//        println("===== Host Runner exit =====")
-//      }
-//      true
-//    } else {
-//      false
-//    }
-
   private def convertHostBatchToDevice(hostConcatResult: HostConcatResult) = {
     // We acquire the GPU regardless of whether `hostConcatResult`
     // is an empty batch or not, because the downstream tasks expect
@@ -332,15 +318,12 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
 
   override def hasNext: Boolean = {
     if (isFirstBatch) {
-      println("===== first call of hasNext =====")
       isFirstBatch = false
       if (child.hasNext) {
         buffer.offer()
         hostConcatThread = new Thread(() => {
-          println("===== Host Runner enter =====")
           while (child.hasNext) buffer.offer()
           buffer.closeHostIterator()
-          println("===== Host Runner exit =====")
         })
         hostConcatThread.start()
         childIsEmpty = false
@@ -349,13 +332,11 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
       }
       !childIsEmpty
     } else {
-      println("===== call of hasNext =====")
       !childIsEmpty && buffer.nonEmpty
     }
   }
 
   override def next(): ColumnarBatch = {
-    println("===== call of next =====")
     if (!hasNext) {
       throw new NoSuchElementException("No more columnar batches")
     }
