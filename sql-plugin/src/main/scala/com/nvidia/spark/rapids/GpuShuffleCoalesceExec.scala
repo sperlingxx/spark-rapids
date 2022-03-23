@@ -253,7 +253,16 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     @volatile private var deck: HostConcatResult = _
     @volatile private var childIsOpen = true
 
-    def nonEmpty: Boolean = childIsOpen || deck != null
+    def nonEmpty: Boolean = deck != null || (if (childIsOpen) {
+        if (!hostConcatThread.isAlive) {
+          val stackTraceMsg = hostConcatThread.getStackTrace.mkString("\n")
+          throw new IllegalStateException(
+            "The host concat thread crashed because: " + stackTraceMsg)
+        }
+        true
+      } else {
+        false
+      })
 
     def offer(): Unit = {
       println("===== offer start =====")
@@ -272,12 +281,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
       println("===== take start =====")
       lock.lock()
       try {
-        while (deck == null) {
-          if (!hostConcatThread.isAlive) {
-            throw new IllegalStateException(hostConcatThread.getStackTrace.mkString("\n"))
-          }
-          notEmpty.await()
-        }
+        while (deck == null) notEmpty.await()
         val ret = deck
         deck = null
         notFull.signal()
