@@ -271,9 +271,9 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
         while (deck != null) notFull.await()
         deck = child.next()
         notEmpty.signal()
+        println("===== offer end =====")
       } finally {
         lock.unlock()
-        println("===== offer end =====")
       }
     }
 
@@ -285,10 +285,10 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
         val ret = deck
         deck = null
         notFull.signal()
+        println("===== take end =====")
         ret
       } finally {
         lock.unlock()
-        println("===== take end =====")
       }
     }
 

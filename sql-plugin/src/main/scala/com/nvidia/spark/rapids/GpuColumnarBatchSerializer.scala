@@ -137,6 +137,8 @@ private class GpuColumnarBatchSerializerInstance(dataSize: GpuMetric) extends Se
     }
   }
 
+  @transient private lazy val taskContext = TaskContext.get()
+
   override def deserializeStream(in: InputStream): DeserializationStream = {
     new DeserializationStream {
       private[this] val dIn: DataInputStream = new DataInputStream(new BufferedInputStream(in))
@@ -145,7 +147,7 @@ private class GpuColumnarBatchSerializerInstance(dataSize: GpuMetric) extends Se
         new Iterator[(Int, ColumnarBatch)] with Arm {
           var toBeReturned: Option[ColumnarBatch] = None
 
-          TaskContext.get().addTaskCompletionListener[Unit]((_: TaskContext) => {
+          taskContext.addTaskCompletionListener[Unit]((_: TaskContext) => {
             toBeReturned.foreach(_.close())
             toBeReturned = None
             dIn.close()
