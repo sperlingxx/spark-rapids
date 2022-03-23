@@ -244,6 +244,8 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
 
   @transient private lazy val buffer = new OneSizeBuffer()
 
+  private var hostConcatThread: Thread = _
+
   private class OneSizeBuffer {
     private val lock = new util.concurrent.locks.ReentrantLock()
     private val notFull = lock.newCondition()
@@ -324,12 +326,13 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
       isFirstBatch = false
       if (child.hasNext) {
         buffer.offer()
-        new Thread(() => {
+        hostConcatThread = new Thread(() => {
           println("===== Host Runner enter =====")
           while (child.hasNext) buffer.offer()
           buffer.closeHostIterator()
           println("===== Host Runner exit =====")
-        }).start()
+        })
+        hostConcatThread.run()
         childIsEmpty = false
       } else {
         childIsEmpty = true
@@ -344,7 +347,9 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
     if (!hasNext) {
       throw new NoSuchElementException("No more columnar batches")
     }
-    println("called AsyncShuffleCoalesce.next: ")
+    if (!hostConcatThread.isAlive) {
+      throw new IllegalStateException(hostConcatThread.getStackTrace.mkString("\n"))
+    }
     convertHostBatchToDevice(buffer.take())
   }
 }
