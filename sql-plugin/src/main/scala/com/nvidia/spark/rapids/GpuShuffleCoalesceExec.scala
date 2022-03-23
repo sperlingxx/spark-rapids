@@ -272,7 +272,12 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
       println("===== take start =====")
       lock.lock()
       try {
-        while (deck == null) notEmpty.await()
+        while (deck == null) {
+          if (!hostConcatThread.isAlive) {
+            throw new IllegalStateException(hostConcatThread.getStackTrace.mkString("\n"))
+          }
+          notEmpty.await()
+        }
         val ret = deck
         deck = null
         notFull.signal()
@@ -323,6 +328,7 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
 
   override def hasNext: Boolean = {
     if (isFirstBatch) {
+      println("===== first call of hasNext =====")
       isFirstBatch = false
       if (child.hasNext) {
         buffer.offer()
@@ -332,23 +338,22 @@ class GpuAsyncShuffleCoalesceIterator(child: Iterator[HostConcatResult],
           buffer.closeHostIterator()
           println("===== Host Runner exit =====")
         })
-        hostConcatThread.run()
+        hostConcatThread.start()
         childIsEmpty = false
       } else {
         childIsEmpty = true
       }
       !childIsEmpty
     } else {
+      println("===== call of hasNext =====")
       !childIsEmpty && buffer.nonEmpty
     }
   }
 
   override def next(): ColumnarBatch = {
+    println("===== call of next =====")
     if (!hasNext) {
       throw new NoSuchElementException("No more columnar batches")
-    }
-    if (!hostConcatThread.isAlive) {
-      throw new IllegalStateException(hostConcatThread.getStackTrace.mkString("\n"))
     }
     convertHostBatchToDevice(buffer.take())
   }
