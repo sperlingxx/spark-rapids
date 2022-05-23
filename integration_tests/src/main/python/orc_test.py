@@ -18,7 +18,7 @@ from asserts import assert_gpu_and_cpu_are_equal_collect, assert_gpu_fallback_co
 from data_gen import *
 from marks import *
 from pyspark.sql.types import *
-from spark_session import with_cpu_session, is_before_spark_320, is_before_spark_330
+from spark_session import with_cpu_session, is_before_spark_320, is_before_spark_330, with_gpu_session
 from parquet_test import _nested_pruning_schemas
 from conftest import is_databricks_runtime
 
@@ -278,8 +278,6 @@ def test_partitioned_read_just_partitions(spark_tmp_path, v1_enabled_list, reade
 @pytest.mark.parametrize('v1_enabled_list', ["", "orc"])
 @pytest.mark.parametrize('reader_confs', reader_opt_confs, ids=idfn)
 def test_merge_schema_read(spark_tmp_path, v1_enabled_list, reader_confs):
-    # Once https://github.com/NVIDIA/spark-rapids/issues/131 is fixed
-    # we should go with a more standard set of generators
     orc_gens = [byte_gen, short_gen, int_gen, long_gen, float_gen, double_gen,
     string_gen, boolean_gen, DateGen(start=date(1590, 1, 1)),
     TimestampGen(start=datetime(1590, 1, 1, tzinfo=timezone.utc))]
@@ -296,6 +294,26 @@ def test_merge_schema_read(spark_tmp_path, v1_enabled_list, reader_confs):
     assert_gpu_and_cpu_are_equal_collect(
             lambda spark : spark.read.option('mergeSchema', 'true').orc(data_path),
             conf=all_confs)
+
+def test_merge_schema_read_1(spark_tmp_path):
+    first_data_path = spark_tmp_path + '/ORC_DATA/key=0'
+    with_cpu_session(
+            lambda spark : gen_df(spark, [('a', int_gen, ('c', int_gen))], length=10).write.orc(first_data_path))
+    second_data_path = spark_tmp_path + '/ORC_DATA/key=1'
+    with_cpu_session(
+            lambda spark : gen_df(spark, [('b', int_gen), ('a', int_gen)], length=10).write.orc(second_data_path))
+    data_path = spark_tmp_path + '/ORC_DATA'
+
+    def fn(spark):
+        df = spark.read.option('mergeSchema', 'true').orc(data_path)
+        print(df.schema)
+        print(df.explain())
+        return df
+
+    assert_gpu_and_cpu_are_equal_collect(fn,
+            conf={'spark.rapids.sql.format.orc.reader.type': 'PERFILE',
+                  'spark.sql.sources.useV1SourceList': ''})
+
 
 @pytest.mark.parametrize('v1_enabled_list', ["", "orc"])
 @pytest.mark.parametrize('reader_confs', reader_opt_confs, ids=idfn)

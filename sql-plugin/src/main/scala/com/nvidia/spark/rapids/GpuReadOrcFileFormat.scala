@@ -60,9 +60,9 @@ class GpuReadOrcFileFormat extends OrcFileFormat with GpuReadFileFormatWithMetri
 object GpuReadOrcFileFormat {
   def tagSupport(meta: SparkPlanMeta[FileSourceScanExec]): Unit = {
     val fsse = meta.wrapped
-    if (fsse.relation.options.getOrElse("mergeSchema", "false").toBoolean) {
-      meta.willNotWorkOnGpu("mergeSchema and schema evolution is not supported yet")
-    }
+//    if (fsse.relation.options.getOrElse("mergeSchema", "false").toBoolean) {
+//      meta.willNotWorkOnGpu("mergeSchema and schema evolution is not supported yet")
+//    }
     GpuOrcScan.tagSupport(
       SparkShimImpl.sessionFromPlan(fsse),
       fsse.requiredSchema,

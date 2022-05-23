@@ -125,9 +125,9 @@ object GpuOrcScan {
   def tagSupport(scanMeta: ScanMeta[OrcScan]): Unit = {
     val scan = scanMeta.wrapped
     val schema = StructType(scan.readDataSchema ++ scan.readPartitionSchema)
-    if (scan.options.getBoolean("mergeSchema", false)) {
-      scanMeta.willNotWorkOnGpu("mergeSchema and schema evolution is not supported yet")
-    }
+//    if (scan.options.getBoolean("mergeSchema", false)) {
+//      scanMeta.willNotWorkOnGpu("mergeSchema and schema evolution is not supported yet")
+//    }
     tagSupport(scan.sparkSession, schema, scanMeta)
   }
 
@@ -147,10 +147,10 @@ object GpuOrcScan {
 
     FileFormatChecks.tag(meta, schema, OrcFormatType, ReadFileOp)
 
-    if (sparkSession.conf
-      .getOption("spark.sql.orc.mergeSchema").exists(_.toBoolean)) {
-      meta.willNotWorkOnGpu("mergeSchema and schema evolution is not supported yet")
-    }
+//    if (sparkSession.conf
+//      .getOption("spark.sql.orc.mergeSchema").exists(_.toBoolean)) {
+//      meta.willNotWorkOnGpu("mergeSchema and schema evolution is not supported yet")
+//    }
   }
 }
 
@@ -668,6 +668,16 @@ class GpuOrcPartitionReader(
         // not reading any data, so return a degenerate ColumnarBatch with the row count
         val numRows = currentStripes.map(_.infoBuilder.getNumberOfRows).sum
         Some(new ColumnarBatch(Array.empty, numRows.toInt))
+      } else if (ctx.updatedReadSchema.isEmpty) {
+        val numRows = currentStripes.map(_.infoBuilder.getNumberOfRows).sum.toInt
+        val nullColumns = readDataSchema.safeMap { f =>
+          GpuColumnVector.columnVectorFromNull(numRows, f.dataType)
+        }
+        withResource(nullColumns) { _ =>
+          withResource(new Table(nullColumns: _*)) { t =>
+            Some(GpuColumnVector.from(t, readDataSchema.toArray.map(_.dataType)))
+          }
+        }
       } else {
         val table = readToTable(currentStripes)
         try {
