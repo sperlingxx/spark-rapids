@@ -424,6 +424,9 @@ case class GpuFileSourceScanExec(
     "filesSize" -> createSizeMetric(ESSENTIAL_LEVEL, "size of files read"),
     GPU_DECODE_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_GPU_DECODE_TIME),
     BUFFER_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_BUFFER_TIME),
+    BUFFER_DATA_TIME -> createNanoTimingMetric(MODERATE_LEVEL, BUFFER_DATA_TIME),
+    BUFFER_META_TIME -> createNanoTimingMetric(MODERATE_LEVEL, BUFFER_META_TIME),
+    BUFFER_RESIZE_TIME -> createNanoTimingMetric(MODERATE_LEVEL, BUFFER_RESIZE_TIME),
     FILTER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_FILTER_TIME)
   ) ++ fileCacheMetrics ++ {
     relation.fileFormat match {

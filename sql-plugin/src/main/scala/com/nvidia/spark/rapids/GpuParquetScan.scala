@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids
 
-import java.io.{Closeable, EOFException, FileNotFoundException, IOException, OutputStream}
+import java.io.{Closeable, EOFException, FileNotFoundException, IOException, OutputStream, PrintWriter}
 import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
@@ -62,6 +62,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
+import org.apache.spark.sql.catalyst.util.rapids.ParquetMetaUtils
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.datasources.{DataSourceUtils, PartitionedFile, PartitioningAwareFileIndex, SchemaColumnConvertNotSupportedException}
@@ -1596,6 +1597,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
     withResource(filePath.getFileSystem(fileHadoopConf).open(filePath)) { in =>
       coalescedRanges.foreach { blockCopy =>
+
         totalBytesCopied += copyDataRange(blockCopy, in, out, copyBuffer)
       }
     }
@@ -1819,6 +1821,11 @@ private case class ParquetDataBlock(dataBlock: BlockMetaData) extends DataBlockB
   override def getRowCount: Long = dataBlock.getRowCount
   override def getReadDataSize: Long = dataBlock.getTotalByteSize
   override def getBlockSize: Long = dataBlock.getColumns.asScala.map(_.getTotalSize).sum
+
+  override protected def extraInfoSummary(writer: PrintWriter): Unit = {
+    writer.println("Parquet extra information: ")
+    ParquetMetaUtils.showDetails(writer, dataBlock.getColumns.asScala)
+  }
 }
 
 /** Parquet extra information containing rebase modes and whether there is int96 timestamp */

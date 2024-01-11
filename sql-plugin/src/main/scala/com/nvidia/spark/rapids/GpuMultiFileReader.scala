@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids
 
-import java.io.{File, IOException}
+import java.io.{File, IOException, PrintWriter}
 import java.net.{URI, URISyntaxException}
 import java.util.concurrent.{Callable, ConcurrentLinkedQueue, ExecutorCompletionService, Future, LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
 
@@ -32,6 +32,7 @@ import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, FILTER_TIME}
 import com.nvidia.spark.rapids.RapidsPluginImplicits.AutoCloseableProducingSeq
 import com.nvidia.spark.rapids.jni.GpuSplitAndRetryOOM
 import org.apache.commons.io.IOUtils
+import org.apache.commons.io.output.StringBuilderWriter
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 
@@ -756,6 +757,21 @@ trait DataBlockBase {
   def getReadDataSize: Long
   // the block size to be used to slice the whole HostMemoryBuffer
   def getBlockSize: Long
+
+  def blockInfoSummary: String = {
+    val stringWriter = new StringBuilderWriter()
+    val writer = new PrintWriter(stringWriter)
+
+    writer.print(s"RowCount: $getRowCount; ")
+    writer.print(s"DataSize: $getReadDataSize; ")
+    writer.println(s"BlockSize: $getBlockSize")
+    extraInfoSummary(writer)
+    writer.flush()
+
+    stringWriter.toString
+  }
+
+  protected def extraInfoSummary(writer: PrintWriter): Unit = {}
 }
 
 /**
@@ -1058,12 +1074,20 @@ abstract class MultiFileCoalescingPartitionReaderBase(
         if (currentChunkMeta.currentChunk.isEmpty) {
           CachedGpuBatchIterator(EmptyTableReader, colTypes)
         } else {
+          val beforeIO = System.currentTimeMillis()
           val (dataBuffer, dataSize) = readPartFiles(currentChunkMeta.currentChunk,
             currentChunkMeta.clippedSchema)
+          val ioCost = System.currentTimeMillis() - beforeIO
+
           if (dataSize == 0) {
             dataBuffer.close()
             CachedGpuBatchIterator(EmptyTableReader, colTypes)
           } else {
+            currentChunkMeta.currentChunk.foreach { case (path, dataBlock) =>
+              logInfo(s"spent ${ioCost / 1000L}ms for reading parquet file($path): ")
+              logInfo(dataBlock.blockInfoSummary)
+            }
+
             startNewBufferRetry
             RmmRapidsRetryIterator.withRetry(dataBuffer, chunkedSplit(_)) { _ =>
               // We don't want to actually close the host buffer until we know that we don't
@@ -1110,7 +1134,11 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       val batchContext = createBatchContext(filesAndBlocks, clippedSchema)
       // First, estimate the output file size for the initial allocating.
       //   the estimated size should be >= size of HEAD + Blocks + FOOTER
-      val initTotalSize = calculateEstimatedBlocksOutputSize(batchContext)
+      val initTotalSize =
+        withResource(new NvtxWithMetrics("Buffer size eval", NvtxColor.ORANGE,
+          metrics("bufferMetaTime"))) { _ =>
+          calculateEstimatedBlocksOutputSize(batchContext)
+        }
       val (buffer, bufferSize, footerOffset, outBlocks) =
         closeOnExcept(HostMemoryBuffer.allocate(initTotalSize)) { hmb =>
           // Second, write header
@@ -1129,15 +1157,21 @@ abstract class MultiFileCoalescingPartitionReaderBase(
             offset += fileBlockSize
           }
 
-          for (future <- tasks.asScala) {
-            val (blocks, bytesRead) = future.get()
-            allOutputBlocks ++= blocks
-            TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
+          withResource(new NvtxWithMetrics("Buffer read data", NvtxColor.PURPLE,
+            metrics("bufferDataTime"))) { _ =>
+            for (future <- tasks.asScala) {
+              val (blocks, bytesRead) = future.get()
+              allOutputBlocks ++= blocks
+              TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
+            }
           }
 
           // Fourth, calculate the final buffer size
-          val finalBufferSize = calculateFinalBlocksOutputSize(offset, allOutputBlocks.toSeq,
-            batchContext)
+          val finalBufferSize = withResource(new NvtxWithMetrics("Buffer size eval",
+            NvtxColor.RED, metrics("bufferMetaTime"))) { _ =>
+            calculateFinalBlocksOutputSize(offset, allOutputBlocks.toSeq,
+              batchContext)
+          }
 
           (hmb, finalBufferSize, offset, allOutputBlocks.toSeq)
         }
@@ -1154,14 +1188,17 @@ abstract class MultiFileCoalescingPartitionReaderBase(
             s"reallocating and copying data to bigger buffer size: $bufferSize")
         }
         // Copy the old buffer to a new allocated bigger buffer and close the old buffer
-        buf = withResource(buffer) { _ =>
-          withResource(new HostMemoryInputStream(buffer, footerOffset)) { in =>
-            // realloc memory and copy
-            closeOnExcept(HostMemoryBuffer.allocate(bufferSize)) { newhmb =>
-              withResource(new HostMemoryOutputStream(newhmb)) { out =>
-                IOUtils.copy(in, out)
+        buf = withResource(new NvtxWithMetrics("Buffer resize time",
+          NvtxColor.RED, metrics("bufferResizeTime"))) { _ =>
+          withResource(buffer) { _ =>
+            withResource(new HostMemoryInputStream(buffer, footerOffset)) { in =>
+              // realloc memory and copy
+              closeOnExcept(HostMemoryBuffer.allocate(bufferSize)) { newhmb =>
+                withResource(new HostMemoryOutputStream(newhmb)) { out =>
+                  IOUtils.copy(in, out)
+                }
+                newhmb
               }
-              newhmb
             }
           }
         }
@@ -1175,9 +1212,11 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       // Closing the original buf and returning a new allocated buffer is allowed, but there is no
       // reason to do that.
       // If you have to do this, please think about to add other abstract methods first.
-      val (finalBuffer, finalBufferSize) = writeFileFooter(buf, totalBufferSize, footerOffset,
-        outBlocks, batchContext)
-
+      val (finalBuffer, finalBufferSize) = withResource(new NvtxWithMetrics("Buffer write footer",
+        NvtxColor.WHITE, metrics("bufferMetaTime"))) { _ =>
+        writeFileFooter(buf, totalBufferSize, footerOffset,
+          outBlocks, batchContext)
+      }
       closeOnExcept(finalBuffer) { _ =>
         // triple check we didn't go over memory
         if (finalBufferSize > totalBufferSize) {
