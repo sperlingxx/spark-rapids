@@ -17,21 +17,24 @@
 package org.apache.spark.sql.execution.datasources.parquet
 
 import java.lang.reflect.Method
+import java.time.ZoneId
 import java.util.TimeZone
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import ai.rapids.cudf.{HostColumnVector, HostMemoryBuffer, Table}
-import com.nvidia.spark.rapids.{DateTimeRebaseMode, GpuDataProducer, GpuMetric, GpuSemaphore, HMBInputFile, RapidsWritableColumnVector}
+import com.nvidia.spark.rapids.{DateTimeRebaseMode, GpuDataProducer, GpuMetric, GpuSemaphore, HMBInputFile, RapidsWritableColumnVector, ShimLoader}
 import com.nvidia.spark.rapids.Arm.withResource
 import org.apache.hadoop.conf.Configuration
-import org.apache.parquet.HadoopReadOptions
+import org.apache.parquet.{HadoopReadOptions, VersionParser}
+import org.apache.parquet.VersionParser.ParsedVersion
 import org.apache.parquet.hadoop.ParquetFileReader
-import org.apache.parquet.schema.MessageType
+import org.apache.parquet.schema.{LogicalTypeAnnotation, MessageType}
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.execution.datasources.parquet.rapids.shims.ShimVectorizedColumnReader
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector
 import org.apache.spark.sql.types.StructType
 
@@ -59,11 +62,39 @@ class VectorizedParquetGpuProducer(
     reader
   }
 
+  private val writerVersion: ParsedVersion = try {
+    VersionParser.parse(pageReader.getFileMetaData.getCreatedBy)
+  } catch {
+    case _: Exception =>
+      // If any problems occur trying to parse the writer version, fallback to sequential reads
+      // if the column is a delta byte array encoding (due to PARQUET-246).
+      null
+  }
+
   // Follow Spark 3.2.1
-  private val colDesc = clippedSchema.getColumns.asScala
-  private val colTypes = clippedSchema.asGroupType().getFields.asScala
-  logWarning(s"ColumnDescriptors ${colDesc.mkString(" | ")}")
-  logWarning(s"ColumnFieldTypes ${colTypes.mkString(" | ")}")
+  private val colDesc = clippedSchema.getColumns
+  private val colTypes = clippedSchema.asGroupType().getFields
+  logWarning(s"ColumnDescriptors ${colDesc.asScala.mkString(" | ")}")
+  logWarning(s"ColumnFieldTypes ${colTypes.asScala.mkString(" | ")}")
+
+  private val updateFactories = {
+    val clz = ShimLoader.getShimClassLoader().loadClass(
+      "org.apache.spark.sql.execution.datasources.parquet.ParquetVectorUpdaterFactory")
+    val constructor = clz.getDeclaredConstructor(
+      classOf[LogicalTypeAnnotation], classOf[ZoneId],
+      classOf[String], classOf[String], classOf[String], classOf[String])
+    constructor.setAccessible(true)
+    colTypes.asScala.map { colType =>
+      constructor.newInstance(
+        colType.getLogicalTypeAnnotation,
+        null,
+        dateRebaseMode.value,
+        TimeZone.getDefault.getID,
+        timestampRebaseMode.value,
+        TimeZone.getDefault.getID
+      ).asInstanceOf[ParquetVectorUpdaterFactory]
+    }.toArray
+  }
 
   // Performed all the host-side reading work before transferring to device
   private lazy val hostBatches: mutable.Queue[Array[HostColumnVector]] = {
@@ -71,31 +102,36 @@ class VectorizedParquetGpuProducer(
     var pages = pageReader.readNextFilteredRowGroup()
 
     while (pages != null) {
-      val readers = colDesc.indices.map { i =>
-        new RapidsParquetColumnReader(
-          colDesc(i),
-          colTypes(i).getLogicalTypeAnnotation,
-          pages.getPageReader(colDesc(i)),
-          pages.getRowIndexes.orElse(null),
-          null,
+      val readers = (0 until colDesc.size()).map { i =>
+        new ShimVectorizedColumnReader(
+          i,
+          colDesc,
+          colTypes,
+          pages,
+          convertTz = null,
           dateRebaseMode.value,
-          TimeZone.getDefault.getID,
           timestampRebaseMode.value,
-          TimeZone.getDefault.getID)
+          int96CDPHive3Compatibility = false,
+          writerVersion)
       }
 
       (0L until pages.getRowCount by rowBatchSize).foreach { from =>
         val batchNum = ((pages.getRowCount - from) min rowBatchSize).toInt
 
         buffer.enqueue(
-          readDataSchema.fields.zip(readers).map { case (f, reader) =>
+          readDataSchema.fields.indices.map { i =>
+            val f = readDataSchema.fields(i)
             val rapidsVec = new RapidsWritableColumnVector(batchNum, f.dataType)
-//            VectorizedParquetGpuProducer.readBatchMethod
-//              .invoke(reader, batchNum.asInstanceOf[AnyRef],
-//                rapidsVec.asInstanceOf[AnyRef])
-            reader.readBatch(batchNum, rapidsVec)
+
+            VectorizedParquetGpuProducer.readBatchMethod
+              .invoke(readers(i), batchNum.asInstanceOf[AnyRef],
+                rapidsVec.asInstanceOf[AnyRef])
+
+            val updater = updateFactories(i).getUpdater(colDesc.get(i), f.dataType)
+            rapidsVec.materializeParquetDict(updater)
+
             rapidsVec.build(true).asInstanceOf[HostColumnVector]
-          }
+          }.toArray
         )
       }
       logWarning(s"PageReader contains ${pages.getRowCount} rows")

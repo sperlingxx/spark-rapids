@@ -16,10 +16,10 @@
 
 package com.nvidia.spark.rapids;
 
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 
@@ -28,6 +28,7 @@ import ai.rapids.cudf.HostColumnVector;
 import ai.rapids.cudf.HostColumnVectorCore;
 import ai.rapids.cudf.HostMemoryBuffer;
 
+import org.apache.spark.sql.execution.datasources.parquet.ParquetVectorUpdater;
 import org.apache.spark.sql.execution.shim.ShimWritableColumnVector;
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector;
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
@@ -69,6 +70,20 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 				data, valid, offsets, children);
 	}
 
+	public void materializeParquetDict(ParquetVectorUpdater updater) {
+		if (dictionary != null) {
+			int numRows = (elementsAppended > 0) ? elementsAppended : capacity;
+			try {
+				Field f = dictionary.getClass().getDeclaredField("dictionary");
+				f.setAccessible(true);
+				org.apache.parquet.column.Dictionary dict = (org.apache.parquet.column.Dictionary) f.get(dictionary);
+				updater.decodeDictionaryIds(numRows, 0, this, getDictionaryIds(), dict);
+			} catch (NoSuchFieldException | IllegalAccessException e) {
+				throw new RuntimeException(e);
+			}
+		}
+	}
+
 	@Override
 	public void putBitMask(int rowId, byte src) {
 		data.setByte(rowId, (byte)(src & 1));
@@ -83,7 +98,8 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	public boolean isValid(int rowId) {
-		return valid.getBoolean(rowId);
+		return true;
+		// return valid.getBoolean(rowId);
 	}
 
 	@Override
@@ -130,7 +146,6 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	public void putByte(int rowId, byte value) {
-		System.err.println("byte: " + value);
 		data.setByte(rowId, value);
 	}
 
@@ -141,13 +156,11 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	public void putBytes(int rowId, int count, byte[] src, int srcIndex) {
-		System.err.println("byte[]: " + Arrays.toString(src));
 		data.setBytes(rowId, src, srcIndex, count);
 	}
 
 	@Override
 	public void putShort(int rowId, short value) {
-		System.err.println("short: " + value);
 		data.setShort(rowId * 2L, value);
 	}
 
@@ -160,19 +173,16 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	public void putShorts(int rowId, int count, short[] src, int srcIndex) {
-		System.err.println("short[]: " + Arrays.toString(src));
 		data.setShorts(rowId * 2L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putShorts(int rowId, int count, byte[] src, int srcIndex) {
-		System.err.println("shortByte[]: " + Arrays.toString(src));
 		data.setBytes(rowId * 2L, src, srcIndex, count * 2L);
 	}
 
 	@Override
 	public void putInt(int rowId, int value) {
-		System.err.println("int: " + value);
 		data.setInt(rowId * 4L, value);
 	}
 
@@ -185,19 +195,16 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	public void putInts(int rowId, int count, int[] src, int srcIndex) {
-		System.err.println("int[]: " + Arrays.toString(src));
 		data.setInts(rowId * 4L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putInts(int rowId, int count, byte[] src, int srcIndex) {
-		System.err.println("intByte[]: " + Arrays.toString(src));
 		data.setBytes(rowId * 4L, src, srcIndex, count * 4L);
 	}
 
 	@Override
 	public void putIntsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		System.err.println("intLittleEndian[]: " + Arrays.toString(src));
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
 		long offset = 4L * rowId;
 		for (int i = 0; i < count; ++i, offset += 4) {
@@ -219,20 +226,16 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	public void putLongs(int rowId, int count, long[] src, int srcIndex) {
-		System.err.println("long[]: " + Arrays.toString(src));
 		data.setLongs(rowId * 8L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putLongs(int rowId, int count, byte[] src, int srcIndex) {
-		System.err.println("longByte[]: " + Arrays.toString(src));
 		data.setBytes(rowId * 8L, src, srcIndex, count * 8L);
 	}
 
 	@Override
 	public void putLongsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		System.err.println("longLittleEndian[]: " + Arrays.toString(src));
-
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
 		long offset = 8L * rowId;
 		for (int i = 0; i < count; ++i, offset += 8) {
@@ -366,6 +369,7 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 			dictionaryIds.reset();
 			dictionaryIds.reserve(capacity);
 		}
+
 		return dictionaryIds;
 	}
 
