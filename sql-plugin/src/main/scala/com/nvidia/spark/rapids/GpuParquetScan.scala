@@ -65,6 +65,7 @@ import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.datasources.{DataSourceUtils, PartitionedFile, PartitioningAwareFileIndex, SchemaColumnConvertNotSupportedException}
+import org.apache.spark.sql.execution.datasources.parquet.VectorizedParquetGpuProducer
 import org.apache.spark.sql.execution.datasources.v2.FileScan
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.internal.SQLConf
@@ -460,11 +461,17 @@ class HMBSeekableInputStream(
   }
 }
 
-class HMBInputFile(buffer: HostMemoryBuffer) extends InputFile {
+class HMBInputFile(buffer: HostMemoryBuffer,
+                   offset: Option[Long] = None,
+                   length: Option[Long] = None) extends InputFile {
 
-  override def getLength: Long = buffer.getLength
+  override def getLength: Long = length.getOrElse(buffer.getLength)
 
-  override def newStream(): SeekableInputStream = new HMBSeekableInputStream(buffer, getLength)
+  override def newStream(): SeekableInputStream = {
+    val is = new HMBSeekableInputStream(buffer, getLength)
+    offset.foreach(is.seek)
+    is
+  }
 }
 
 private case class GpuParquetFileFilterHandler(
@@ -2522,7 +2529,7 @@ class MultiFileCloudParquetPartitionReader(
       val batchIter = readBufferToBatches(buffer.dateRebaseMode,
         buffer.timestampRebaseMode, buffer.hasInt96Timestamps, buffer.clippedSchema,
         buffer.readSchema, buffer.partitionedFile, hmbAndInfo.hmb, hmbAndInfo.bytes,
-        buffer.allPartValues)
+        buffer.allPartValues, hostSideRead = true)
       if (memBuffersAndSize.length > 1) {
         val updatedBuffers = memBuffersAndSize.drop(1)
         currentFileHostBuffers = Some(buffer.copy(memBuffersAndSizes = updatedBuffers))
@@ -2542,7 +2549,8 @@ class MultiFileCloudParquetPartitionReader(
       partedFile: PartitionedFile,
       hostBuffer: HostMemoryBuffer,
       dataSize: Long,
-      allPartValues: Option[Array[(Long, InternalRow)]]): Iterator[ColumnarBatch] = {
+      allPartValues: Option[Array[(Long, InternalRow)]],
+      hostSideRead: Boolean): Iterator[ColumnarBatch] = {
 
     val parseOpts = closeOnExcept(hostBuffer) { _ =>
       getParquetOptions(readDataSchema, clippedSchema, useFieldId)
@@ -2557,18 +2565,28 @@ class MultiFileCloudParquetPartitionReader(
     }
 
     // about to start using the GPU
-    GpuSemaphore.acquireIfNecessary(TaskContext.get())
+    if (!hostSideRead) {
+      GpuSemaphore.acquireIfNecessary(TaskContext.get())
+    }
 
     RmmRapidsRetryIterator.withRetry(hostBuffer, splitBatchSizePolicy) { _ =>
       // The MakeParquetTableProducer will close the input buffer, and that would be bad
       // because we don't want to close it until we know that we are done with it
       hostBuffer.incRefCount()
-      val tableReader = MakeParquetTableProducer(useChunkedReader, conf, currentTargetBatchSize,
-        parseOpts,
-        hostBuffer, 0, dataSize, metrics,
-        dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
-        isSchemaCaseSensitive, useFieldId, readDataSchema, clippedSchema, files,
-        debugDumpPrefix, debugDumpAlways)
+
+      val tableReader = if (hostSideRead) {
+        new VectorizedParquetGpuProducer(conf, currentTargetBatchSize,
+          hostBuffer, 0, dataSize, metrics,
+          dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
+          clippedSchema, readDataSchema)
+      } else {
+        MakeParquetTableProducer(useChunkedReader, conf, currentTargetBatchSize,
+          parseOpts,
+          hostBuffer, 0, dataSize, metrics,
+          dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
+          isSchemaCaseSensitive, useFieldId, readDataSchema, clippedSchema, files,
+          debugDumpPrefix, debugDumpAlways)
+      }
 
       val batchIter = CachedGpuBatchIterator(tableReader, colTypes)
 
