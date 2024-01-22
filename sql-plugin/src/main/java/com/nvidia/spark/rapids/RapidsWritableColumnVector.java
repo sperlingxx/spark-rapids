@@ -16,6 +16,7 @@
 
 package com.nvidia.spark.rapids;
 
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -27,6 +28,7 @@ import ai.rapids.cudf.HostColumnVector;
 import ai.rapids.cudf.HostColumnVectorCore;
 import ai.rapids.cudf.HostMemoryBuffer;
 
+import org.apache.spark.sql.execution.datasources.parquet.ParquetVectorUpdater;
 import org.apache.spark.sql.execution.shim.ShimWritableColumnVector;
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector;
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
@@ -68,6 +70,20 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 				data, valid, offsets, children);
 	}
 
+	public void materializeParquetDict(ParquetVectorUpdater updater) {
+		if (dictionary != null) {
+			int numRows = (elementsAppended > 0) ? elementsAppended : capacity;
+			try {
+				Field f = dictionary.getClass().getDeclaredField("dictionary");
+				f.setAccessible(true);
+				org.apache.parquet.column.Dictionary dict = (org.apache.parquet.column.Dictionary) f.get(dictionary);
+				updater.decodeDictionaryIds(numRows, 0, this, getDictionaryIds(), dict);
+			} catch (NoSuchFieldException | IllegalAccessException e) {
+				throw new RuntimeException(e);
+			}
+		}
+	}
+
 	@Override
 	public void putBitMask(int rowId, byte src) {
 		data.setByte(rowId, (byte)(src & 1));
@@ -82,7 +98,8 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	public boolean isValid(int rowId) {
-		return valid.getBoolean(rowId);
+		return true;
+		// return valid.getBoolean(rowId);
 	}
 
 	@Override

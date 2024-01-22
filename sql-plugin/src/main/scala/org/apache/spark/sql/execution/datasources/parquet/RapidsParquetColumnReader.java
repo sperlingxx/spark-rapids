@@ -22,6 +22,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.time.ZoneId;
 import java.util.PrimitiveIterator;
 
+import com.nvidia.spark.rapids.ShimLoader;
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.bytes.BytesUtils;
@@ -93,7 +94,7 @@ public class RapidsParquetColumnReader {
 		this.pageReader = pageReader;
 
 		try {
-			Class<?> clz = getClass().getClassLoader().loadClass(
+			Class<?> clz = ShimLoader.getShimClassLoader().loadClass(
 					"org.apache.spark.sql.execution.datasources.parquet.ParquetReadState");
 			Constructor<?> constructor = clz.getDeclaredConstructor(int.class, PrimitiveIterator.OfLong.class);
 			constructor.setAccessible(true);
