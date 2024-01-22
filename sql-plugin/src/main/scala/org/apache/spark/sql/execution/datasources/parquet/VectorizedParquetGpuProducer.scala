@@ -17,24 +17,23 @@
 package org.apache.spark.sql.execution.datasources.parquet
 
 import java.lang.reflect.Method
+import java.util.TimeZone
 
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import ai.rapids.cudf.{HostColumnVector, HostMemoryBuffer, Table}
 import com.nvidia.spark.rapids.{DateTimeRebaseMode, GpuDataProducer, GpuMetric, GpuSemaphore, HMBInputFile, RapidsWritableColumnVector}
 import com.nvidia.spark.rapids.Arm.withResource
 import org.apache.hadoop.conf.Configuration
-import org.apache.parquet.{HadoopReadOptions, VersionParser}
-import org.apache.parquet.VersionParser.ParsedVersion
+import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.schema.MessageType
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.execution.datasources.parquet.rapids.shims.ShimVectorizedColumnReader
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector
 import org.apache.spark.sql.types.StructType
-
 
 class VectorizedParquetGpuProducer(
     conf: Configuration,
@@ -50,61 +49,56 @@ class VectorizedParquetGpuProducer(
     readDataSchema: StructType) extends GpuDataProducer[Table] with Logging {
 
   private val pageReader: ParquetFileReader = {
-    val readOpt = HadoopReadOptions.builder(conf).build()
-    val bufferFile = new HMBInputFile(fileBuffer, Some(offset), Some(len))
-    val reader = new ParquetFileReader(bufferFile, readOpt)
+    val options = HadoopReadOptions.builder(conf)
+        .withRange(offset, offset + len)
+        .build()
+    val bufferFile = new HMBInputFile(fileBuffer, length = Some(offset + len))
+    val reader = new ParquetFileReader(bufferFile, options)
     // The fileSchema here has already been clipped
     reader.setRequestedSchema(clippedSchema)
     reader
   }
 
-  val writerVersion: ParsedVersion = try {
-    VersionParser.parse(pageReader.getFileMetaData.getCreatedBy)
-  } catch {
-    case _: Exception =>
-      // If any problems occur trying to parse the writer version, fallback to sequential reads
-      // if the column is a delta byte array encoding (due to PARQUET-246).
-      null
-  }
-
-  // Follow Spark 3.2
-  private val sparkSchema = new ParquetToSparkSchemaConverter(conf).convert(clippedSchema)
-  private val colDesc = clippedSchema.getColumns
-  private val colTypes = clippedSchema.asGroupType().getFields
+  // Follow Spark 3.2.1
+  private val colDesc = clippedSchema.getColumns.asScala
+  private val colTypes = clippedSchema.asGroupType().getFields.asScala
+  logWarning(s"ColumnDescriptors ${colDesc.mkString(" | ")}")
+  logWarning(s"ColumnFieldTypes ${colTypes.mkString(" | ")}")
 
   // Performed all the host-side reading work before transferring to device
   private lazy val hostBatches: mutable.Queue[Array[HostColumnVector]] = {
-
     val buffer = mutable.Queue.empty[Array[HostColumnVector]]
     var pages = pageReader.readNextFilteredRowGroup()
 
     while (pages != null) {
-      val readers = (0 until colDesc.size()).map { i =>
-        new ShimVectorizedColumnReader(
-          i,
-          colDesc,
-          colTypes,
-          pages,
-          convertTz = null,
+      val readers = colDesc.indices.map { i =>
+        new RapidsParquetColumnReader(
+          colDesc(i),
+          colTypes(i).getLogicalTypeAnnotation,
+          pages.getPageReader(colDesc(i)),
+          pages.getRowIndexes.orElse(null),
+          null,
           dateRebaseMode.value,
+          TimeZone.getDefault.getID,
           timestampRebaseMode.value,
-          int96CDPHive3Compatibility = false,
-          writerVersion)
+          TimeZone.getDefault.getID)
       }
 
       (0L until pages.getRowCount by rowBatchSize).foreach { from =>
         val batchNum = ((pages.getRowCount - from) min rowBatchSize).toInt
 
         buffer.enqueue(
-          sparkSchema.fields.zip(readers).map { case (f, reader) =>
+          readDataSchema.fields.zip(readers).map { case (f, reader) =>
             val rapidsVec = new RapidsWritableColumnVector(batchNum, f.dataType)
-            VectorizedParquetGpuProducer.readBatchMethod
-              .invoke(reader, batchNum.asInstanceOf[AnyRef], rapidsVec.asInstanceOf[AnyRef])
-            rapidsVec.build()
+//            VectorizedParquetGpuProducer.readBatchMethod
+//              .invoke(reader, batchNum.asInstanceOf[AnyRef],
+//                rapidsVec.asInstanceOf[AnyRef])
+            reader.readBatch(batchNum, rapidsVec)
+            rapidsVec.build(true).asInstanceOf[HostColumnVector]
           }
         )
       }
-      logWarning(s"HostParquetReader read ${pages.getRowCount} rows")
+      logWarning(s"PageReader contains ${pages.getRowCount} rows")
 
       pages = pageReader.readNextFilteredRowGroup()
     }
@@ -125,8 +119,11 @@ class VectorizedParquetGpuProducer(
         GpuSemaphore.acquireIfNecessary(TaskContext.get())
         firstBatch = false
       }
-      val dCVs = hostCVs.indices.map(i => hostCVs(i).copyToDevice())
-      new Table(dCVs: _*)
+      logWarning(s"hostVector rowCount: ${hostCVs.head.getRowCount}")
+
+      withResource(hostCVs.indices.map(i => hostCVs(i).copyToDevice())) { dCVs =>
+        new Table(dCVs: _*)
+      }
     }
   }
 

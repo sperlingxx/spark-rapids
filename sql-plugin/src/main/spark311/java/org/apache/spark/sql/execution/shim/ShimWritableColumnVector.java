@@ -43,4 +43,11 @@ public abstract class ShimWritableColumnVector extends WritableColumnVector {
 
 	public abstract ByteBuffer byteBuffer(int rowId, int count);
 
+	public abstract boolean isValid(int rowId);
+
+	@Override
+	public boolean isNullAt(int rowId) {
+		return !isValid(rowId);
+	}
+
 }

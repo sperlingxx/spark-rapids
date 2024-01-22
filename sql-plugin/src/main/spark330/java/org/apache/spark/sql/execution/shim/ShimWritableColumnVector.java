@@ -48,6 +48,8 @@ public abstract class ShimWritableColumnVector extends WritableColumnVector {
 
 	public abstract ByteBuffer byteBuffer(int rowId, int count);
 
+	public abstract boolean isValid(int rowId);
+
 	@Override
 	public void putBooleans(int rowId, byte src) {
 		putBitMask(rowId, src);
@@ -56,6 +58,11 @@ public abstract class ShimWritableColumnVector extends WritableColumnVector {
 	@Override
 	public ByteBuffer getByteBuffer(int rowId, int count) {
 		return byteBuffer(rowId, count);
+	}
+
+	@Override
+	public boolean isNullAt(int rowId) {
+		return isAllNull || !isValid(rowId);
 	}
 
 }
