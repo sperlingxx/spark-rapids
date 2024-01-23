@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 
-package com.nvidia.spark.rapids;
+package org.apache.spark.sql.execution.vectorized.rapids;
 
-import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -28,20 +27,17 @@ import ai.rapids.cudf.HostColumnVector;
 import ai.rapids.cudf.HostColumnVectorCore;
 import ai.rapids.cudf.HostMemoryBuffer;
 
-import org.apache.spark.sql.execution.datasources.parquet.ParquetVectorUpdater;
-import org.apache.spark.sql.execution.shim.ShimWritableColumnVector;
-import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector;
-import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
+import com.nvidia.spark.rapids.GpuColumnVector;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.UTF8String;
 
-public class RapidsWritableColumnVector extends ShimWritableColumnVector {
+public class HostWritableColumnVector extends WritableColumnVector {
 
 	private HostMemoryBuffer data;
 	private HostMemoryBuffer valid;
 	private HostMemoryBuffer offsets;
 
-	public RapidsWritableColumnVector(int capacity, DataType type) {
+	public HostWritableColumnVector(int capacity, DataType type) {
 		super(capacity, type);
 		this.capacity = 0;
 		reserveInternal(capacity);
@@ -53,10 +49,10 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 		List<HostColumnVectorCore> children = new ArrayList<>();
 		if (rapidsType == DType.STRING) {
-			data = ((RapidsWritableColumnVector) childColumns[0]).data;
+			data = ((HostWritableColumnVector) childColumns[0]).data;
 		} else if (childColumns != null) {
 			for (WritableColumnVector child : childColumns) {
-				children.add(((RapidsWritableColumnVector) child).build(false));
+				children.add(((HostWritableColumnVector) child).build(false));
 			}
 		}
 
@@ -70,22 +66,23 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 				data, valid, offsets, children);
 	}
 
-	public void materializeParquetDict(ParquetVectorUpdater updater) {
-		if (dictionary != null) {
-			int numRows = (elementsAppended > 0) ? elementsAppended : capacity;
-			try {
-				Field f = dictionary.getClass().getDeclaredField("dictionary");
-				f.setAccessible(true);
-				org.apache.parquet.column.Dictionary dict = (org.apache.parquet.column.Dictionary) f.get(dictionary);
-				updater.decodeDictionaryIds(numRows, 0, this, getDictionaryIds(), dict);
-			} catch (NoSuchFieldException | IllegalAccessException e) {
-				throw new RuntimeException(e);
-			}
+	public void reAllocate(int newCapacity) {
+		this.capacity = 0;
+		data = null;
+		valid = null;
+		offsets = null;
+		reserveInternal(newCapacity);
+
+		if (isArray() && (!(type instanceof ArrayType))) {
+				newCapacity *= DEFAULT_ARRAY_LENGTH;
+		}
+		for (WritableColumnVector ch: childColumns) {
+			((HostWritableColumnVector) ch).reAllocate(newCapacity);
 		}
 	}
 
 	@Override
-	public void putBitMask(int rowId, byte src) {
+	public void putBooleans(int rowId, byte src) {
 		data.setByte(rowId, (byte)(src & 1));
 		data.setByte(rowId + 1, (byte)(src >>> 1 & 1));
 		data.setByte(rowId + 2, (byte)(src >>> 2 & 1));
@@ -97,14 +94,8 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 	}
 
 	@Override
-	public boolean isValid(int rowId) {
-		return true;
-		// return valid.getBoolean(rowId);
-	}
-
-	@Override
-	public ByteBuffer byteBuffer(int rowId, int count) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+	public boolean isNullAt(int rowId) {
+		return false;
 	}
 
 	@Override
@@ -307,8 +298,7 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	public void putArray(int rowId, int offset, int length) {
-		assert(offset >= 0 &&
-				offset + length <= ((RapidsWritableColumnVector) childColumns[0]).capacity);
+		assert(offset >= 0 && offset + length <= childColumns[0].capacity);
 		offsets.setInt((rowId + 1) * 4L, offset + length);
 	}
 
@@ -357,7 +347,7 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 
 	@Override
 	protected WritableColumnVector reserveNewColumn(int capacity, DataType type) {
-		return new RapidsWritableColumnVector(capacity, type);
+		return new HostWritableColumnVector(capacity, type);
 	}
 
 	@Override
@@ -441,5 +431,12 @@ public class RapidsWritableColumnVector extends ShimWritableColumnVector {
 	@Override
 	public double getDouble(int rowId) {
 		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+	}
+
+	@Override
+	public ByteBuffer getByteBuffer(int rowId, int count) {
+		byte[] buffer = new byte[count];
+		data.getBytes(buffer, count, rowId, count);
+		return ByteBuffer.wrap(buffer);
 	}
 }

@@ -65,7 +65,7 @@ import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.datasources.{DataSourceUtils, PartitionedFile, PartitioningAwareFileIndex, SchemaColumnConvertNotSupportedException}
-import org.apache.spark.sql.execution.datasources.parquet.VectorizedParquetGpuProducer
+import org.apache.spark.sql.execution.datasources.parquet.rapids.VectorizedParquetGpuProducer
 import org.apache.spark.sql.execution.datasources.v2.FileScan
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.internal.SQLConf
@@ -2575,7 +2575,7 @@ class MultiFileCloudParquetPartitionReader(
       hostBuffer.incRefCount()
 
       val tableReader = if (hostSideRead) {
-        new VectorizedParquetGpuProducer(conf, currentTargetBatchSize,
+        new VectorizedParquetGpuProducer(conf, currentTargetBatchSize.toInt,
           hostBuffer, 0, dataSize, metrics,
           dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
           clippedSchema, readDataSchema)
