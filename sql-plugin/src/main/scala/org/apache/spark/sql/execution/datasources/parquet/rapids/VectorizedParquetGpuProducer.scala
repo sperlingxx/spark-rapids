@@ -52,7 +52,7 @@ class VectorizedParquetGpuProducer(
   logWarning(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
   logWarning(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
 
-  private var curBatchSize = rowBatchSize
+  private var curBatchSize: Int = _
 
   private val pageReader: ParquetFileReader = {
     val options = HadoopReadOptions.builder(conf)
@@ -66,7 +66,7 @@ class VectorizedParquetGpuProducer(
   }
 
   private val parquetColumn: ParquetColumn = {
-    val converter = new ParquetToSparkSchemaConverter(conf)
+    val converter = new ParquetToSparkSchemaConverter()
     converter.convertParquetColumn(clippedSchema, Option(readDataSchema))
   }
 

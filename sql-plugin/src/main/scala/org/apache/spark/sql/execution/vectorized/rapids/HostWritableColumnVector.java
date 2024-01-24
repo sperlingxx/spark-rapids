@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.vectorized.rapids;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.List;
 import java.util.Optional;
 
@@ -34,21 +35,41 @@ import org.apache.spark.unsafe.types.UTF8String;
 public class HostWritableColumnVector extends WritableColumnVector {
 
 	private HostMemoryBuffer data;
-	private HostMemoryBuffer valid;
 	private HostMemoryBuffer offsets;
+	private final BitSet nullMask;
+
+	private int lastRowIndex = -1;
 
 	public HostWritableColumnVector(int capacity, DataType type) {
 		super(capacity, type);
+		nullMask = new BitSet(capacity);
 		this.capacity = 0;
 		reserveInternal(capacity);
 	}
 
 	public HostColumnVectorCore build(boolean topLevel) {
-		DType rapidsType = GpuColumnVector.getRapidsType(type);
-		long numRows = (elementsAppended > 0) ? elementsAppended : capacity;
+		DType cudfType;
+		if (type instanceof MapType) {
+			cudfType = DType.LIST;
+		} else {
+			cudfType = GpuColumnVector.getRapidsType(type);
+		}
+
+		int numRows = (elementsAppended > 0) ? elementsAppended : capacity;
 
 		List<HostColumnVectorCore> children = new ArrayList<>();
-		if (rapidsType == DType.STRING) {
+		if (type instanceof MapType) {
+			List<HostColumnVectorCore> mapChild = new ArrayList<>();
+			mapChild.add(((HostWritableColumnVector) childColumns[0]).build(false));
+			mapChild.add(((HostWritableColumnVector) childColumns[1]).build(false));
+			children.add(
+					new HostColumnVectorCore(
+							DType.STRUCT,
+							mapChild.get(0).getRowCount(),
+							Optional.of(0L),
+							null, null, null,
+							mapChild));
+		} else if (cudfType == DType.STRING) {
 			data = ((HostWritableColumnVector) childColumns[0]).data;
 		} else if (childColumns != null) {
 			for (WritableColumnVector child : childColumns) {
@@ -56,21 +77,30 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			}
 		}
 
+		HostMemoryBuffer valid = null;
+		if (!nullMask.isEmpty()) {
+			nullMask.flip(0, numRows);
+			byte[] bitBuffer = nullMask.toByteArray();
+			valid = HostMemoryBuffer.allocate(bitBuffer.length);
+			valid.setBytes(0, bitBuffer, 0, bitBuffer.length);
+			nullMask.clear();
+		}
+
 		if (topLevel) {
 			return new HostColumnVector(
-					rapidsType, numRows, Optional.of((long) numNulls),
-					data, valid, offsets, children);
+					cudfType, numRows, Optional.of((long) numNulls), data, valid, offsets, children);
 		}
 		return new HostColumnVectorCore(
-				rapidsType, numRows, Optional.of((long) numNulls),
-				data, valid, offsets, children);
+				cudfType, numRows, Optional.of((long) numNulls), data, valid, offsets, children);
 	}
 
 	public void reAllocate(int newCapacity) {
 		this.capacity = 0;
+		this.elementsAppended = 0;
+		this.numNulls = 0;
 		data = null;
-		valid = null;
 		offsets = null;
+		nullMask.clear();
 		reserveInternal(newCapacity);
 
 		if (isArray() && (!(type instanceof ArrayType))) {
@@ -95,34 +125,29 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public boolean isNullAt(int rowId) {
-		return false;
+		return nullMask.get(rowId);
 	}
 
 	@Override
 	public void putNotNull(int rowId) {
-		throw new UnsupportedOperationException("do NOT support set bit mask");
-		// valid.setByte(rowId, (byte) 1);
+		nullMask.clear(rowId);
 	}
 
 	@Override
 	public void putNull(int rowId) {
-		throw new UnsupportedOperationException("do NOT support set bit mask");
-		// valid.setByte(rowId, (byte) 0);
-		// ++numNulls;
+		nullMask.set(rowId);
+		++numNulls;
 	}
 
 	@Override
 	public void putNulls(int rowId, int count) {
-		throw new UnsupportedOperationException("do NOT support set bit mask");
-		// valid.setMemory(rowId, count, (byte) 0);
-		// numNulls += count;
+		nullMask.set(rowId, rowId + count);
+		numNulls += count;
 	}
 
 	@Override
 	public void putNotNulls(int rowId, int count) {
-		if (!hasNull()) return;
-		throw new UnsupportedOperationException("do NOT support set bit mask");
-		// valid.setMemory(rowId, count, (byte) 1);
+		nullMask.clear(rowId, rowId + count);
 	}
 
 	@Override
@@ -299,13 +324,21 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	@Override
 	public void putArray(int rowId, int offset, int length) {
 		assert(offset >= 0 && offset + length <= childColumns[0].capacity);
+		for (int i = lastRowIndex + 1; i < rowId; ++i) {
+			offsets.setInt((i + 1) * 4L, offset);
+		}
 		offsets.setInt((rowId + 1) * 4L, offset + length);
+		lastRowIndex = rowId;
 	}
 
 	@Override
 	public int putByteArray(int rowId, byte[] value, int offset, int length) {
-		int result = childColumns[0].appendBytes(length, value, offset);
+		int result = arrayData().appendBytes(length, value, offset);
+		for (int i = lastRowIndex + 1; i < rowId; ++i) {
+			offsets.setInt((i + 1) * 4L, result);
+		}
 		offsets.setInt((rowId + 1) * 4L, result + length);
+		lastRowIndex = rowId;
 		return result;
 	}
 
@@ -313,12 +346,12 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	protected void reserveInternal(int newCap) {
 		System.err.println("reserve Column(" + type + ") from " + capacity + " to " + newCap);
 
-		int oldCapacity = capacity;
 		if (isArray() || type instanceof MapType) {
-			offsets = moveBuffer(HostMemoryBuffer.allocate((newCap + 1) * 4L), offsets);
-			if (oldCapacity == 0) {
-				offsets.setInt(0, 0);
+			HostMemoryBuffer newOffsets = moveBuffer(HostMemoryBuffer.allocate((newCap + 1) * 4L), offsets);
+			if (offsets == null) {
+				newOffsets.setInt(0, 0);
 			}
+			offsets = newOffsets;
 		} else if (type instanceof ByteType || type instanceof BooleanType) {
 			data = moveBuffer(HostMemoryBuffer.allocate(newCap), data);
 		} else if (type instanceof ShortType) {
@@ -336,11 +369,6 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		} else {
 			throw new RuntimeException("Unhandled " + type);
 		}
-
-		//		int oldValidBytes = BitVectorHelper.getValidityBufferSize(oldCapacity);
-		//		int validByteSize = BitVectorHelper.getValidityBufferSize(newCap);
-		//		valid = moveBuffer(HostMemoryBuffer.allocate(validByteSize), valid);
-		//		valid.setMemory(oldValidBytes, validByteSize - oldValidBytes, (byte) 0xFF);
 
 		capacity = newCap;
 	}

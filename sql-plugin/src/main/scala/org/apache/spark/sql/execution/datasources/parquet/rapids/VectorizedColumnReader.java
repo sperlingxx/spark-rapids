@@ -163,13 +163,9 @@ public class VectorizedColumnReader {
         }
         readState.resetForNewPage(pageValueCount, pageFirstRowIndex);
       }
-      PrimitiveType.PrimitiveTypeName typeName =
-          descriptor.getPrimitiveType().getPrimitiveTypeName();
       if (isCurrentPageDictionaryEncoded) {
         // Save starting offset in case we need to decode dictionary IDs.
         int startOffset = readState.valueOffset;
-        // Save starting row index so we can check if we need to eagerly decode dict ids later
-        long startRowId = readState.rowId;
 
         // Read and decode dictionary ids.
         if (readState.maxRepetitionLevel == 0) {
