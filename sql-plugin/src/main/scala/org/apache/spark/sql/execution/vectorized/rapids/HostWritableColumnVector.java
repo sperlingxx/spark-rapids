@@ -19,14 +19,10 @@ package org.apache.spark.sql.execution.vectorized.rapids;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.List;
 import java.util.Optional;
 
-import ai.rapids.cudf.DType;
-import ai.rapids.cudf.HostColumnVector;
-import ai.rapids.cudf.HostColumnVectorCore;
-import ai.rapids.cudf.HostMemoryBuffer;
+import ai.rapids.cudf.*;
 
 import com.nvidia.spark.rapids.GpuColumnVector;
 import org.apache.spark.sql.types.*;
@@ -36,13 +32,11 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	private HostMemoryBuffer data;
 	private HostMemoryBuffer offsets;
-	private final BitSet nullMask;
-
+	private HostMemoryBuffer valid;
 	private int lastRowIndex = -1;
 
 	public HostWritableColumnVector(int capacity, DataType type) {
 		super(capacity, type);
-		nullMask = new BitSet(capacity);
 		this.capacity = 0;
 		reserveInternal(capacity);
 	}
@@ -60,7 +54,13 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		List<HostColumnVectorCore> children = new ArrayList<>();
 		if (type instanceof MapType) {
 			List<HostColumnVectorCore> mapChild = new ArrayList<>();
-			mapChild.add(((HostWritableColumnVector) childColumns[0]).build(false));
+			HostWritableColumnVector keyCol = (HostWritableColumnVector) childColumns[0];
+			if (keyCol.valid != null) {
+				keyCol.valid.close();
+				keyCol.valid = null;
+				keyCol.numNulls = 0;
+			}
+			mapChild.add(keyCol.build(false));
 			mapChild.add(((HostWritableColumnVector) childColumns[1]).build(false));
 			children.add(
 					new HostColumnVectorCore(
@@ -77,21 +77,11 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			}
 		}
 
-		HostMemoryBuffer valid = null;
-		if (!nullMask.isEmpty()) {
-			nullMask.flip(0, numRows);
-			byte[] bitBuffer = nullMask.toByteArray();
-			valid = HostMemoryBuffer.allocate(bitBuffer.length);
-			valid.setBytes(0, bitBuffer, 0, bitBuffer.length);
-			nullMask.clear();
-		}
-
+		Optional<Long> nullCnt = valid == null ? Optional.of(0L) : Optional.of((long) numNulls);
 		if (topLevel) {
-			return new HostColumnVector(
-					cudfType, numRows, Optional.of((long) numNulls), data, valid, offsets, children);
+			return new HostColumnVector(cudfType, numRows, nullCnt, data, valid, offsets, children);
 		}
-		return new HostColumnVectorCore(
-				cudfType, numRows, Optional.of((long) numNulls), data, valid, offsets, children);
+		return new HostColumnVectorCore(cudfType, numRows, nullCnt, data, valid, offsets, children);
 	}
 
 	public void reAllocate(int newCapacity) {
@@ -100,14 +90,17 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		this.numNulls = 0;
 		data = null;
 		offsets = null;
-		nullMask.clear();
+		valid = null;
+		lastRowIndex = -1;
 		reserveInternal(newCapacity);
 
-		if (isArray() && (!(type instanceof ArrayType))) {
-				newCapacity *= DEFAULT_ARRAY_LENGTH;
-		}
-		for (WritableColumnVector ch: childColumns) {
-			((HostWritableColumnVector) ch).reAllocate(newCapacity);
+		if (childColumns != null) {
+			if (isArray() && (!(type instanceof ArrayType))) {
+					newCapacity *= DEFAULT_ARRAY_LENGTH;
+			}
+			for (WritableColumnVector ch : childColumns) {
+				((HostWritableColumnVector) ch).reAllocate(newCapacity);
+			}
 		}
 	}
 
@@ -125,29 +118,80 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public boolean isNullAt(int rowId) {
-		return nullMask.get(rowId);
+		if (valid == null) {
+			return false;
+		}
+		int b = valid.getByte(rowId / 8);
+		int i = b & (1 << (rowId % 8));
+		return i == 0;
 	}
 
 	@Override
 	public void putNotNull(int rowId) {
-		nullMask.clear(rowId);
+		/*if (valid != null) {
+			long bucket = rowId / 8;
+			byte currentByte = valid.getByte(bucket);
+			int bitmask = 1 << (rowId % 8);
+			valid.setByte(bucket, (byte) (currentByte | bitmask));
+		}*/
 	}
 
 	@Override
 	public void putNull(int rowId) {
-		nullMask.set(rowId);
+		if (valid == null) {
+			valid = initNullMask(elementsAppended > 0 ? elementsAppended : capacity, null);
+		}
+		long bucket = rowId / 8;
+		byte currentByte = valid.getByte(bucket);
+		int bitmask = 1 << (rowId % 8);
+		valid.setByte(bucket, (byte) (currentByte & ~bitmask));
 		++numNulls;
 	}
 
 	@Override
 	public void putNulls(int rowId, int count) {
-		nullMask.set(rowId, rowId + count);
+		if (valid == null) {
+			valid = initNullMask(elementsAppended > 0 ? elementsAppended : capacity, null);
+		}
+		long startBucket = rowId / 8;
+		long endBucket = (rowId + count - 1) / 8 + 1;
+		// handle head bucket
+		int bitmask = 0;
+		for (int i = rowId % 8; i < 8; i++) bitmask |= 1 << i;
+		valid.setByte(startBucket, (byte) (valid.getByte(startBucket) & ~bitmask));
+		// handle tail bucket
+		if (startBucket < endBucket - 1) {
+			bitmask = 0;
+			for (int i = 0; i <= (rowId + count) % 8; i++) bitmask |= 1 << i;
+			valid.setByte(endBucket - 1, (byte) (valid.getByte(endBucket - 1) & ~bitmask));
+		}
+		// handle middle buckets
+		if (startBucket < endBucket - 2) {
+			valid.setMemory(startBucket + 1, endBucket - startBucket - 2, (byte) 0x00);
+		}
 		numNulls += count;
 	}
 
 	@Override
 	public void putNotNulls(int rowId, int count) {
-		nullMask.clear(rowId, rowId + count);
+		/*if (!hasNull() || valid == null) return;
+
+		long startBucket = rowId / 8;
+		long endBucket = (rowId + count - 1) / 8 + 1;
+		// handle head bucket
+		int bitmask = 0;
+		for (int i = rowId % 8; i < 8; i++) bitmask |= 1 << i;
+		valid.setByte(startBucket, (byte) (valid.getByte(startBucket) | bitmask));
+		// handle tail bucket
+		if (startBucket < endBucket - 1) {
+			bitmask = 0;
+			for (int i = 0; i <= (rowId + count) % 8; i++) bitmask |= 1 << i;
+			valid.setByte(endBucket - 1, (byte) (valid.getByte(endBucket - 1) | bitmask));
+		}
+		// handle middle buckets
+		if (startBucket < endBucket - 2) {
+			valid.setMemory(startBucket + 1, endBucket - startBucket - 2, (byte) 0xFF);
+		}*/
 	}
 
 	@Override
@@ -323,11 +367,11 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putArray(int rowId, int offset, int length) {
-		assert(offset >= 0 && offset + length <= childColumns[0].capacity);
+		int realOffset = offsets.getInt((lastRowIndex + 1) * 4L);
 		for (int i = lastRowIndex + 1; i < rowId; ++i) {
-			offsets.setInt((i + 1) * 4L, offset);
+			offsets.setInt((i + 1) * 4L, realOffset);
 		}
-		offsets.setInt((rowId + 1) * 4L, offset + length);
+		offsets.setInt((rowId + 1) * 4L, realOffset + length);
 		lastRowIndex = rowId;
 	}
 
@@ -344,8 +388,9 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	protected void reserveInternal(int newCap) {
-		System.err.println("reserve Column(" + type + ") from " + capacity + " to " + newCap);
-
+		if (valid != null) {
+			valid = initNullMask(newCap, valid);
+		}
 		if (isArray() || type instanceof MapType) {
 			HostMemoryBuffer newOffsets = moveBuffer(HostMemoryBuffer.allocate((newCap + 1) * 4L), offsets);
 			if (offsets == null) {
@@ -373,6 +418,19 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		capacity = newCap;
 	}
 
+	private HostMemoryBuffer initNullMask(int rowCapacity, HostMemoryBuffer curBuffer) {
+		long actualBytes = ((long) rowCapacity + 7) >> 3;
+		long paddingBytes = ((actualBytes + 63) >> 6) << 6;
+		HostMemoryBuffer newBuffer = HostMemoryBuffer.allocate(paddingBytes);
+		long offset = curBuffer == null ? 0 : curBuffer.getLength();
+		long length = paddingBytes - offset;
+		newBuffer.setMemory(offset, length, (byte) 0xFF);
+		if (curBuffer != null) {
+			return moveBuffer(newBuffer, curBuffer);
+		}
+		return newBuffer;
+	}
+
 	@Override
 	protected WritableColumnVector reserveNewColumn(int capacity, DataType type) {
 		return new HostWritableColumnVector(capacity, type);
@@ -381,7 +439,6 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	@Override
 	public WritableColumnVector reserveDictionaryIds(int capacity) {
 		if (dictionaryIds == null) {
-			System.err.println("reserved OnHeap DictIds " + capacity);
 			dictionaryIds = new OnHeapColumnVector(capacity, DataTypes.IntegerType);
 		} else {
 			dictionaryIds.reset();

@@ -2529,7 +2529,7 @@ class MultiFileCloudParquetPartitionReader(
       val batchIter = readBufferToBatches(buffer.dateRebaseMode,
         buffer.timestampRebaseMode, buffer.hasInt96Timestamps, buffer.clippedSchema,
         buffer.readSchema, buffer.partitionedFile, hmbAndInfo.hmb, hmbAndInfo.bytes,
-        buffer.allPartValues, hostSideRead = true)
+        buffer.allPartValues, enableReadOnHost = true)
       if (memBuffersAndSize.length > 1) {
         val updatedBuffers = memBuffersAndSize.drop(1)
         currentFileHostBuffers = Some(buffer.copy(memBuffersAndSizes = updatedBuffers))
@@ -2550,7 +2550,7 @@ class MultiFileCloudParquetPartitionReader(
       hostBuffer: HostMemoryBuffer,
       dataSize: Long,
       allPartValues: Option[Array[(Long, InternalRow)]],
-      hostSideRead: Boolean): Iterator[ColumnarBatch] = {
+      enableReadOnHost: Boolean): Iterator[ColumnarBatch] = {
 
     val parseOpts = closeOnExcept(hostBuffer) { _ =>
       getParquetOptions(readDataSchema, clippedSchema, useFieldId)
@@ -2564,8 +2564,9 @@ class MultiFileCloudParquetPartitionReader(
       Seq(hostBuffer)
     }
 
-    // about to start using the GPU
-    if (!hostSideRead) {
+    val readOnHost = enableReadOnHost && !GpuSemaphore.mayBeAvailable(TaskContext.get())
+    if (!readOnHost) {
+      // about to start using the GPU
       GpuSemaphore.acquireIfNecessary(TaskContext.get())
     }
 
@@ -2574,7 +2575,7 @@ class MultiFileCloudParquetPartitionReader(
       // because we don't want to close it until we know that we are done with it
       hostBuffer.incRefCount()
 
-      val tableReader = if (hostSideRead) {
+      val tableReader = if (readOnHost) {
         new VectorizedParquetGpuProducer(conf, currentTargetBatchSize.toInt,
           hostBuffer, 0, dataSize, metrics,
           dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,

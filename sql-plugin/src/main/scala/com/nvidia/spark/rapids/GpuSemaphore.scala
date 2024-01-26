@@ -71,6 +71,14 @@ object GpuSemaphore {
     }
   }
 
+  def mayBeAvailable(context: TaskContext): Boolean = {
+    if (context != null) {
+      getInstance.anyResourceRemain
+    } else {
+      false
+    }
+  }
+
   /**
    * Tasks must call this when they are finished using the GPU.
    */
@@ -266,6 +274,8 @@ private final class GpuSemaphore() extends Logging {
   private val semaphore = new Semaphore(MAX_PERMITS)
   // Keep track of all tasks that are both active on the GPU and blocked waiting on the GPU
   private val tasks = new ConcurrentHashMap[Long, SemaphoreTaskInfo]
+
+  private def anyResourceRemain: Boolean = semaphore.availablePermits() > 0
 
   def acquireIfNecessary(context: TaskContext): Unit = {
     // Make sure that the thread/task is registered before we try and block

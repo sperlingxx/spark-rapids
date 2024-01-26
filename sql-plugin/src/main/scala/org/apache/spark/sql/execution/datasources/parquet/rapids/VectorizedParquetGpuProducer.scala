@@ -51,6 +51,7 @@ class VectorizedParquetGpuProducer(
 
   logWarning(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
   logWarning(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
+  logWarning(s"ReadDataSchema ${readDataSchema.sql}")
 
   private var curBatchSize: Int = _
 
@@ -67,8 +68,10 @@ class VectorizedParquetGpuProducer(
 
   private val parquetColumn: ParquetColumn = {
     val converter = new ParquetToSparkSchemaConverter()
-    converter.convertParquetColumn(clippedSchema, Option(readDataSchema))
+    converter.convertParquetColumn(clippedSchema, None)
   }
+
+  logWarning(s"ParquetColumn: $parquetColumn")
 
   private val writerVersion: ParsedVersion = try {
     VersionParser.parse(pageReader.getFileMetaData.getCreatedBy)
@@ -128,6 +131,7 @@ class VectorizedParquetGpuProducer(
 
         if (buffer.nonEmpty) {
           hostColumnBuilders.foreach(_.reAllocate(curBatchSize))
+          columnVectors.foreach(_.reset())
         }
         columnVectors.foreach { cv =>
           cv.getLeaves.asScala.foreach { leafCv =>
