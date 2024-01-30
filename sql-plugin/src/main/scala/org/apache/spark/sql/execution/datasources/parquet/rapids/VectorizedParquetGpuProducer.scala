@@ -49,9 +49,9 @@ class VectorizedParquetGpuProducer(
     clippedSchema: MessageType,
     readDataSchema: StructType) extends GpuDataProducer[Table] with Logging {
 
-  logWarning(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
-  logWarning(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
-  logWarning(s"ReadDataSchema ${readDataSchema.sql}")
+  logDebug(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
+  logDebug(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
+  logDebug(s"ReadDataSchema ${readDataSchema.sql}")
 
   private var curBatchSize: Int = _
 
@@ -70,8 +70,6 @@ class VectorizedParquetGpuProducer(
     val converter = new ParquetToSparkSchemaConverter()
     converter.convertParquetColumn(clippedSchema, None)
   }
-
-  logWarning(s"ParquetColumn: $parquetColumn")
 
   private val writerVersion: ParsedVersion = try {
     VersionParser.parse(pageReader.getFileMetaData.getCreatedBy)
@@ -143,11 +141,11 @@ class VectorizedParquetGpuProducer(
           }
           cv.assemble()
         }
-        buffer.enqueue(hostColumnBuilders.map(
-          _.build(true).asInstanceOf[HostColumnVector]))
+
+        buffer.enqueue(hostColumnBuilders.map(_.build()))
       }
 
-      logWarning(s"PageReadStore contains ${pages.getRowCount} rows")
+      // logInfo(s"PageReadStore contains ${pages.getRowCount} rows")
 
       pages = pageReader.readNextFilteredRowGroup()
     }
@@ -168,7 +166,7 @@ class VectorizedParquetGpuProducer(
         GpuSemaphore.acquireIfNecessary(TaskContext.get())
         firstBatch = false
       }
-      logWarning(s"VectorizedParquetGpuProducer batches ${hostCVs.head.getRowCount} rows")
+      logInfo(s"VectorizedParquetGpuProducer batches ${hostCVs.head.getRowCount} rows")
 
       withResource(hostCVs.indices.map(i => hostCVs(i).copyToDevice())) { dCVs =>
         new Table(dCVs: _*)
