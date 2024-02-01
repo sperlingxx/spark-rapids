@@ -34,7 +34,7 @@ import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.memory.MemoryMode
 import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DecimalType, MapType, StructType}
 
 class VectorizedParquetGpuProducer(
     conf: Configuration,
@@ -181,4 +181,23 @@ class VectorizedParquetGpuProducer(
     pageReader.close()
     fileBuffer.close()
   }
+}
+
+object VectorizedParquetGpuProducer {
+
+  def schemaSupportCheck(types: Array[DataType]): Boolean = {
+    types.collectFirst {
+      case _: BinaryType =>
+        false
+      case dt: DecimalType if DecimalType.isByteArrayDecimalType(dt) =>
+        false
+      case st: StructType =>
+        schemaSupportCheck(st.fields.map(_.dataType))
+      case ArrayType(et, _) =>
+        schemaSupportCheck(Array(et))
+      case MapType(kt, vt, _) =>
+        schemaSupportCheck(Array(kt, vt))
+    }.getOrElse(true)
+  }
+
 }

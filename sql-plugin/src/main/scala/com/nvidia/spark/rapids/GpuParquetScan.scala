@@ -2564,7 +2564,14 @@ class MultiFileCloudParquetPartitionReader(
       Seq(hostBuffer)
     }
 
-    val readOnHost = enableReadOnHost
+    val readOnHost = enableReadOnHost && {
+      val supported = VectorizedParquetGpuProducer.schemaSupportCheck(
+        readDataSchema.fields.map(_.dataType))
+      if (!supported) {
+        GpuSemaphore.acquireIfNecessary(TaskContext.get())
+      }
+      supported
+    }
 
     RmmRapidsRetryIterator.withRetry(hostBuffer, splitBatchSizePolicy) { _ =>
       // The MakeParquetTableProducer will close the input buffer, and that would be bad
