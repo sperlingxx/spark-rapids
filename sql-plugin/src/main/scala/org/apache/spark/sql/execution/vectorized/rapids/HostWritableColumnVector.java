@@ -84,15 +84,6 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			gatherFixedWidthBuffer(ranges, rangeLength, cudfType.getSizeInBytes());
 		}
 
-		/*if (type instanceof MapType || type instanceof ArrayType) {
-			if (offsetBuffer != null)
-				dumpOffsetVector(offsetBuffer, rdSeed);
-		}
-		if (type instanceof LongType) {
-			if (data != null)
-				dumpLongVector(data, rdSeed);
-		}*/
-
 		if (valids != null) {
 			// Truncate valid (temp) array via Ranges
 			gatherValidBuffer(ranges, rangeLength);
@@ -148,15 +139,16 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		List<Integer> newChildRanges = new ArrayList<>();
 		int rangeUb = -1, rangeIndex = -1;
 		for (int i = 0; i < ranges.size(); i += 2) {
-			for (int j = ranges.get(i); j < ranges.get(i + 1); ++j) {
-				newArrayOffsets[dstOffset] = arrayOffsets[j];
-				newArrayLengths[dstOffset] = arrayLengths[j];
-				dstOffset++;
-				newSelectedLength += arrayLengths[j];
+			for (int j = ranges.get(i); j < ranges.get(i + 1); ++j, ++dstOffset) {
 				// skip null records because their offsets are not correctly setup
 				if (valids != null && valids[j] == (byte) 1) {
 					continue;
 				}
+				// transfer arrayOffset/Length
+				newArrayOffsets[dstOffset] = arrayOffsets[j];
+				newArrayLengths[dstOffset] = arrayLengths[j];
+				newSelectedLength += arrayLengths[j];
+				// transfer Ranges
 				if (rangeUb == arrayOffsets[j]) {
 					rangeUb += arrayLengths[j];
 					newChildRanges.set(rangeIndex, rangeUb);

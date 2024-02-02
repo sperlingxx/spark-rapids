@@ -2564,13 +2564,17 @@ class MultiFileCloudParquetPartitionReader(
       Seq(hostBuffer)
     }
 
-    val readOnHost = enableReadOnHost && {
-      val supported = VectorizedParquetGpuProducer.schemaSupportCheck(
-        readDataSchema.fields.map(_.dataType))
-      if (!supported) {
-        GpuSemaphore.acquireIfNecessary(TaskContext.get())
+    val canReadOnHost = enableReadOnHost &&
+      VectorizedParquetGpuProducer.schemaSupportCheck(readDataSchema.fields.map(_.dataType))
+
+    val readOnHost = if (canReadOnHost) {
+      GpuSemaphore.tryAcquire(TaskContext.get()) match {
+        case SemaphoreAcquired => false
+        case AcquireFailed(_) => true
       }
-      supported
+    } else {
+      GpuSemaphore.acquireIfNecessary(TaskContext.get())
+      false
     }
 
     RmmRapidsRetryIterator.withRetry(hostBuffer, splitBatchSizePolicy) { _ =>
