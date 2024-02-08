@@ -93,9 +93,9 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			}
 		}
 
-		// Build child columns recursively
+		// Build child columns of "real" nested types recursively (StringType is NOT even it contains childColumns)
 		List<HostColumnVectorCore> children = new ArrayList<>();
-		if (childColumns != null) {
+		if (childColumns != null && !(type instanceof StringType)) {
 			for (WritableColumnVector ch : childColumns) {
 				children.add(((HostWritableColumnVector) ch).buildImpl(
 						childrenRanges, selectedLength, false, rdSeed));
@@ -173,13 +173,10 @@ public class HostWritableColumnVector extends WritableColumnVector {
 				charOffset = null;
 			}
 			if (childColumns != null) {
-				childColumns[0].close();
-				childColumns = null;
+				((HostWritableColumnVector) childColumns[0]).data.close();
+				((HostWritableColumnVector) childColumns[0]).data = null;
 			}
-			if (data != null) {
-				data.close();
-				data = null;
-			}
+			assert data == null;
 			return;
 		}
 
@@ -213,7 +210,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		charOffset = newCharOffset;
 
 		data = ((HostWritableColumnVector) childColumns[0]).data;
-		childColumns = null;
+		((HostWritableColumnVector) childColumns[0]).data = null;
 		int byteArrayEnd = charOffset.getInt(charOffset.getLength() - 4);
 		HostMemoryBuffer newData = data.slice(0, byteArrayEnd);
 		data.close();
@@ -312,7 +309,6 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	public void reAllocate(int newCapacity) {
 		this.capacity = 0;
-		this.rowCnt = 0;
 		this.elementsAppended = 0;
 		this.numNulls = 0;
 		data = null;
@@ -324,6 +320,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		selectedLength = 0;
 		childrenRanges = new ArrayList<>();
 		reserveInternal(newCapacity);
+		this.rowCnt = newCapacity;
 
 		if (childColumns != null) {
 			if (isArray() && (!(type instanceof ArrayType))) {

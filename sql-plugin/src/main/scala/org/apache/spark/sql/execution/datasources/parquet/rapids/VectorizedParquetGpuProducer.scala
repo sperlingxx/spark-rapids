@@ -49,9 +49,9 @@ class VectorizedParquetGpuProducer(
     clippedSchema: MessageType,
     readDataSchema: StructType) extends GpuDataProducer[Table] with Logging {
 
-  logDebug(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
-  logDebug(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
-  logDebug(s"ReadDataSchema ${readDataSchema.sql}")
+  logInfo(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
+  logInfo(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
+  logInfo(s"ReadDataSchema ${readDataSchema.sql}")
 
   private var curBatchSize: Int = _
 
@@ -166,7 +166,12 @@ class VectorizedParquetGpuProducer(
         GpuSemaphore.acquireIfNecessary(TaskContext.get())
         firstBatch = false
       }
-      logInfo(s"VectorizedParquetGpuProducer batches ${hostCVs.head.getRowCount} rows")
+
+      val batchRows = hostCVs.head.getRowCount
+      logInfo(s"VectorizedParquetGpuProducer batches $batchRows rows")
+      metrics.get("hostDecodeRows").foreach(_.+=(batchRows))
+      metrics.get("hostDecodeBatches").foreach(_.+=(1))
+      metrics.get("numOutputBatches").foreach(_.+=(1))
 
       withResource(hostCVs.indices.map(i => hostCVs(i).copyToDevice())) { dCVs =>
         new Table(dCVs: _*)

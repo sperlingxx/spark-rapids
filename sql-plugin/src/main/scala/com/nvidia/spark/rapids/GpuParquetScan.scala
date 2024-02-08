@@ -1107,6 +1107,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
   private val useChunkedReader = rapidsConf.chunkedReaderEnabled
   private val debugDumpPrefix = rapidsConf.parquetDebugDumpPrefix
   private val debugDumpAlways = rapidsConf.parquetDebugDumpAlways
+  private val readOnHost = rapidsConf.parquetReadOnHost
   private val numThreads = rapidsConf.multiThreadReadNumThreads
   private val maxNumFileProcessed = rapidsConf.maxNumParquetFilesParallel
   private val ignoreMissingFiles = sqlConf.ignoreMissingFiles
@@ -1173,7 +1174,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       targetBatchSizeBytes, maxGpuColumnSizeBytes, useChunkedReader, metrics, partitionSchema,
       numThreads, maxNumFileProcessed, ignoreMissingFiles, ignoreCorruptFiles, readUseFieldId,
       alluxioPathReplacementMap.getOrElse(Map.empty), alluxioReplacementTaskTime,
-      queryUsesInputFile, keepReadsInOrderFromConf, combineConf)
+      queryUsesInputFile, keepReadsInOrderFromConf, combineConf, readOnHost)
   }
 
   private def filterBlocksForCoalescingReader(
@@ -1287,7 +1288,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
     new MultiFileParquetPartitionReader(conf, files, clippedBlocks.toSeq, isCaseSensitive,
       debugDumpPrefix, debugDumpAlways, useChunkedReader, maxReadBatchSizeRows,
       maxReadBatchSizeBytes, targetBatchSizeBytes, maxGpuColumnSizeBytes, metrics, partitionSchema,
-      numThreads, ignoreMissingFiles, ignoreCorruptFiles, readUseFieldId)
+      numThreads, ignoreMissingFiles, ignoreCorruptFiles, readUseFieldId, readOnHost)
   }
 
   /**
@@ -1885,7 +1886,8 @@ class MultiFileParquetPartitionReader(
     numThreads: Int,
     ignoreMissingFiles: Boolean,
     ignoreCorruptFiles: Boolean,
-    useFieldId: Boolean)
+    useFieldId: Boolean,
+    readOnHostOpts: Int = 0)
   extends MultiFileCoalescingPartitionReaderBase(conf, clippedBlocks,
     partitionSchema, maxReadBatchSizeRows, maxReadBatchSizeBytes, maxGpuColumnSizeBytes,
     numThreads, execMetrics)
@@ -1986,16 +1988,37 @@ class MultiFileParquetPartitionReader(
       clippedSchema: SchemaBase, readDataSchema: StructType,
       extraInfo: ExtraInfo): GpuDataProducer[Table] = {
 
-    val parseOpts = getParquetOptions(readDataSchema, clippedSchema, useFieldId)
+    val canReadOnHost = readOnHostOpts > 0 &&
+      VectorizedParquetGpuProducer.schemaSupportCheck(readDataSchema.fields.map(_.dataType))
 
-    // About to start using the GPU
-    GpuSemaphore.acquireIfNecessary(TaskContext.get())
+    val readOnHost = if (canReadOnHost) {
+      if (readOnHostOpts == 2) {
+        true
+      } else {
+        GpuSemaphore.tryAcquire(TaskContext.get()) match {
+          case SemaphoreAcquired => false
+          case AcquireFailed(_) => true
+        }
+      }
+    } else {
+      GpuSemaphore.acquireIfNecessary(TaskContext.get())
+      false
+    }
 
-    MakeParquetTableProducer(useChunkedReader, conf, currentTargetBatchSize, parseOpts,
-      dataBuffer, 0, dataSize, metrics,
-      extraInfo.dateRebaseMode, extraInfo.timestampRebaseMode,
-      extraInfo.hasInt96Timestamps, isSchemaCaseSensitive, useFieldId, readDataSchema,
-      clippedSchema, splits, debugDumpPrefix, debugDumpAlways)
+    if (readOnHost) {
+      new VectorizedParquetGpuProducer(conf, currentTargetBatchSize.toInt,
+        dataBuffer, 0, dataSize, metrics,
+        extraInfo.dateRebaseMode, extraInfo.timestampRebaseMode, extraInfo.hasInt96Timestamps,
+        clippedSchema, readDataSchema)
+    } else {
+      val parseOpts = getParquetOptions(readDataSchema, clippedSchema, useFieldId)
+
+      MakeParquetTableProducer(useChunkedReader, conf, currentTargetBatchSize, parseOpts,
+        dataBuffer, 0, dataSize, metrics,
+        extraInfo.dateRebaseMode, extraInfo.timestampRebaseMode,
+        extraInfo.hasInt96Timestamps, isSchemaCaseSensitive, useFieldId, readDataSchema,
+        clippedSchema, splits, debugDumpPrefix, debugDumpAlways)
+    }
   }
 
   override def writeFileHeader(buffer: HostMemoryBuffer, bContext: BatchContext): Long = {
@@ -2086,7 +2109,8 @@ class MultiFileCloudParquetPartitionReader(
     alluxioReplacementTaskTime: Boolean,
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
-    combineConf: CombineConf)
+    combineConf: CombineConf,
+    readOnHostOpts: Int = 0)
   extends MultiFileCloudPartitionReaderBase(conf, files, numThreads, maxNumFileProcessed, null,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
     alluxioPathReplacementMap, alluxioReplacementTaskTime, keepReadsInOrder, combineConf)
@@ -2529,7 +2553,7 @@ class MultiFileCloudParquetPartitionReader(
       val batchIter = readBufferToBatches(buffer.dateRebaseMode,
         buffer.timestampRebaseMode, buffer.hasInt96Timestamps, buffer.clippedSchema,
         buffer.readSchema, buffer.partitionedFile, hmbAndInfo.hmb, hmbAndInfo.bytes,
-        buffer.allPartValues, enableReadOnHost = true)
+        buffer.allPartValues, readOnHostOpts)
       if (memBuffersAndSize.length > 1) {
         val updatedBuffers = memBuffersAndSize.drop(1)
         currentFileHostBuffers = Some(buffer.copy(memBuffersAndSizes = updatedBuffers))
@@ -2550,7 +2574,7 @@ class MultiFileCloudParquetPartitionReader(
       hostBuffer: HostMemoryBuffer,
       dataSize: Long,
       allPartValues: Option[Array[(Long, InternalRow)]],
-      enableReadOnHost: Boolean): Iterator[ColumnarBatch] = {
+      readOnHostOpts: Int): Iterator[ColumnarBatch] = {
 
     val parseOpts = closeOnExcept(hostBuffer) { _ =>
       getParquetOptions(readDataSchema, clippedSchema, useFieldId)
@@ -2564,13 +2588,17 @@ class MultiFileCloudParquetPartitionReader(
       Seq(hostBuffer)
     }
 
-    val canReadOnHost = enableReadOnHost &&
+    val canReadOnHost = readOnHostOpts > 0 &&
       VectorizedParquetGpuProducer.schemaSupportCheck(readDataSchema.fields.map(_.dataType))
 
     val readOnHost = if (canReadOnHost) {
-      GpuSemaphore.tryAcquire(TaskContext.get()) match {
-        case SemaphoreAcquired => false
-        case AcquireFailed(_) => true
+      if (readOnHostOpts == 2) {
+        true
+      } else {
+        GpuSemaphore.tryAcquire(TaskContext.get()) match {
+          case SemaphoreAcquired => false
+          case AcquireFailed(_) => true
+        }
       }
     } else {
       GpuSemaphore.acquireIfNecessary(TaskContext.get())
