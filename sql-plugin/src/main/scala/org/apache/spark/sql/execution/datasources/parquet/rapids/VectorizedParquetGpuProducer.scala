@@ -128,9 +128,22 @@ class VectorizedParquetGpuProducer(
         curBatchSize = ((pages.getRowCount - from) min rowBatchSize).toInt
 
         if (buffer.nonEmpty) {
+          columnVectors.foreach { cv =>
+            cv.reset()
+            cv.getLeaves.asScala.foreach {
+              case leaf if leaf != null && leaf.getColumnReader != null =>
+                if (leaf.getDefinitionLevelVector != null) {
+                  leaf.getDefinitionLevelVector.reserve(curBatchSize)
+                }
+                if (leaf.getRepetitionLevelVector != null) {
+                  leaf.getRepetitionLevelVector.reserve(curBatchSize)
+                }
+              case _ =>
+            }
+          }
           hostColumnBuilders.foreach(_.reAllocate(curBatchSize))
-          columnVectors.foreach(_.reset())
         }
+
         columnVectors.foreach { cv =>
           cv.getLeaves.asScala.foreach { leafCv =>
             val reader = leafCv.getColumnReader
