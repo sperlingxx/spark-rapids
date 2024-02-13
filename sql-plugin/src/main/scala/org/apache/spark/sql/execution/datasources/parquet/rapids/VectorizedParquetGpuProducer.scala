@@ -27,6 +27,7 @@ import com.nvidia.spark.rapids.Arm.withResource
 import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.{HadoopReadOptions, VersionParser}
 import org.apache.parquet.VersionParser.ParsedVersion
+import org.apache.parquet.column.page.PageReadStore
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.schema.MessageType
 
@@ -38,7 +39,7 @@ import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DecimalType,
 
 class VectorizedParquetGpuProducer(
     conf: Configuration,
-    rowBatchSize: Int,
+    tgtBatchSize: Int,
     fileBuffer: HostMemoryBuffer,
     offset: Long,
     len: Long,
@@ -52,8 +53,6 @@ class VectorizedParquetGpuProducer(
   logInfo(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
   logInfo(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
   logInfo(s"ReadDataSchema ${readDataSchema.sql}")
-
-  private var curBatchSize: Int = _
 
   private val pageReader: ParquetFileReader = {
     val options = HadoopReadOptions.builder(conf)
@@ -80,16 +79,17 @@ class VectorizedParquetGpuProducer(
       null
   }
 
-  private lazy val hostColumnBuilders: Array[HostWritableColumnVector] = {
-    parquetColumn.sparkType.asInstanceOf[StructType].fields.map { f =>
-      new HostWritableColumnVector(curBatchSize, f.dataType)
-    }
-  }
+  private var hostColumnBuilders: Array[HostWritableColumnVector] = _
 
-  private lazy val columnVectors: Array[ParquetColumnVector] = {
-    hostColumnBuilders.indices.toArray.map { i =>
+  private var columnVectors: Array[ParquetColumnVector] = _
+
+  private def createParquetColumnVectors(batchSize: Int): Unit = {
+    hostColumnBuilders = parquetColumn.sparkType.asInstanceOf[StructType].fields.map { f =>
+      new HostWritableColumnVector(batchSize, f.dataType)
+    }
+    columnVectors = hostColumnBuilders.indices.toArray.map { i =>
       new ParquetColumnVector(parquetColumn.children(i),
-        hostColumnBuilders(i), curBatchSize, MemoryMode.ON_HEAP,
+        hostColumnBuilders(i), batchSize, MemoryMode.OFF_HEAP,
         Set.empty[ParquetColumn].asJava, true, null);
     }
   }
@@ -98,11 +98,23 @@ class VectorizedParquetGpuProducer(
   private lazy val hostBatches: mutable.Queue[Array[HostColumnVector]] = {
 
     val buffer = mutable.Queue.empty[Array[HostColumnVector]]
-    var pages = pageReader.readNextFilteredRowGroup()
-    curBatchSize = (pages.getRowCount min rowBatchSize).toInt
 
-    while (pages != null) {
+    val pageBuilder = mutable.ArrayBuffer.empty[PageReadStore]
+    do {
+      pageBuilder += pageReader.readNextFilteredRowGroup()
+    } while (pageBuilder.last != null)
+    val pages = pageBuilder.dropRight(1).toArray
 
+    val totalRowCnt = pages.foldLeft(0)((s, x) => s + x.getRowCount.toInt)
+    val rowBatchSize = (tgtBatchSize.toDouble / len * totalRowCnt).toInt max 1
+    logWarning(s"total row count: $totalRowCnt ; batch size in row: $rowBatchSize")
+
+    var remainTotalRows = totalRowCnt
+    var remainBatchRows = rowBatchSize min totalRowCnt
+    createParquetColumnVectors(remainBatchRows)
+
+    pages.foreach { page: PageReadStore =>
+      // update column readers to read the new page
       val stack = mutable.Stack[ParquetColumnVector](columnVectors: _*)
       while (stack.nonEmpty) {
         stack.pop() match {
@@ -111,7 +123,7 @@ class VectorizedParquetGpuProducer(
               new VectorizedColumnReader(
                 cv.getColumn.descriptor.get,
                 cv.getColumn.required,
-                pages,
+                page,
                 null,
                 dateRebaseMode.value,
                 TimeZone.getDefault.getID,
@@ -123,44 +135,52 @@ class VectorizedParquetGpuProducer(
         }
       }
 
-      (0L until pages.getRowCount by rowBatchSize).foreach { from =>
-
-        curBatchSize = ((pages.getRowCount - from) min rowBatchSize).toInt
-
-        if (buffer.nonEmpty) {
-          columnVectors.foreach { cv =>
-            cv.reset()
-            cv.getLeaves.asScala.foreach {
-              case leaf if leaf != null && leaf.getColumnReader != null =>
-                if (leaf.getDefinitionLevelVector != null) {
-                  leaf.getDefinitionLevelVector.reserve(curBatchSize)
-                }
-                if (leaf.getRepetitionLevelVector != null) {
-                  leaf.getRepetitionLevelVector.reserve(curBatchSize)
-                }
-              case _ =>
-            }
-          }
-          hostColumnBuilders.foreach(_.reAllocate(curBatchSize))
-        }
+      var remainPageRows = page.getRowCount.toInt
+      while (remainPageRows > 0) {
+        val readSize = remainBatchRows min remainPageRows
+        remainPageRows -= readSize
+        remainBatchRows -= readSize
+        remainTotalRows -= readSize
 
         columnVectors.foreach { cv =>
-          cv.getLeaves.asScala.foreach { leafCv =>
-            val reader = leafCv.getColumnReader
-            if (reader != null) {
-              reader.readBatch(curBatchSize, leafCv.getValueVector,
-                leafCv.getRepetitionLevelVector, leafCv.getDefinitionLevelVector)
-            }
+          cv.getLeaves.asScala.foreach {
+            case leaf if leaf.getColumnReader != null =>
+              leaf.getColumnReader.readBatch(readSize, leaf.getValueVector,
+                leaf.getRepetitionLevelVector, leaf.getDefinitionLevelVector)
+            case _ =>
           }
-          cv.assemble()
         }
 
-        buffer.enqueue(hostColumnBuilders.map(_.build()))
+        if (remainBatchRows == 0) {
+          // materialize current batch in the memory layout of cuDF column vector
+          columnVectors.foreach(_.assemble())
+          buffer.enqueue(hostColumnBuilders.map(_.build()))
+          // logWarning(s"Build host buffer(batchSize:$curBatchSize; " +
+          //   s"remainPageRows:$remainPageRows; remainTotalRows: $remainTotalRows)")
+
+          if (remainTotalRows > 0) {
+            // update batch size and remaining
+            remainBatchRows = rowBatchSize min remainTotalRows
+
+            // reset data vectors with the new batch size
+            hostColumnBuilders.foreach(_.reAllocate(remainBatchRows))
+            // reset the DefVector/repVector with the new batch size
+            columnVectors.foreach(_.reset())
+            /* columnVectors.foreach { cv =>
+               cv.getLeaves.asScala.foreach {
+                case leaf if leaf.getColumnReader != null =>
+                  if (leaf.getDefinitionLevelVector != null) {
+                     leaf.getDefinitionLevelVector.reserve(remainBatchRows)
+                   }
+                  if (leaf.getRepetitionLevelVector != null) {
+                     leaf.getRepetitionLevelVector.reserve(remainBatchRows)
+                  }
+                case _ =>
+              }
+            } */
+          }
+        }
       }
-
-      // logInfo(s"PageReadStore contains ${pages.getRowCount} rows")
-
-      pages = pageReader.readNextFilteredRowGroup()
     }
 
     buffer

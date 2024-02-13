@@ -42,14 +42,13 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	private HostMemoryBuffer charOffset;
 	private int lastCharRowId = -1;
 
-	private int rowCnt;
+	private int rowCnt = 0;
 
 	public HostWritableColumnVector(int capacity, DataType type) {
 		super(capacity, type);
 		this.capacity = 0;
 		childrenRanges = new ArrayList<>();
 		reserveInternal(capacity);
-		this.rowCnt = capacity;
 	}
 
 	public HostColumnVector build() {
@@ -61,6 +60,8 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	}
 
 	private HostColumnVectorCore buildImpl(List<Integer> ranges, int rangeLength, boolean topLevel, int rdSeed) {
+//		System.err.format("[seed=%d]building %s(rowCnt=%d,capacity=%d,rangeLength=%d)\n",
+//				rdSeed, type, rowCnt, capacity, rangeLength);
 
 		DType cudfType = type instanceof MapType ? DType.LIST : GpuColumnVector.getRapidsType(type);
 
@@ -319,8 +320,8 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		arrayOffsets = null;
 		selectedLength = 0;
 		childrenRanges = new ArrayList<>();
+		this.rowCnt = 0;
 		reserveInternal(newCapacity);
-		this.rowCnt = newCapacity;
 
 		if (childColumns != null) {
 			if (isArray() && (!(type instanceof ArrayType))) {
@@ -334,6 +335,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putBooleans(int rowId, byte src) {
+		rowCnt += 8;
 		data.setByte(rowId, (byte)(src & 1));
 		data.setByte(rowId + 1, (byte)(src >>> 1 & 1));
 		data.setByte(rowId + 2, (byte)(src >>> 2 & 1));
@@ -353,24 +355,24 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putNotNull(int rowId) {
+		if (type instanceof StructType) rowCnt++;
+
 		if (!hasNull() || valids == null) return;
 		valids[rowId] = 0;
 	}
 
 	@Override
 	public void putNull(int rowId) {
-		if (valids == null) {
-			initNullMask(elementsAppended > 0 ? elementsAppended : capacity);
-		}
+		rowCnt++;
+		if (valids == null) initNullMask(capacity);
 		valids[rowId] = 1;
 		++numNulls;
 	}
 
 	@Override
 	public void putNulls(int rowId, int count) {
-		if (valids == null) {
-			initNullMask(elementsAppended > 0 ? elementsAppended : capacity);
-		}
+		rowCnt += count;
+		if (valids == null) initNullMask(capacity);
 		for (int i = 0; i < count; ++i) {
 			valids[rowId + i] = 1;
 		}
@@ -379,6 +381,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putNotNulls(int rowId, int count) {
+		rowCnt = Math.max(rowCnt, rowId + count);
 		if (!hasNull() || valids == null) return;
 		for (int i = 0; i < count; ++i) {
 			valids[rowId + i] = 0;
@@ -387,36 +390,43 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putBoolean(int rowId, boolean value) {
+		rowCnt++;
 		data.setBoolean(rowId, value);
 	}
 
 	@Override
 	public void putBooleans(int rowId, int count, boolean value) {
+		rowCnt += count;
 		data.setMemory(rowId, count, value ? (byte) 1 : (byte) 0);
 	}
 
 	@Override
 	public void putByte(int rowId, byte value) {
+		rowCnt++;
 		data.setByte(rowId, value);
 	}
 
 	@Override
 	public void putBytes(int rowId, int count, byte value) {
+		rowCnt += count;
 		data.setMemory(rowId, count, value);
 	}
 
 	@Override
 	public void putBytes(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		data.setBytes(rowId, src, srcIndex, count);
 	}
 
 	@Override
 	public void putShort(int rowId, short value) {
+		rowCnt++;
 		data.setShort(rowId * 2L, value);
 	}
 
 	@Override
 	public void putShorts(int rowId, int count, short value) {
+		rowCnt += count;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setShort(offset * 2L, value);
 		}
@@ -424,21 +434,25 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putShorts(int rowId, int count, short[] src, int srcIndex) {
+		rowCnt++;
 		data.setShorts(rowId * 2L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putShorts(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		data.setBytes(rowId * 2L, src, srcIndex, count * 2L);
 	}
 
 	@Override
 	public void putInt(int rowId, int value) {
+		rowCnt++;
 		data.setInt(rowId * 4L, value);
 	}
 
 	@Override
 	public void putInts(int rowId, int count, int value) {
+		rowCnt += count;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setInt(offset * 4L, value);
 		}
@@ -446,16 +460,19 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putInts(int rowId, int count, int[] src, int srcIndex) {
+		rowCnt += count;
 		data.setInts(rowId * 4L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putInts(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		data.setBytes(rowId * 4L, src, srcIndex, count * 4L);
 	}
 
 	@Override
 	public void putIntsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
 		long offset = 4L * rowId;
 		for (int i = 0; i < count; ++i, offset += 4) {
@@ -465,11 +482,13 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putLong(int rowId, long value) {
+		rowCnt++;
 		data.setLong(rowId * 8L, value);
 	}
 
 	@Override
 	public void putLongs(int rowId, int count, long value) {
+		rowCnt += count;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setLong(offset * 8L, value);
 		}
@@ -477,16 +496,19 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putLongs(int rowId, int count, long[] src, int srcIndex) {
+		rowCnt += count;
 		data.setLongs(rowId * 8L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putLongs(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		data.setBytes(rowId * 8L, src, srcIndex, count * 8L);
 	}
 
 	@Override
 	public void putLongsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
 		long offset = 8L * rowId;
 		for (int i = 0; i < count; ++i, offset += 8) {
@@ -496,11 +518,13 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putFloat(int rowId, float value) {
+		rowCnt++;
 		data.setFloat(rowId * 4L, value);
 	}
 
 	@Override
 	public void putFloats(int rowId, int count, float value) {
+		rowCnt += count;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setFloat(offset * 4L, value);
 		}
@@ -508,16 +532,19 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putFloats(int rowId, int count, float[] src, int srcIndex) {
+		rowCnt += count;
 		data.setFloats(rowId * 4L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putFloats(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		data.setBytes(rowId * 4L, src, srcIndex * 4L, count * 4L);
 	}
 
 	@Override
 	public void putFloatsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
 		long offset = 4L * rowId;
 		for (int i = 0; i < count; ++i, offset += 4) {
@@ -527,11 +554,13 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putDouble(int rowId, double value) {
+		rowCnt++;
 		data.setDouble(rowId * 8L, value);
 	}
 
 	@Override
 	public void putDoubles(int rowId, int count, double value) {
+		rowCnt += count;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setDouble(offset * 8L, value);
 		}
@@ -539,16 +568,20 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putDoubles(int rowId, int count, double[] src, int srcIndex) {
+		rowCnt += count;
 		data.setDoubles(rowId * 8L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putDoubles(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
 		data.setBytes(rowId * 8L, src, srcIndex, count * 8L);
 	}
 
 	@Override
 	public void putDoublesLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
+		rowCnt += count;
+
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
 		long offset = 8L * rowId;
 		for (int i = 0; i < count; ++i, offset += 8) {
@@ -558,6 +591,8 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putArray(int rowId, int offset, int length) {
+		rowCnt++;
+
 		arrayOffsets[rowId] = offset;
 		arrayLengths[rowId] = length;
 
@@ -574,6 +609,8 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public int putByteArray(int rowId, byte[] value, int offset, int length) {
+		rowCnt++;
+
 		int result = arrayData().appendBytes(length, value, offset);
 		for (int i = lastCharRowId + 1; i < rowId; ++i) {
 			charOffset.setInt((i + 1) * 4L, result);
@@ -585,7 +622,6 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void reserve(int requiredCapacity) {
-		rowCnt = requiredCapacity;
 		super.reserve(requiredCapacity);
 	}
 
