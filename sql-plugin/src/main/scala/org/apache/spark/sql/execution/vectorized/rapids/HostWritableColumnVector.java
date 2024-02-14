@@ -42,7 +42,11 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	private HostMemoryBuffer charOffset;
 	private int lastCharRowId = -1;
 
-	private int rowCnt = 0;
+	private int rowGroupOffset = 0;
+	private int rowGroupArrayOffset = 0;
+	private int rowGroupStringOffset = 0;
+	private int rowGroupIndex = 0;
+	private int rowGroupArrayIndex = 0;
 
 	public HostWritableColumnVector(int capacity, DataType type) {
 		super(capacity, type);
@@ -52,16 +56,22 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	}
 
 	public HostColumnVector build() {
+		assert rowGroupIndex == 0 && rowGroupArrayIndex == 0;
+
 		List<Integer> initRanges = new ArrayList<>();
 		initRanges.add(0);
-		initRanges.add(rowCnt);
-		int rdSeed = Random.randInt(Integer.MAX_VALUE - 1);
-		return (HostColumnVector) buildImpl(initRanges, rowCnt, true, rdSeed);
+		initRanges.add(rowGroupOffset);
+
+		return (HostColumnVector) buildImpl(initRanges, rowGroupOffset, true,
+				Random.randInt(Integer.MAX_VALUE - 1));
 	}
 
 	private HostColumnVectorCore buildImpl(List<Integer> ranges, int rangeLength, boolean topLevel, int rdSeed) {
-//		System.err.format("[seed=%d]building %s(rowCnt=%d,capacity=%d,rangeLength=%d)\n",
-//				rdSeed, type, rowCnt, capacity, rangeLength);
+		// Make sure all subVectors are fully "flushed" before the materialization.
+		assert rowGroupIndex == 0 && rowGroupArrayIndex == 0;
+
+		/* System.err.format("[seed=%d]building %s(rowCnt=%d,capacity=%d,rangeLength=%d)\n",
+					rdSeed, type, rowCnt, capacity, rangeLength); */
 
 		DType cudfType = type instanceof MapType ? DType.LIST : GpuColumnVector.getRapidsType(type);
 
@@ -131,7 +141,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			arrayLengths = null;
 			return;
 		}
-		if (ranges.size() == 2 && ranges.get(0) == 0 && ranges.get(1) == rowCnt) {
+		if (ranges.size() == 2 && ranges.get(0) == 0 && ranges.get(1) == rowGroupOffset) {
 			return;
 		}
 		int[] newArrayOffsets = new int[numRecord];
@@ -253,7 +263,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			numNulls = 0;
 			return;
 		}
-		if (ranges.size() == 2 && ranges.get(0) == 0 && ranges.get(1) == rowCnt) {
+		if (ranges.size() == 2 && ranges.get(0) == 0 && ranges.get(1) == rowGroupOffset) {
 			return;
 		}
 		byte[] newValids = new byte[rangeLength];
@@ -308,6 +318,22 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		return nullMask;
 	}
 
+	@Override
+	public void reset() {
+		if (childColumns != null) {
+			for (WritableColumnVector c: childColumns)
+				c.reset();
+		}
+		rowGroupOffset += rowGroupIndex;
+		rowGroupIndex = 0;
+		rowGroupArrayOffset += rowGroupArrayIndex;
+		rowGroupArrayIndex = 0;
+		if (lastCharRowId > -1) {
+			rowGroupStringOffset = charOffset.getInt((lastCharRowId + 1) * 4L);
+		}
+		elementsAppended = 0;
+	}
+
 	public void reAllocate(int newCapacity) {
 		this.capacity = 0;
 		this.elementsAppended = 0;
@@ -320,11 +346,16 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		arrayOffsets = null;
 		selectedLength = 0;
 		childrenRanges = new ArrayList<>();
-		this.rowCnt = 0;
+		this.rowGroupIndex = 0;
+		this.rowGroupArrayIndex = 0;
+		this.rowGroupOffset = 0;
+		this.rowGroupArrayOffset = 0;
+		this.rowGroupStringOffset = 0;
+
 		reserveInternal(newCapacity);
 
 		if (childColumns != null) {
-			if (isArray() && (!(type instanceof ArrayType))) {
+			if (isArray()) {
 					newCapacity *= DEFAULT_ARRAY_LENGTH;
 			}
 			for (WritableColumnVector ch : childColumns) {
@@ -335,7 +366,8 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putBooleans(int rowId, byte src) {
-		rowCnt += 8;
+		rowGroupIndex += 8;
+		rowId += rowGroupOffset;
 		data.setByte(rowId, (byte)(src & 1));
 		data.setByte(rowId + 1, (byte)(src >>> 1 & 1));
 		data.setByte(rowId + 2, (byte)(src >>> 2 & 1));
@@ -350,29 +382,34 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	public boolean isNullAt(int rowId) {
 		if (isAllNull) return true;
 		if (valids == null) return false;
-		return valids[rowId] == 1;
+		return valids[rowGroupOffset + rowId] == 1;
 	}
 
 	@Override
 	public void putNotNull(int rowId) {
-		if (type instanceof StructType) rowCnt++;
-
+		if (type instanceof StructType) {
+			rowGroupIndex++;
+		}
 		if (!hasNull() || valids == null) return;
-		valids[rowId] = 0;
+		valids[rowGroupOffset + rowId] = 0;
 	}
 
 	@Override
 	public void putNull(int rowId) {
-		rowCnt++;
+		rowGroupIndex++;
+		if (type instanceof ArrayType || type instanceof MapType) {
+			rowGroupArrayIndex++;
+		}
 		if (valids == null) initNullMask(capacity);
-		valids[rowId] = 1;
+		valids[rowGroupOffset + rowId] = 1;
 		++numNulls;
 	}
 
 	@Override
 	public void putNulls(int rowId, int count) {
-		rowCnt += count;
+		rowGroupIndex += count;
 		if (valids == null) initNullMask(capacity);
+		rowId += rowGroupOffset;
 		for (int i = 0; i < count; ++i) {
 			valids[rowId + i] = 1;
 		}
@@ -381,8 +418,9 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putNotNulls(int rowId, int count) {
-		rowCnt = Math.max(rowCnt, rowId + count);
+		// rowCnt = Math.max(rowCnt, rowId + count);
 		if (!hasNull() || valids == null) return;
+		rowId += rowGroupOffset;
 		for (int i = 0; i < count; ++i) {
 			valids[rowId + i] = 0;
 		}
@@ -390,43 +428,45 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putBoolean(int rowId, boolean value) {
-		rowCnt++;
-		data.setBoolean(rowId, value);
+		rowGroupIndex++;
+		data.setBoolean(rowGroupOffset + rowId, value);
 	}
 
 	@Override
 	public void putBooleans(int rowId, int count, boolean value) {
-		rowCnt += count;
-		data.setMemory(rowId, count, value ? (byte) 1 : (byte) 0);
+		rowGroupIndex += count;
+		data.setMemory(rowGroupOffset + rowId, count, value ? (byte) 1 : (byte) 0);
 	}
 
 	@Override
 	public void putByte(int rowId, byte value) {
-		rowCnt++;
-		data.setByte(rowId, value);
+		rowGroupIndex++;
+		data.setByte(rowGroupOffset + rowId, value);
 	}
 
 	@Override
 	public void putBytes(int rowId, int count, byte value) {
-		rowCnt += count;
-		data.setMemory(rowId, count, value);
+		rowGroupIndex += count;
+		data.setMemory(rowGroupOffset + rowId, count, value);
 	}
 
 	@Override
 	public void putBytes(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
-		data.setBytes(rowId, src, srcIndex, count);
+		rowGroupIndex += count;
+		data.setBytes(rowGroupOffset + rowId, src, srcIndex, count);
 	}
 
 	@Override
 	public void putShort(int rowId, short value) {
-		rowCnt++;
+		rowGroupIndex++;
+		rowId += rowGroupOffset;
 		data.setShort(rowId * 2L, value);
 	}
 
 	@Override
 	public void putShorts(int rowId, int count, short value) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setShort(offset * 2L, value);
 		}
@@ -434,25 +474,29 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putShorts(int rowId, int count, short[] src, int srcIndex) {
-		rowCnt++;
+		rowGroupIndex++;
+		rowId += rowGroupOffset;
 		data.setShorts(rowId * 2L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putShorts(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setBytes(rowId * 2L, src, srcIndex, count * 2L);
 	}
 
 	@Override
 	public void putInt(int rowId, int value) {
-		rowCnt++;
+		rowGroupIndex++;
+		rowId += rowGroupOffset;
 		data.setInt(rowId * 4L, value);
 	}
 
 	@Override
 	public void putInts(int rowId, int count, int value) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setInt(offset * 4L, value);
 		}
@@ -460,21 +504,23 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putInts(int rowId, int count, int[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setInts(rowId * 4L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putInts(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setBytes(rowId * 4L, src, srcIndex, count * 4L);
 	}
 
 	@Override
 	public void putIntsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
-		long offset = 4L * rowId;
+		long offset = 4L * (rowGroupOffset + rowId);
 		for (int i = 0; i < count; ++i, offset += 4) {
 			data.setInt(offset, bb.getInt(srcIndex + (4 * i)));
 		}
@@ -482,13 +528,15 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putLong(int rowId, long value) {
-		rowCnt++;
+		rowGroupIndex++;
+		rowId += rowGroupOffset;
 		data.setLong(rowId * 8L, value);
 	}
 
 	@Override
 	public void putLongs(int rowId, int count, long value) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setLong(offset * 8L, value);
 		}
@@ -496,35 +544,39 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putLongs(int rowId, int count, long[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setLongs(rowId * 8L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putLongs(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setBytes(rowId * 8L, src, srcIndex, count * 8L);
 	}
 
 	@Override
 	public void putLongsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
-		long offset = 8L * rowId;
+		long offset = 8L * (rowGroupOffset + rowId);
 		for (int i = 0; i < count; ++i, offset += 8) {
-			data.setLong(offset, bb.getLong(srcIndex + (8 * i)));
+			data.setLong(offset, bb.getLong(srcIndex + 8 * i));
 		}
 	}
 
 	@Override
 	public void putFloat(int rowId, float value) {
-		rowCnt++;
+		rowGroupIndex++;
+		rowId += rowGroupOffset;
 		data.setFloat(rowId * 4L, value);
 	}
 
 	@Override
 	public void putFloats(int rowId, int count, float value) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setFloat(offset * 4L, value);
 		}
@@ -532,21 +584,23 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putFloats(int rowId, int count, float[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setFloats(rowId * 4L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putFloats(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setBytes(rowId * 4L, src, srcIndex * 4L, count * 4L);
 	}
 
 	@Override
 	public void putFloatsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
-		long offset = 4L * rowId;
+		long offset = 4L * (rowGroupOffset + rowId);
 		for (int i = 0; i < count; ++i, offset += 4) {
 			data.setFloat(offset, bb.getFloat(srcIndex + (4 * i)));
 		}
@@ -554,13 +608,15 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putDouble(int rowId, double value) {
-		rowCnt++;
+		rowGroupIndex++;
+		rowId += rowGroupOffset;
 		data.setDouble(rowId * 8L, value);
 	}
 
 	@Override
 	public void putDoubles(int rowId, int count, double value) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		for (int offset = rowId; offset < rowId + count; offset++) {
 			data.setDouble(offset * 8L, value);
 		}
@@ -568,22 +624,23 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putDoubles(int rowId, int count, double[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setDoubles(rowId * 8L, src, srcIndex, count);
 	}
 
 	@Override
 	public void putDoubles(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
+		rowGroupIndex += count;
+		rowId += rowGroupOffset;
 		data.setBytes(rowId * 8L, src, srcIndex, count * 8L);
 	}
 
 	@Override
 	public void putDoublesLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		rowCnt += count;
-
+		rowGroupIndex += count;
 		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
-		long offset = 8L * rowId;
+		long offset = 8L * (rowGroupOffset + rowId);
 		for (int i = 0; i < count; ++i, offset += 8) {
 			data.setDouble(offset, bb.getDouble(srcIndex + (8 * i)));
 		}
@@ -591,12 +648,17 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putArray(int rowId, int offset, int length) {
-		rowCnt++;
+		rowGroupIndex++;
 
+		rowId += rowGroupOffset;
+		offset += rowGroupArrayOffset;
 		arrayOffsets[rowId] = offset;
 		arrayLengths[rowId] = length;
 
-		if (length == 0) return;
+		if (length == 0) {
+			rowGroupArrayIndex++;
+			return;
+		}
 
 		if (!childrenRanges.isEmpty() && childrenRanges.get(childrenRanges.size() - 1) == offset) {
 			childrenRanges.set(childrenRanges.size() - 1, offset + length);
@@ -605,13 +667,15 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			childrenRanges.add(offset + length);
 		}
 		selectedLength += length;
+		rowGroupArrayIndex += length;
 	}
 
 	@Override
 	public int putByteArray(int rowId, byte[] value, int offset, int length) {
-		rowCnt++;
+		rowGroupIndex++;
 
-		int result = arrayData().appendBytes(length, value, offset);
+		rowId += rowGroupOffset;
+		int result = arrayData().appendBytes(length, value, offset) + rowGroupStringOffset;
 		for (int i = lastCharRowId + 1; i < rowId; ++i) {
 			charOffset.setInt((i + 1) * 4L, result);
 		}
@@ -622,7 +686,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void reserve(int requiredCapacity) {
-		super.reserve(requiredCapacity);
+		super.reserve(requiredCapacity + rowGroupOffset);
 	}
 
 	@Override

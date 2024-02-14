@@ -94,18 +94,32 @@ class VectorizedParquetGpuProducer(
     }
   }
 
+  private def releaseDefRepVectors(parquetCVs: Array[ParquetColumnVector]): Unit = {
+    parquetCVs.foreach { pcv =>
+      if (pcv.getDefinitionLevelVector != null) {
+        pcv.getDefinitionLevelVector.close()
+      }
+      if (pcv.getRepetitionLevelVector != null) {
+        pcv.getRepetitionLevelVector.close()
+      }
+      if (pcv.getChildren.size() > 0) {
+        releaseDefRepVectors(pcv.getChildren.asScala.toArray)
+      }
+    }
+  }
+
   // Performed all the host-side reading work before transferring to device
   private lazy val hostBatches: mutable.Queue[Array[HostColumnVector]] = {
 
     val buffer = mutable.Queue.empty[Array[HostColumnVector]]
 
-    val pageBuilder = mutable.ArrayBuffer.empty[PageReadStore]
+    val rowGroupBuilder = mutable.ArrayBuffer.empty[PageReadStore]
     do {
-      pageBuilder += pageReader.readNextFilteredRowGroup()
-    } while (pageBuilder.last != null)
-    val pages = pageBuilder.dropRight(1).toArray
+      rowGroupBuilder += pageReader.readNextFilteredRowGroup()
+    } while (rowGroupBuilder.last != null)
+    val rowGroups = rowGroupBuilder.dropRight(1).toArray
 
-    val totalRowCnt = pages.foldLeft(0)((s, x) => s + x.getRowCount.toInt)
+    val totalRowCnt = rowGroups.foldLeft(0)((s, x) => s + x.getRowCount.toInt)
     val rowBatchSize = (tgtBatchSize.toDouble / len * totalRowCnt).toInt max 1
     logWarning(s"total row count: $totalRowCnt ; batch size in row: $rowBatchSize")
 
@@ -113,7 +127,7 @@ class VectorizedParquetGpuProducer(
     var remainBatchRows = rowBatchSize min totalRowCnt
     createParquetColumnVectors(remainBatchRows)
 
-    pages.foreach { page: PageReadStore =>
+    rowGroups.foreach { rowGroup: PageReadStore =>
       // update column readers to read the new page
       val stack = mutable.Stack[ParquetColumnVector](columnVectors: _*)
       while (stack.nonEmpty) {
@@ -123,7 +137,7 @@ class VectorizedParquetGpuProducer(
               new VectorizedColumnReader(
                 cv.getColumn.descriptor.get,
                 cv.getColumn.required,
-                page,
+                rowGroup,
                 null,
                 dateRebaseMode.value,
                 TimeZone.getDefault.getID,
@@ -135,7 +149,7 @@ class VectorizedParquetGpuProducer(
         }
       }
 
-      var remainPageRows = page.getRowCount.toInt
+      var remainPageRows = rowGroup.getRowCount.toInt
       while (remainPageRows > 0) {
         val readSize = remainBatchRows min remainPageRows
         remainPageRows -= readSize
@@ -149,11 +163,17 @@ class VectorizedParquetGpuProducer(
                 leaf.getRepetitionLevelVector, leaf.getDefinitionLevelVector)
             case _ =>
           }
+          cv.assemble()
+          // Reset all value vectors(HostWritableColumnVector) along with def/repVectors.
+          // The reset is essential because we are going to either finalize current batch
+          // or read another RowGroup, or even both.
+          // As of value vectors, reset means update the offsets of target buffers.
+          // As of def/repVectors vectors, reset simply means re-initialize.
+          cv.reset()
         }
 
         if (remainBatchRows == 0) {
           // materialize current batch in the memory layout of cuDF column vector
-          columnVectors.foreach(_.assemble())
           buffer.enqueue(hostColumnBuilders.map(_.build()))
           // logWarning(s"Build host buffer(batchSize:$curBatchSize; " +
           //   s"remainPageRows:$remainPageRows; remainTotalRows: $remainTotalRows)")
@@ -161,27 +181,15 @@ class VectorizedParquetGpuProducer(
           if (remainTotalRows > 0) {
             // update batch size and remaining
             remainBatchRows = rowBatchSize min remainTotalRows
-
-            // reset data vectors with the new batch size
+            // Do the "real" reset of data vectors while initializing them for the upcoming batch
             hostColumnBuilders.foreach(_.reAllocate(remainBatchRows))
-            // reset the DefVector/repVector with the new batch size
-            columnVectors.foreach(_.reset())
-            /* columnVectors.foreach { cv =>
-               cv.getLeaves.asScala.foreach {
-                case leaf if leaf.getColumnReader != null =>
-                  if (leaf.getDefinitionLevelVector != null) {
-                     leaf.getDefinitionLevelVector.reserve(remainBatchRows)
-                   }
-                  if (leaf.getRepetitionLevelVector != null) {
-                     leaf.getRepetitionLevelVector.reserve(remainBatchRows)
-                  }
-                case _ =>
-              }
-            } */
           }
         }
       }
     }
+
+    // release RepetitionLevelVectors and DefinitionLevelVectors which consuming OFF_HEAP memory
+    releaseDefRepVectors(columnVectors)
 
     buffer
   }
