@@ -83,7 +83,7 @@ class VectorizedParquetGpuProducer(
 
   private var columnVectors: Array[ParquetColumnVector] = _
 
-  private def createParquetColumnVectors(batchSize: Int): Unit = {
+  private def createEverything(batchSize: Int): Unit = {
     hostColumnBuilders = parquetColumn.sparkType.asInstanceOf[StructType].fields.map { f =>
       new HostWritableColumnVector(batchSize, f.dataType)
     }
@@ -94,7 +94,7 @@ class VectorizedParquetGpuProducer(
     }
   }
 
-  private def releaseDefRepVectors(parquetCVs: Array[ParquetColumnVector]): Unit = {
+  private def releaseEverything(parquetCVs: Array[ParquetColumnVector]): Unit = {
     parquetCVs.foreach {
       case pcv if pcv.getColumn.isPrimitive =>
         if (pcv.getDefinitionLevelVector != null) {
@@ -103,8 +103,10 @@ class VectorizedParquetGpuProducer(
         if (pcv.getRepetitionLevelVector != null) {
           pcv.getRepetitionLevelVector.close()
         }
+        pcv.getValueVector.close()
       case pcv =>
-        releaseDefRepVectors(pcv.getChildren.asScala.toArray)
+        pcv.getValueVector.close()
+        releaseEverything(pcv.getChildren.asScala.toArray)
     }
   }
 
@@ -125,7 +127,7 @@ class VectorizedParquetGpuProducer(
 
     var remainTotalRows = totalRowCnt
     var remainBatchRows = rowBatchSize min totalRowCnt
-    createParquetColumnVectors(remainBatchRows)
+    createEverything(remainBatchRows)
 
     rowGroups.foreach { rowGroup: PageReadStore =>
       // update column readers to read the new page
@@ -177,16 +179,14 @@ class VectorizedParquetGpuProducer(
           buffer.enqueue(hostColumnBuilders.map(_.build()))
           // update batch size and remaining
           remainBatchRows = rowBatchSize min remainTotalRows
-          // Do the "real" reset of data vectors while initializing them for the upcoming batch
-          // The reallocation is useful even for the last batch (when remainBatchRows = 0). It
-          // corrects the refCounts of buffer in order to ensure no memery leak will take place.
-          hostColumnBuilders.foreach(_.clearAndReallocate(remainBatchRows))
+          // Reset all the HostColumnBuffers for the upcoming batch
+          hostColumnBuilders.foreach(_.reallocate(remainBatchRows))
         }
       }
     }
 
-    // release RepetitionLevelVectors and DefinitionLevelVectors which consuming OFF_HEAP memory
-    releaseDefRepVectors(columnVectors)
+    // release all work buffers since all work are done
+    releaseEverything(columnVectors)
 
     buffer
   }

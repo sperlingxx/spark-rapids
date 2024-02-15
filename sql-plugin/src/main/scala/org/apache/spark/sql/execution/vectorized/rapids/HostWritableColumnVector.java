@@ -21,11 +21,12 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Random;
 
 import ai.rapids.cudf.*;
-
-import com.google.crypto.tink.subtle.Random;
 import com.nvidia.spark.rapids.GpuColumnVector;
+import org.apache.commons.lang3.tuple.Pair;
+
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.UTF8String;
 
@@ -52,7 +53,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		super(capacity, type);
 		this.capacity = 0;
 		childrenRanges = new ArrayList<>();
-		reserveInternal(capacity);
+		resetAllBuffers(capacity, false);
 	}
 
 	public HostColumnVector build() {
@@ -62,8 +63,9 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		initRanges.add(0);
 		initRanges.add(rowGroupOffset);
 
-		return (HostColumnVector) buildImpl(initRanges, rowGroupOffset, true,
-				Random.randInt(Integer.MAX_VALUE - 1));
+		return (HostColumnVector) buildImpl(initRanges,
+				rowGroupOffset, true,
+				new Random().nextInt(Integer.MAX_VALUE - 1));
 	}
 
 	private HostColumnVectorCore buildImpl(List<Integer> ranges, int rangeLength, boolean topLevel, int rdSeed) {
@@ -77,35 +79,36 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 		HostMemoryBuffer offsetBuffer = null;
 		HostMemoryBuffer validBuffer = null;
+		HostMemoryBuffer dataBuffer = null;
 		Optional<Long> nullCnt = Optional.of((long) numNulls);
 
 		if (type instanceof MapType || type instanceof ArrayType) {
 			// Merge current range with parent ranges
-			gatherNestedRanges(ranges, rangeLength);
+			Pair<int[], int[]> arrayHelpers = gatherNestedRanges(ranges, rangeLength);
 			// Convert arrayOffset/arrayLength to cuDF offset buffer
-			offsetBuffer = buildOffsetBuffer(rangeLength);
-			// release offsets and lengths
+			offsetBuffer = buildOffsetBuffer(arrayHelpers.getLeft(), arrayHelpers.getRight(), rangeLength);
 			arrayOffsets = null;
 			arrayLengths = null;
 		} else if (type instanceof StringType) {
 			// Gather String(Array[Byte]) with potential existed parent ranges
-			gatherByteArray(ranges, rangeLength);
-			offsetBuffer = charOffset;
+			Pair<HostMemoryBuffer, HostMemoryBuffer> pair = gatherByteArray(ranges, rangeLength);
+			offsetBuffer = pair.getLeft();
+			dataBuffer = pair.getRight();
 		} else if (type instanceof StructType) {
 			childrenRanges = ranges;
 			selectedLength = rangeLength;
 		} else {
-			gatherFixedWidthBuffer(ranges, rangeLength, cudfType.getSizeInBytes());
+			dataBuffer = gatherFixedWidthBuffer(ranges, rangeLength, cudfType.getSizeInBytes());
 		}
 
 		if (valids != null) {
 			// Truncate valid (temp) array via Ranges
-			gatherValidBuffer(ranges, rangeLength);
+			HostMemoryBuffer byteMask = gatherValidBuffer(ranges, rangeLength);
 			// Build bitwise validity mask
-			if (!ranges.isEmpty()) {
-				validBuffer = buildNullMask(rangeLength);
+			if (byteMask != null) {
+				validBuffer = buildNullMask(byteMask, rangeLength);
+				byteMask.close();
 			}
-			valids.close();
 		}
 
 		// Build child columns of "real" nested types recursively (StringType is NOT even it contains childColumns)
@@ -116,6 +119,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 						childrenRanges, selectedLength, false, rdSeed));
 			}
 		}
+		childrenRanges.clear();
 
 		// Wrap the level of Struct to adapt cuDF layout for MapType
 		// Array[(keyCol, valueCol)] => Array[Struct[keyCol, valueCol]]
@@ -131,25 +135,32 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 		if (topLevel) {
 			return new HostColumnVector(
-					cudfType, rangeLength, nullCnt, data, validBuffer, offsetBuffer, children);
+					cudfType, rangeLength, nullCnt, dataBuffer, validBuffer, offsetBuffer, children);
 		}
 		return new HostColumnVectorCore(
-				cudfType, rangeLength, nullCnt, data, validBuffer, offsetBuffer, children);
+				cudfType, rangeLength, nullCnt, dataBuffer, validBuffer, offsetBuffer, children);
 	}
 
-	private void gatherNestedRanges(List<Integer> ranges, int numRecord) {
+	private Pair<int[], int[]> gatherNestedRanges(List<Integer> ranges, int numRecord) {
 		if (ranges.isEmpty()) {
 			childrenRanges.clear();
 			selectedLength = 0;
+			return Pair.of(null, null);
+		}
+
+		int[] arrayOffsetHelper;
+		int[] arrayLengthHelper;
+
+		if (ranges.size() == 2 && ranges.get(0) == 0 && ranges.get(1) == rowGroupOffset) {
+			arrayOffsetHelper = arrayOffsets;
+			arrayLengthHelper = arrayLengths;
 			arrayOffsets = null;
 			arrayLengths = null;
-			return;
+			return Pair.of(arrayOffsetHelper, arrayLengthHelper);
 		}
-		if (ranges.size() == 2 && ranges.get(0) == 0 && ranges.get(1) == rowGroupOffset) {
-			return;
-		}
-		int[] newArrayOffsets = new int[numRecord];
-		int[] newArrayLengths = new int[numRecord];
+
+		arrayOffsetHelper = new int[numRecord];
+		arrayLengthHelper = new int[numRecord];
 		int dstOffset = 0, newSelectedLength = 0;
 		List<Integer> newChildRanges = new ArrayList<>();
 		int rangeUb = -1, rangeIndex = -1;
@@ -160,8 +171,8 @@ public class HostWritableColumnVector extends WritableColumnVector {
 					continue;
 				}
 				// transfer arrayOffset/Length
-				newArrayOffsets[dstOffset] = arrayOffsets[j];
-				newArrayLengths[dstOffset] = arrayLengths[j];
+				arrayOffsetHelper[dstOffset] = arrayOffsets[j];
+				arrayLengthHelper[dstOffset] = arrayLengths[j];
 				newSelectedLength += arrayLengths[j];
 				// transfer Ranges
 				if (rangeUb == arrayOffsets[j]) {
@@ -175,24 +186,16 @@ public class HostWritableColumnVector extends WritableColumnVector {
 				}
 			}
 		}
-		arrayOffsets = newArrayOffsets;
-		arrayLengths = newArrayLengths;
 		selectedLength = newSelectedLength;
 		childrenRanges = newChildRanges;
+
+		return Pair.of(arrayOffsetHelper, arrayLengthHelper);
 	}
 
-	private void gatherByteArray(List<Integer> ranges, int numRecord) {
+	private Pair<HostMemoryBuffer, HostMemoryBuffer> gatherByteArray(List<Integer> ranges, int numRecord) {
 		if (ranges.isEmpty()) {
-			if (charOffset != null) {
-				charOffset.close();
-				charOffset = null;
-			}
-			if (childColumns != null) {
-				((HostWritableColumnVector) childColumns[0]).data.close();
-				((HostWritableColumnVector) childColumns[0]).data = null;
-			}
 			assert data == null;
-			return;
+			return Pair.of(null, null);
 		}
 
 		// padding tail values
@@ -203,123 +206,130 @@ public class HostWritableColumnVector extends WritableColumnVector {
 				charOffset.setInt(i * 4L, byteArrayEnd);
 		}
 
-		HostMemoryBuffer newCharOffset;
+		HostMemoryBuffer offsetBuffer;
+		HostMemoryBuffer dataBuffer;
+
 		if (ranges.size() == 2) {
+			// Transfer charOffset buffer in the manner of zero-copy
 			long offset = ranges.get(0) * 4L;
 			long size = (ranges.get(1) + 1) * 4L - offset;
-			newCharOffset = charOffset.slice(offset, size);
+			offsetBuffer = charOffset.slice(offset, size);
+			charOffset.close();
+			charOffset = null;
 		} else {
-			newCharOffset = HostMemoryBuffer.allocate((numRecord + 1) * 4L);
+			// Do the real data copy, and keep the charOffset buffer for potential reuse
+			offsetBuffer = HostMemoryBuffer.allocate((numRecord + 1) * 4L);
 			long dstOff = 0;
 			for (int i = 0; i < ranges.size(); i += 2) {
 				long srcOff = ranges.get(i) * 4L;
 				long len = ranges.get(i + 1) * 4L - srcOff;
-				newCharOffset.copyFromHostBuffer(dstOff, charOffset, srcOff, len);
+				offsetBuffer.copyFromHostBuffer(dstOff, charOffset, srcOff, len);
 				dstOff += len;
 			}
 			long charOffsetEnd = ranges.get(ranges.size() - 1) * 4L;
-			newCharOffset.setInt(dstOff, charOffset.getInt(charOffsetEnd));
+			offsetBuffer.setInt(dstOff, charOffset.getInt(charOffsetEnd));
 		}
 
-		charOffset.close();
-		charOffset = newCharOffset;
-
-		data = ((HostWritableColumnVector) childColumns[0]).data;
+		// Transfer charData buffer in the manner of zero-copy
+		int byteArrayEnd = offsetBuffer.getInt(offsetBuffer.getLength() - 4);
+		HostMemoryBuffer tmpData = ((HostWritableColumnVector) childColumns[0]).data;
+		dataBuffer = tmpData.slice(0, byteArrayEnd);
+		tmpData.close();
 		((HostWritableColumnVector) childColumns[0]).data = null;
-		int byteArrayEnd = charOffset.getInt(charOffset.getLength() - 4);
-		HostMemoryBuffer newData = data.slice(0, byteArrayEnd);
-		data.close();
-		data = newData;
+
+		return Pair.of(offsetBuffer, dataBuffer);
 	}
 
-	private void gatherFixedWidthBuffer(List<Integer> ranges, int numRecord, long rcdWidth) {
-		if (ranges.isEmpty()) {
-			if (data != null) {
-				data.close();
-				data = null;
-			}
-			return;
-		}
+	private HostMemoryBuffer gatherFixedWidthBuffer(List<Integer> ranges, int numRecord, long rcdWidth) {
+		if (ranges.isEmpty()) return null;
 
-		HostMemoryBuffer newData;
+		HostMemoryBuffer dataBuffer;
 		if (ranges.size() == 2) {
+			// Transfer data buffer in the manner of zero-copy
 			long offset = ranges.get(0) * rcdWidth;
 			long size = ranges.get(1) * rcdWidth - offset;
-			newData = data.slice(offset, size);
+			dataBuffer = data.slice(offset, size);
+			data.close();
+			data = null;
 		} else {
-			newData = HostMemoryBuffer.allocate(numRecord * rcdWidth);
+			// Do the real data copy, and keep the data buffer for potential reuse
+			dataBuffer = HostMemoryBuffer.allocate(numRecord * rcdWidth);
 			long dstOffset = 0;
 			for (int i = 0; i < ranges.size(); i += 2) {
 				long offset = ranges.get(i);
 				long length = ranges.get(i + 1) - offset;
-				newData.copyFromHostBuffer(dstOffset * rcdWidth,
+				dataBuffer.copyFromHostBuffer(dstOffset * rcdWidth,
 						data, offset * rcdWidth, length * rcdWidth);
 				dstOffset += length;
 			}
 		}
-		data.close();
-		data = newData;
+		return dataBuffer;
 	}
 
-	private void gatherValidBuffer(List<Integer> ranges, int rangeLength) {
+	private HostMemoryBuffer gatherValidBuffer(List<Integer> ranges, int rangeLength) {
 		if (ranges.isEmpty()) {
 			numNulls = 0;
-			return;
+			return null;
 		}
+
+		HostMemoryBuffer validBuffer;
+		// zero-copy path
 		if (ranges.size() == 2 && ranges.get(0) == 0 && ranges.get(1) == rowGroupOffset) {
-			return;
+			validBuffer = valids;
+			valids = null;
+			return validBuffer;
 		}
-		HostMemoryBuffer newValids = HostMemoryBuffer.allocate(rangeLength, false);
+		// real data copy path
+		validBuffer = HostMemoryBuffer.allocate(rangeLength, false);
 		int dstOffset = 0;
 		for (int i = 0; i < ranges.size(); i += 2) {
 			int offset = ranges.get(i);
 			int length = ranges.get(i + 1) - offset;
-			newValids.copyFromHostBuffer(dstOffset, valids, offset, length);
+			validBuffer.copyFromHostBuffer(dstOffset, valids, offset, length);
 			dstOffset += length;
 		}
-		valids.close();
-		valids = newValids;
+		return validBuffer;
 	}
 
-	private HostMemoryBuffer buildOffsetBuffer(int numRecord) {
-		if (arrayOffsets == null) return null;
+	private HostMemoryBuffer buildOffsetBuffer(int[] offsets, int[] lengths, int numRecord) {
+		if (offsets == null) return null;
 
 		HostMemoryBuffer offBuf = HostMemoryBuffer.allocate((numRecord + 1) * 4L);
 		offBuf.setInt(0L, 0);
 		int lastIndex = 0;
 		for (int i = 0; i < numRecord; ++i) {
-			lastIndex += arrayLengths[i];
+			lastIndex += lengths[i];
 			offBuf.setInt((i + 1) * 4L, lastIndex);
 		}
 
 		return offBuf;
 	}
 
-	private HostMemoryBuffer buildNullMask(int numRecord) {
+	private HostMemoryBuffer buildNullMask(HostMemoryBuffer byteMask, int numRecord) {
 		long actualBytes = ((long) numRecord + 7) >> 3;
 		long paddingBytes = ((actualBytes + 63) >> 6) << 6;
-		HostMemoryBuffer nullMask = HostMemoryBuffer.allocate(paddingBytes);
+		HostMemoryBuffer bitMask = HostMemoryBuffer.allocate(paddingBytes);
 		for (int i = 0; i < numRecord - 7; i += 8) {
-			int mask = (valids.getByte(i) ^ 1)
-					| ((valids.getByte(i + 1) ^ 1) << 1)
-					| ((valids.getByte(i + 2) ^ 1) << 2)
-					| ((valids.getByte(i + 3) ^ 1) << 3)
-					| ((valids.getByte(i + 4) ^ 1) << 4)
-					| ((valids.getByte(i + 5) ^ 1) << 5)
-					| ((valids.getByte(i + 6) ^ 1) << 6)
-					| ((valids.getByte(i + 7) ^ 1) << 7);
-			nullMask.setByte(i >> 3, (byte) mask);
+			int mask = (byteMask.getByte(i) ^ 1)
+					| ((byteMask.getByte(i + 1) ^ 1) << 1)
+					| ((byteMask.getByte(i + 2) ^ 1) << 2)
+					| ((byteMask.getByte(i + 3) ^ 1) << 3)
+					| ((byteMask.getByte(i + 4) ^ 1) << 4)
+					| ((byteMask.getByte(i + 5) ^ 1) << 5)
+					| ((byteMask.getByte(i + 6) ^ 1) << 6)
+					| ((byteMask.getByte(i + 7) ^ 1) << 7);
+			bitMask.setByte(i >> 3, (byte) mask);
 		}
 		int lastByte = 0;
 		int j = 0;
 		for (int i = (numRecord >> 3) << 3; i < numRecord; i++) {
-			lastByte |= ((valids.getByte(i) ^ 1) << j++);
+			lastByte |= ((byteMask.getByte(i) ^ 1) << j++);
 		}
 		if (j > 0) {
-			nullMask.setByte(numRecord >> 3, (byte) lastByte);
+			bitMask.setByte(numRecord >> 3, (byte) lastByte);
 		}
 
-		return nullMask;
+		return bitMask;
 	}
 
 	@Override
@@ -338,32 +348,12 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		elementsAppended = 0;
 	}
 
-	public void clearAndReallocate(int newCapacity) {
+	public void reallocate(int newCapacity) {
 		this.capacity = 0;
 		this.elementsAppended = 0;
 		this.numNulls = 0;
 
-		if (data != null) {
-			while (data.getRefCount() > 1) data.close();
-			data = null;
-		}
-		if (charOffset != null) {
-			while (charOffset.getRefCount() > 1) charOffset.close();
-			charOffset = null;
-		}
-		if (valids != null) {
-			while (valids.getRefCount() > 0) valids.close();
-			valids = null;
-		}
-		if (dictionaryIds != null) {
-			dictionaryIds.close();
-			dictionary = null;
-			dictionaryIds = null;
-		}
-
 		lastCharRowId = -1;
-		arrayLengths = null;
-		arrayOffsets = null;
 		selectedLength = 0;
 		childrenRanges = new ArrayList<>();
 
@@ -374,7 +364,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		this.rowGroupStringOffset = 0;
 
 		if (newCapacity > 0) {
-			reserveInternal(newCapacity);
+			resetAllBuffers(newCapacity, false);
 		}
 
 		if (childColumns != null) {
@@ -382,7 +372,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 				newCapacity *= DEFAULT_ARRAY_LENGTH;
 			}
 			for (WritableColumnVector ch : childColumns) {
-				((HostWritableColumnVector) ch).clearAndReallocate(newCapacity);
+				((HostWritableColumnVector) ch).reallocate(newCapacity);
 			}
 		}
 	}
@@ -424,7 +414,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			rowGroupArrayIndex++;
 		}
 		if (valids == null) {
-			initNullMask(capacity);
+			allocateNullVector(capacity, true);
 		}
 		valids.setByte(rowGroupOffset + rowId, (byte) 1);
 		++numNulls;
@@ -434,7 +424,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	public void putNulls(int rowId, int count) {
 		rowGroupIndex += count;
 		if (valids == null) {
-			initNullMask(capacity);
+			allocateNullVector(capacity, true);
 		}
 		valids.setMemory(rowGroupOffset + rowId, count, (byte) 1);
 		numNulls += count;
@@ -712,37 +702,31 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	protected void reserveInternal(int newCap) {
+		resetAllBuffers(newCap, true);
+	}
+
+	private void resetAllBuffers(int newCap, boolean keepData) {
 		if (valids != null) {
-			initNullMask(newCap);
+			allocateNullVector(newCap, keepData);
 		}
+
 		if (type instanceof ArrayType || type instanceof MapType) {
-			int[] newLengths = new int[newCap];
-			int[] newOffsets = new int[newCap];
-			if (this.arrayLengths != null) {
-				System.arraycopy(this.arrayLengths, 0, newLengths, 0, capacity);
-				System.arraycopy(this.arrayOffsets, 0, newOffsets, 0, capacity);
-			}
-			arrayLengths = newLengths;
-			arrayOffsets = newOffsets;
+			allocateArrayHelpers(newCap, keepData);
 		} else if (isArray()) {
-			HostMemoryBuffer newOffsets = moveBuffer(
-					HostMemoryBuffer.allocate((newCap + 1) * 4L), charOffset);
-			if (charOffset == null) {
-				newOffsets.setInt(0, 0);
-			}
-			charOffset = newOffsets;
+			charOffset = transferBuffer((newCap + 1) * 4L, charOffset, keepData, false);
+			charOffset.setInt(0, 0);
 		} else if (type instanceof ByteType || type instanceof BooleanType) {
-			data = moveBuffer(HostMemoryBuffer.allocate(newCap), data);
+			data = transferBuffer(newCap, data, keepData, false);
 		} else if (type instanceof ShortType) {
-			data = moveBuffer(HostMemoryBuffer.allocate(newCap * 2L), data);
+			data = transferBuffer(newCap * 2L, data, keepData, false);
 		} else if (type instanceof IntegerType || type instanceof FloatType ||
 				type instanceof DateType || DecimalType.is32BitDecimalType(type) ||
 				type instanceof YearMonthIntervalType) {
-			data = moveBuffer(HostMemoryBuffer.allocate(newCap * 4L), data);
+			data = transferBuffer(newCap * 4L, data, keepData, false);
 		} else if (type instanceof LongType || type instanceof DoubleType ||
 				DecimalType.is64BitDecimalType(type) || type instanceof TimestampType ||
 				type instanceof TimestampNTZType || type instanceof DayTimeIntervalType) {
-			data = moveBuffer(HostMemoryBuffer.allocate(newCap * 8L), data);
+			data = transferBuffer(newCap * 8L, data, keepData, false);
 		} else if (childColumns != null) {
 			// Nothing to store.
 		} else {
@@ -752,17 +736,31 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		capacity = newCap;
 	}
 
-	private void initNullMask(int capacity) {
-		if (valids == null) {
-			valids = HostMemoryBuffer.allocate(capacity, false);
+	private void allocateNullVector(int capacity, boolean keepData) {
+		long currentSize = valids == null ? 0 : valids.getLength();
+
+		valids = transferBuffer(capacity, valids, keepData, false);
+
+		if (!keepData) {
 			valids.setMemory(0, capacity, (byte) 0);
-		} else {
-			HostMemoryBuffer newValids = HostMemoryBuffer.allocate(capacity, false);
-			newValids.setMemory(valids.getLength(), capacity - valids.getLength(), (byte) 0);
-			newValids.copyFromHostBuffer(0, valids, 0, valids.getLength());
-			valids.close();
-			valids = newValids;
+		} else if (currentSize < capacity) {
+			valids.setMemory(currentSize, capacity - currentSize, (byte) 0);
 		}
+	}
+
+	private void allocateArrayHelpers(int capacity, boolean keepData) {
+		int currentSize = arrayLengths == null ? 0 : arrayLengths.length;
+
+		if (currentSize >= capacity) return;
+
+		int[] newLengths = new int[capacity];
+		int[] newOffsets = new int[capacity];
+		if (keepData && currentSize > 0) {
+			System.arraycopy(this.arrayLengths, 0, newLengths, 0, currentSize);
+			System.arraycopy(this.arrayOffsets, 0, newOffsets, 0, currentSize);
+		}
+		arrayLengths = newLengths;
+		arrayOffsets = newOffsets;
 	}
 
 	@Override
@@ -782,19 +780,35 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		return dictionaryIds;
 	}
 
-	private HostMemoryBuffer moveBuffer(HostMemoryBuffer targetBuffer, HostMemoryBuffer buffer) {
-		try {
-			if (buffer != null) {
-				targetBuffer.copyFromHostBuffer(0, buffer, 0, buffer.getLength());
-				buffer.close();
-			}
-			return targetBuffer;
-		} catch (Exception e) {
-			if (targetBuffer != null) {
-				targetBuffer.close();
-			}
-			throw e;
+	private HostMemoryBuffer transferBuffer(long targetSize,
+																					HostMemoryBuffer buffer,
+																					boolean keepData,
+																					boolean usePinnedMemory) {
+		assert targetSize > 0;
+		long currentSize = buffer == null ? 0L : buffer.getLength();
+
+		if (currentSize == targetSize) {
+			return buffer;
 		}
+
+		if (currentSize > targetSize) {
+			if (keepData) {
+				throw new RuntimeException("Can NOT keep data because targetSize < currentSize");
+			}
+			HostMemoryBuffer sliced = buffer.slice(0, targetSize);
+			buffer.close();
+			return sliced;
+		}
+
+		HostMemoryBuffer extended = HostMemoryBuffer.allocate(targetSize, usePinnedMemory);
+		if (currentSize > 0) {
+			if (keepData) {
+				extended.copyFromHostBuffer(0, buffer, 0, currentSize);
+			}
+			buffer.close();
+		}
+
+		return extended;
 	}
 
 	@Override
@@ -864,9 +878,20 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		super.close();
 		arrayLengths = null;
 		arrayOffsets = null;
-		if (data != null) data.close();
-		if (charOffset != null) charOffset.close();
-		if (valids != null) valids.close();
+		if (data != null) {
+			while (data.getRefCount() > 0) data.close();
+		}
+		if (charOffset != null) {
+			while (charOffset.getRefCount() > 0) charOffset.close();
+		}
+		if (valids != null) {
+			while (valids.getRefCount() > 0) valids.close();
+		}
+		if (dictionaryIds != null) {
+			dictionaryIds.close();
+			dictionary = null;
+			dictionaryIds = null;
+		}
 	}
 
 	private void dumpOffsetVector(HostMemoryBuffer offsetBuffer, int rdSeed) {
