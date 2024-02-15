@@ -95,16 +95,16 @@ class VectorizedParquetGpuProducer(
   }
 
   private def releaseDefRepVectors(parquetCVs: Array[ParquetColumnVector]): Unit = {
-    parquetCVs.foreach { pcv =>
-      if (pcv.getDefinitionLevelVector != null) {
-        pcv.getDefinitionLevelVector.close()
-      }
-      if (pcv.getRepetitionLevelVector != null) {
-        pcv.getRepetitionLevelVector.close()
-      }
-      if (pcv.getChildren.size() > 0) {
+    parquetCVs.foreach {
+      case pcv if pcv.getColumn.isPrimitive =>
+        if (pcv.getDefinitionLevelVector != null) {
+          pcv.getDefinitionLevelVector.close()
+        }
+        if (pcv.getRepetitionLevelVector != null) {
+          pcv.getRepetitionLevelVector.close()
+        }
+      case pcv =>
         releaseDefRepVectors(pcv.getChildren.asScala.toArray)
-      }
     }
   }
 
@@ -175,15 +175,12 @@ class VectorizedParquetGpuProducer(
         if (remainBatchRows == 0) {
           // materialize current batch in the memory layout of cuDF column vector
           buffer.enqueue(hostColumnBuilders.map(_.build()))
-          // logWarning(s"Build host buffer(batchSize:$curBatchSize; " +
-          //   s"remainPageRows:$remainPageRows; remainTotalRows: $remainTotalRows)")
-
-          if (remainTotalRows > 0) {
-            // update batch size and remaining
-            remainBatchRows = rowBatchSize min remainTotalRows
-            // Do the "real" reset of data vectors while initializing them for the upcoming batch
-            hostColumnBuilders.foreach(_.reAllocate(remainBatchRows))
-          }
+          // update batch size and remaining
+          remainBatchRows = rowBatchSize min remainTotalRows
+          // Do the "real" reset of data vectors while initializing them for the upcoming batch
+          // The reallocation is useful even for the last batch (when remainBatchRows = 0). It
+          // corrects the refCounts of buffer in order to ensure no memery leak will take place.
+          hostColumnBuilders.foreach(_.clearAndReallocate(remainBatchRows))
         }
       }
     }

@@ -32,7 +32,7 @@ import org.apache.spark.unsafe.types.UTF8String;
 public class HostWritableColumnVector extends WritableColumnVector {
 
 	private HostMemoryBuffer data;
-	private byte[] valids = null;
+	private HostMemoryBuffer valids = null;
 	// offset for ArrayType|MapType
 	private int[] arrayLengths;
 	private int[] arrayOffsets;
@@ -84,6 +84,9 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			gatherNestedRanges(ranges, rangeLength);
 			// Convert arrayOffset/arrayLength to cuDF offset buffer
 			offsetBuffer = buildOffsetBuffer(rangeLength);
+			// release offsets and lengths
+			arrayOffsets = null;
+			arrayLengths = null;
 		} else if (type instanceof StringType) {
 			// Gather String(Array[Byte]) with potential existed parent ranges
 			gatherByteArray(ranges, rangeLength);
@@ -102,6 +105,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			if (!ranges.isEmpty()) {
 				validBuffer = buildNullMask(rangeLength);
 			}
+			valids.close();
 		}
 
 		// Build child columns of "real" nested types recursively (StringType is NOT even it contains childColumns)
@@ -152,7 +156,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		for (int i = 0; i < ranges.size(); i += 2) {
 			for (int j = ranges.get(i); j < ranges.get(i + 1); ++j, ++dstOffset) {
 				// skip null records because their offsets are not correctly setup
-				if (valids != null && valids[j] == (byte) 1) {
+				if (valids != null && valids.getBoolean(j)) {
 					continue;
 				}
 				// transfer arrayOffset/Length
@@ -259,21 +263,21 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	private void gatherValidBuffer(List<Integer> ranges, int rangeLength) {
 		if (ranges.isEmpty()) {
-			valids = null;
 			numNulls = 0;
 			return;
 		}
 		if (ranges.size() == 2 && ranges.get(0) == 0 && ranges.get(1) == rowGroupOffset) {
 			return;
 		}
-		byte[] newValids = new byte[rangeLength];
+		HostMemoryBuffer newValids = HostMemoryBuffer.allocate(rangeLength, false);
 		int dstOffset = 0;
 		for (int i = 0; i < ranges.size(); i += 2) {
 			int offset = ranges.get(i);
 			int length = ranges.get(i + 1) - offset;
-			System.arraycopy(valids, offset, newValids, dstOffset, length);
+			newValids.copyFromHostBuffer(dstOffset, valids, offset, length);
 			dstOffset += length;
 		}
+		valids.close();
 		valids = newValids;
 	}
 
@@ -296,20 +300,20 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		long paddingBytes = ((actualBytes + 63) >> 6) << 6;
 		HostMemoryBuffer nullMask = HostMemoryBuffer.allocate(paddingBytes);
 		for (int i = 0; i < numRecord - 7; i += 8) {
-			int mask = (valids[i] ^ 1)
-					| ((valids[i + 1] ^ 1) << 1)
-					| ((valids[i + 2] ^ 1) << 2)
-					| ((valids[i + 3] ^ 1) << 3)
-					| ((valids[i + 4] ^ 1) << 4)
-					| ((valids[i + 5] ^ 1) << 5)
-					| ((valids[i + 6] ^ 1) << 6)
-					| ((valids[i + 7] ^ 1) << 7);
+			int mask = (valids.getByte(i) ^ 1)
+					| ((valids.getByte(i + 1) ^ 1) << 1)
+					| ((valids.getByte(i + 2) ^ 1) << 2)
+					| ((valids.getByte(i + 3) ^ 1) << 3)
+					| ((valids.getByte(i + 4) ^ 1) << 4)
+					| ((valids.getByte(i + 5) ^ 1) << 5)
+					| ((valids.getByte(i + 6) ^ 1) << 6)
+					| ((valids.getByte(i + 7) ^ 1) << 7);
 			nullMask.setByte(i >> 3, (byte) mask);
 		}
 		int lastByte = 0;
 		int j = 0;
 		for (int i = (numRecord >> 3) << 3; i < numRecord; i++) {
-			lastByte |= ((valids[i] ^ 1) << j++);
+			lastByte |= ((valids.getByte(i) ^ 1) << j++);
 		}
 		if (j > 0) {
 			nullMask.setByte(numRecord >> 3, (byte) lastByte);
@@ -334,32 +338,51 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		elementsAppended = 0;
 	}
 
-	public void reAllocate(int newCapacity) {
+	public void clearAndReallocate(int newCapacity) {
 		this.capacity = 0;
 		this.elementsAppended = 0;
 		this.numNulls = 0;
-		data = null;
-		charOffset = null;
-		valids = null;
+
+		if (data != null) {
+			while (data.getRefCount() > 1) data.close();
+			data = null;
+		}
+		if (charOffset != null) {
+			while (charOffset.getRefCount() > 1) charOffset.close();
+			charOffset = null;
+		}
+		if (valids != null) {
+			while (valids.getRefCount() > 0) valids.close();
+			valids = null;
+		}
+		if (dictionaryIds != null) {
+			dictionaryIds.close();
+			dictionary = null;
+			dictionaryIds = null;
+		}
+
 		lastCharRowId = -1;
 		arrayLengths = null;
 		arrayOffsets = null;
 		selectedLength = 0;
 		childrenRanges = new ArrayList<>();
+
 		this.rowGroupIndex = 0;
 		this.rowGroupArrayIndex = 0;
 		this.rowGroupOffset = 0;
 		this.rowGroupArrayOffset = 0;
 		this.rowGroupStringOffset = 0;
 
-		reserveInternal(newCapacity);
+		if (newCapacity > 0) {
+			reserveInternal(newCapacity);
+		}
 
 		if (childColumns != null) {
-			if (isArray()) {
-					newCapacity *= DEFAULT_ARRAY_LENGTH;
+			if (isArray() && !(type instanceof ArrayType)) {
+				newCapacity *= DEFAULT_ARRAY_LENGTH;
 			}
 			for (WritableColumnVector ch : childColumns) {
-				((HostWritableColumnVector) ch).reAllocate(newCapacity);
+				((HostWritableColumnVector) ch).clearAndReallocate(newCapacity);
 			}
 		}
 	}
@@ -382,7 +405,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	public boolean isNullAt(int rowId) {
 		if (isAllNull) return true;
 		if (valids == null) return false;
-		return valids[rowGroupOffset + rowId] == 1;
+		return valids.getBoolean(rowGroupOffset + rowId);
 	}
 
 	@Override
@@ -391,7 +414,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			rowGroupIndex++;
 		}
 		if (!hasNull() || valids == null) return;
-		valids[rowGroupOffset + rowId] = 0;
+		valids.setByte(rowGroupOffset + rowId, (byte) 0);
 	}
 
 	@Override
@@ -400,19 +423,20 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		if (type instanceof ArrayType || type instanceof MapType) {
 			rowGroupArrayIndex++;
 		}
-		if (valids == null) initNullMask(capacity);
-		valids[rowGroupOffset + rowId] = 1;
+		if (valids == null) {
+			initNullMask(capacity);
+		}
+		valids.setByte(rowGroupOffset + rowId, (byte) 1);
 		++numNulls;
 	}
 
 	@Override
 	public void putNulls(int rowId, int count) {
 		rowGroupIndex += count;
-		if (valids == null) initNullMask(capacity);
-		rowId += rowGroupOffset;
-		for (int i = 0; i < count; ++i) {
-			valids[rowId + i] = 1;
+		if (valids == null) {
+			initNullMask(capacity);
 		}
+		valids.setMemory(rowGroupOffset + rowId, count, (byte) 1);
 		numNulls += count;
 	}
 
@@ -420,10 +444,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	public void putNotNulls(int rowId, int count) {
 		// rowCnt = Math.max(rowCnt, rowId + count);
 		if (!hasNull() || valids == null) return;
-		rowId += rowGroupOffset;
-		for (int i = 0; i < count; ++i) {
-			valids[rowId + i] = 0;
-		}
+		valids.setMemory(rowGroupOffset + rowId, count, (byte) 0);
 	}
 
 	@Override
@@ -731,12 +752,15 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		capacity = newCap;
 	}
 
-	private void initNullMask(int rowCapacity) {
+	private void initNullMask(int capacity) {
 		if (valids == null) {
-			valids = new byte[rowCapacity];
+			valids = HostMemoryBuffer.allocate(capacity, false);
+			valids.setMemory(0, capacity, (byte) 0);
 		} else {
-			byte[] newValids = new byte[rowCapacity];
-			System.arraycopy(valids, 0, newValids, 0, valids.length);
+			HostMemoryBuffer newValids = HostMemoryBuffer.allocate(capacity, false);
+			newValids.setMemory(valids.getLength(), capacity - valids.getLength(), (byte) 0);
+			newValids.copyFromHostBuffer(0, valids, 0, valids.getLength());
+			valids.close();
 			valids = newValids;
 		}
 	}
@@ -749,7 +773,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	@Override
 	public WritableColumnVector reserveDictionaryIds(int capacity) {
 		if (dictionaryIds == null) {
-			dictionaryIds = new OnHeapColumnVector(capacity, DataTypes.IntegerType);
+			dictionaryIds = new OffHeapColumnVector(capacity, DataTypes.IntegerType);
 		} else {
 			dictionaryIds.reset();
 			dictionaryIds.reserve(capacity);
@@ -842,6 +866,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		arrayOffsets = null;
 		if (data != null) data.close();
 		if (charOffset != null) charOffset.close();
+		if (valids != null) valids.close();
 	}
 
 	private void dumpOffsetVector(HostMemoryBuffer offsetBuffer, int rdSeed) {
