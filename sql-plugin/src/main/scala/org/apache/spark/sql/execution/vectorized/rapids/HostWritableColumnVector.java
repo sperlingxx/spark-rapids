@@ -283,7 +283,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			return validBuffer;
 		}
 		// real data copy path
-		validBuffer = HostMemoryBuffer.allocate(rangeLength, false);
+		validBuffer = HostMemoryBuffer.allocate(rangeLength);
 		int dstOffset = 0;
 		for (int i = 0; i < ranges.size(); i += 2) {
 			int offset = ranges.get(i);
@@ -700,32 +700,33 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		}
 
 		if (type instanceof ArrayType || type instanceof MapType) {
-			arrayOffsets = transferBuffer(newCap * 4L, arrayOffsets, keepData, false);
-			arrayLengths = transferBuffer(newCap * 4L, arrayLengths, keepData, false);
-			/*// Initialize the value of array helpers explicitly, because only nonNull
-			// rows will be updated.
+			arrayOffsets = transferBuffer(newCap * 4L, arrayOffsets, keepData);
+			arrayLengths = transferBuffer(newCap * 4L, arrayLengths, keepData);
+			/*
+			// Initialize the value of array helpers explicitly, because only nonNull rows will be updated.
 			if (!keepData) {
 				arrayOffsets.setMemory(0, newCap * 4L, (byte) 0);
 				arrayLengths.setMemory(0, newCap * 4L, (byte) 0);
 			} else if (capacity < newCap) {
 				arrayOffsets.setMemory(capacity * 4L, (newCap - capacity) * 4L, (byte) 0);
 				arrayLengths.setMemory(capacity * 4L, (newCap - capacity) * 4L, (byte) 0);
-			}*/
+			}
+			*/
 		} else if (isArray()) {
-			charOffset = transferBuffer((newCap + 1) * 4L, charOffset, keepData, false);
+			charOffset = transferBuffer((newCap + 1) * 4L, charOffset, keepData);
 			charOffset.setInt(0, 0);
 		} else if (type instanceof ByteType || type instanceof BooleanType) {
-			data = transferBuffer(newCap, data, keepData, false);
+			data = transferBuffer(newCap, data, keepData);
 		} else if (type instanceof ShortType) {
-			data = transferBuffer(newCap * 2L, data, keepData, false);
+			data = transferBuffer(newCap * 2L, data, keepData);
 		} else if (type instanceof IntegerType || type instanceof FloatType ||
 				type instanceof DateType || DecimalType.is32BitDecimalType(type) ||
 				type instanceof YearMonthIntervalType) {
-			data = transferBuffer(newCap * 4L, data, keepData, false);
+			data = transferBuffer(newCap * 4L, data, keepData);
 		} else if (type instanceof LongType || type instanceof DoubleType ||
 				DecimalType.is64BitDecimalType(type) || type instanceof TimestampType ||
 				type instanceof TimestampNTZType || type instanceof DayTimeIntervalType) {
-			data = transferBuffer(newCap * 8L, data, keepData, false);
+			data = transferBuffer(newCap * 8L, data, keepData);
 		} else if (childColumns != null) {
 			// Nothing to store.
 		} else {
@@ -738,7 +739,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	private void allocateNullVector(int capacity, boolean keepData) {
 		long currentSize = valids == null ? 0 : valids.getLength();
 
-		valids = transferBuffer(capacity, valids, keepData, false);
+		valids = transferBuffer(capacity, valids, keepData);
 
 		if (!keepData) {
 			valids.setMemory(0, capacity, (byte) 0);
@@ -755,7 +756,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	@Override
 	public WritableColumnVector reserveDictionaryIds(int capacity) {
 		if (dictionaryIds == null) {
-			dictionaryIds = new OffHeapColumnVector(capacity, DataTypes.IntegerType);
+			dictionaryIds = new OnHeapColumnVector(capacity, DataTypes.IntegerType);
 		} else {
 			dictionaryIds.reset();
 			dictionaryIds.reserve(capacity);
@@ -764,10 +765,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		return dictionaryIds;
 	}
 
-	private HostMemoryBuffer transferBuffer(long targetSize,
-																					HostMemoryBuffer buffer,
-																					boolean keepData,
-																					boolean usePinnedMemory) {
+	private HostMemoryBuffer transferBuffer(long targetSize, HostMemoryBuffer buffer, boolean keepData) {
 		assert targetSize > 0;
 		long currentSize = buffer == null ? 0L : buffer.getLength();
 
@@ -784,7 +782,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			return sliced;
 		}
 
-		HostMemoryBuffer extended = HostMemoryBuffer.allocate(targetSize, usePinnedMemory);
+		HostMemoryBuffer extended = HostMemoryBuffer.allocate(targetSize);
 		if (currentSize > 0) {
 			if (keepData) {
 				extended.copyFromHostBuffer(0, buffer, 0, currentSize);
