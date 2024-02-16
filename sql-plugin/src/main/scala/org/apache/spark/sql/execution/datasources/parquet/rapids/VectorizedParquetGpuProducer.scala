@@ -95,18 +95,17 @@ class VectorizedParquetGpuProducer(
   }
 
   private def releaseEverything(parquetCVs: Array[ParquetColumnVector]): Unit = {
-    parquetCVs.foreach {
-      case pcv if pcv.getColumn.isPrimitive =>
-        if (pcv.getDefinitionLevelVector != null) {
-          pcv.getDefinitionLevelVector.close()
-        }
-        if (pcv.getRepetitionLevelVector != null) {
-          pcv.getRepetitionLevelVector.close()
-        }
-        pcv.getValueVector.close()
-      case pcv =>
-        pcv.getValueVector.close()
+    parquetCVs.foreach { pcv =>
+      pcv.getValueVector.close()
+      if (pcv.getDefinitionLevelVector != null) {
+        pcv.getDefinitionLevelVector.close()
+      }
+      if (pcv.getRepetitionLevelVector != null) {
+        pcv.getRepetitionLevelVector.close()
+      }
+      if (pcv.getChildren.size() > 0) {
         releaseEverything(pcv.getChildren.asScala.toArray)
+      }
     }
   }
 
