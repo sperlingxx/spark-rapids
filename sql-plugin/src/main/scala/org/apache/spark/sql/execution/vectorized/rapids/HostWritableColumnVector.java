@@ -17,7 +17,6 @@
 package org.apache.spark.sql.execution.vectorized.rapids;
 
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -518,12 +517,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putIntsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		rowGroupIndex += count;
-		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
-		long offset = 4L * (rowGroupOffset + rowId);
-		for (int i = 0; i < count; ++i, offset += 4) {
-			data.setInt(offset, bb.getInt(srcIndex + (4 * i)));
-		}
+		putInts(rowId, count, src, srcIndex);
 	}
 
 	@Override
@@ -558,12 +552,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putLongsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		rowGroupIndex += count;
-		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
-		long offset = 8L * (rowGroupOffset + rowId);
-		for (int i = 0; i < count; ++i, offset += 8) {
-			data.setLong(offset, bb.getLong(srcIndex + 8 * i));
-		}
+		putLongs(rowId, count, src, srcIndex);
 	}
 
 	@Override
@@ -593,17 +582,12 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	public void putFloats(int rowId, int count, byte[] src, int srcIndex) {
 		rowGroupIndex += count;
 		rowId += rowGroupOffset;
-		data.setBytes(rowId * 4L, src, srcIndex * 4L, count * 4L);
+		data.setBytes(rowId * 4L, src, srcIndex, count * 4L);
 	}
 
 	@Override
 	public void putFloatsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		rowGroupIndex += count;
-		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
-		long offset = 4L * (rowGroupOffset + rowId);
-		for (int i = 0; i < count; ++i, offset += 4) {
-			data.setFloat(offset, bb.getFloat(srcIndex + (4 * i)));
-		}
+		putFloats(rowId, count, src, srcIndex);
 	}
 
 	@Override
@@ -638,12 +622,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public void putDoublesLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		rowGroupIndex += count;
-		ByteBuffer bb = ByteBuffer.wrap(src).order(ByteOrder.LITTLE_ENDIAN);
-		long offset = 8L * (rowGroupOffset + rowId);
-		for (int i = 0; i < count; ++i, offset += 8) {
-			data.setDouble(offset, bb.getDouble(srcIndex + (8 * i)));
-		}
+		putDoubles(rowId, count, src, srcIndex);
 	}
 
 	@Override
@@ -756,7 +735,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	@Override
 	public WritableColumnVector reserveDictionaryIds(int capacity) {
 		if (dictionaryIds == null) {
-			dictionaryIds = new OnHeapColumnVector(capacity, DataTypes.IntegerType);
+			dictionaryIds = new OffHeapColumnVector(capacity, DataTypes.IntegerType);
 		} else {
 			dictionaryIds.reset();
 			dictionaryIds.reserve(capacity);
