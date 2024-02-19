@@ -24,6 +24,7 @@ import java.util.Set;
 import com.google.common.base.Preconditions;
 
 import org.apache.spark.memory.MemoryMode;
+import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector;
 import org.apache.spark.sql.execution.vectorized.rapids.OffHeapColumnVector;
 import org.apache.spark.sql.execution.vectorized.rapids.OnHeapColumnVector;
 import org.apache.spark.sql.execution.vectorized.rapids.WritableColumnVector;
@@ -55,13 +56,15 @@ final class ParquetColumnVector {
 	/** Reader for this column - only set if 'isPrimitive' is true */
 	private VectorizedColumnReader columnReader;
 
+	public final int maxRepetitiveDefLevel;
+
 	ParquetColumnVector(
 			ParquetColumn column,
 			WritableColumnVector vector,
 			int capacity,
-			MemoryMode memoryMode,
 			Set<ParquetColumn> missingColumns,
 			boolean isTopLevel,
+			int maxRepetitiveDefLevel,
 			Object defaultValue) {
 		DataType sparkType = column.sparkType();
 		if (!sparkType.sameType(vector.dataType())) {
@@ -73,6 +76,7 @@ final class ParquetColumnVector {
 		this.vector = vector;
 		this.children = new ArrayList<>();
 		this.isPrimitive = column.isPrimitive();
+		this.maxRepetitiveDefLevel = maxRepetitiveDefLevel;
 
 		if (missingColumns.contains(column)) {
 			/*
@@ -103,19 +107,27 @@ final class ParquetColumnVector {
 
 		if (isPrimitive) {
 			if (column.repetitionLevel() > 0) {
-				repetitionLevels = allocateLevelsVector(capacity, memoryMode);
+				repetitionLevels = new HostWritableColumnVector(capacity, DataTypes.IntegerType);
 			}
 			// We don't need to create and store definition levels if the column is top-level.
 			if (!isTopLevel) {
-				definitionLevels = allocateLevelsVector(capacity, memoryMode);
+				definitionLevels = new HostWritableColumnVector(capacity, DataTypes.IntegerType);
 			}
 		} else {
 			Preconditions.checkArgument(column.children().size() == vector.getNumChildren());
 			boolean allChildrenAreMissing = true;
 
+			int childMaxRepetitiveDefLevel;
+			if (sparkType instanceof ArrayType || sparkType instanceof MapType) {
+				childMaxRepetitiveDefLevel = column.definitionLevel();
+			} else {
+				childMaxRepetitiveDefLevel = maxRepetitiveDefLevel;
+			}
+
 			for (int i = 0; i < column.children().size(); i++) {
 				ParquetColumnVector childCv = new ParquetColumnVector(column.children().apply(i),
-						vector.getChild(i), capacity, memoryMode, missingColumns, false, null);
+						vector.getChild(i), capacity, missingColumns, false,
+						childMaxRepetitiveDefLevel, null);
 				children.add(childCv);
 
 
@@ -194,10 +206,10 @@ final class ParquetColumnVector {
 
 		vector.reset();
 		if (repetitionLevels != null) {
-			repetitionLevels.reset();
+			((HostWritableColumnVector) repetitionLevels).deepReset();
 		}
 		if (definitionLevels != null) {
-			definitionLevels.reset();
+			((HostWritableColumnVector) definitionLevels).deepReset();
 		}
 		for (ParquetColumnVector child : children) {
 			child.reset();
@@ -275,83 +287,45 @@ final class ParquetColumnVector {
 			vector.reserve(rowId + 1);
 			int definitionLevel = definitionLevels.getInt(i);
 			if (definitionLevel <= maxDefinitionLevel) {
-				// This means the value is not an array element, but a collection that is either null or
-				// empty. In this case, we should increase offset to skip it when returning an array
-				// starting from the offset.
-				//
-				// For instance, considering an array of strings with 3 elements like the following:
-				//  null, [], [a, b, c]
-				// the child array (which is of String type) in this case will be:
-				//  null:   1 1 0 0 0
-				//  length: 0 0 1 1 1
-				//  offset: 0 0 0 1 2
-				// and the array itself will be:
-				//  null:   1 0 0
-				//  length: 0 0 3
-				//  offset: 0 1 2
-				//
-				// It's important that for the third element `[a, b, c]`, the offset in the array
-				// (not the elements) starts from 2 since otherwise we'd include the first & second null
-				// element from child array in the result.
-				offset += 1;
-			}
-			if (definitionLevel <= maxDefinitionLevel - 1) {
-				// Collection is null or one of its optional parents is null
-				vector.putNull(rowId++);
-			} else if (definitionLevel == maxDefinitionLevel) {
-				// Collection is defined but empty
-				vector.putNotNull(rowId);
-				vector.putArray(rowId, offset, 0);
-				rowId++;
-			} else if (definitionLevel > maxDefinitionLevel) {
+				if (definitionLevel <= maxRepetitiveDefLevel) {
+					// One of its repetitive parents is null
+					continue;
+				}
+				if (definitionLevel == maxDefinitionLevel) {
+					// Collection is defined but empty
+					vector.putNotNull(rowId);
+				} else {
+					// Collection is null or One of its non-repetitive parents is null
+					vector.putNull(rowId);
+				}
+				vector.putArray(rowId++, offset, 0);
+			} else {
 				// Collection is defined and non-empty: find out how many top elements are there until the
 				// start of the next array.
 				vector.putNotNull(rowId);
 				int length = getCollectionSize(maxElementRepetitionLevel, i);
-				vector.putArray(rowId, offset, length);
+				vector.putArray(rowId++, offset, length);
 				offset += length;
-				rowId++;
 			}
 		}
 		vector.addElementsAppended(rowId);
 	}
 
 	private void assembleStruct() {
-		int maxRepetitionLevel = column.repetitionLevel();
 		int maxDefinitionLevel = column.definitionLevel();
 
 		vector.reserve(definitionLevels.getElementsAppended());
 
 		int rowId = 0;
-		boolean hasRepetitionLevels =
-				repetitionLevels != null && repetitionLevels.getElementsAppended() > 0;
 		for (int i = 0; i < definitionLevels.getElementsAppended(); i++) {
-			// If repetition level > maxRepetitionLevel, the value is a nested element (e.g., an array
-			// element in struct<array<int>>), and we should skip the definition level since it doesn't
-			// represent with the struct.
-			if (!hasRepetitionLevels || repetitionLevels.getInt(i) <= maxRepetitionLevel) {
-				if (definitionLevels.getInt(i) <= maxDefinitionLevel - 1) {
-					// Struct is null
-					vector.putNull(rowId);
-					rowId++;
-				} else if (definitionLevels.getInt(i) >= maxDefinitionLevel) {
-					vector.putNotNull(rowId);
-					rowId++;
-				}
+			int defLevel = definitionLevels.getInt(i);
+			if (defLevel >= maxDefinitionLevel) {
+				vector.putNotNull(rowId++);
+			} else if (defLevel > maxRepetitiveDefLevel) {
+				vector.putNull(rowId++);
 			}
 		}
 		vector.addElementsAppended(rowId);
-	}
-
-	private static WritableColumnVector allocateLevelsVector(int capacity, MemoryMode memoryMode) {
-		switch (memoryMode) {
-			case ON_HEAP:
-				return new OnHeapColumnVector(capacity, DataTypes.IntegerType);
-			case OFF_HEAP:
-				return new OffHeapColumnVector(capacity, DataTypes.IntegerType);
-			default:
-				throw new IllegalArgumentException("Unknown memory mode: " + memoryMode);
-		}
 	}
 
 	/**

@@ -89,8 +89,8 @@ class VectorizedParquetGpuProducer(
     }
     columnVectors = hostColumnBuilders.indices.toArray.map { i =>
       new ParquetColumnVector(parquetColumn.children(i),
-        hostColumnBuilders(i), batchSize, MemoryMode.OFF_HEAP,
-        Set.empty[ParquetColumn].asJava, true, null);
+        hostColumnBuilders(i), batchSize,
+        Set.empty[ParquetColumn].asJava, true, -1, null);
     }
   }
 
@@ -138,6 +138,7 @@ class VectorizedParquetGpuProducer(
               new VectorizedColumnReader(
                 cv.getColumn.descriptor.get,
                 cv.getColumn.required,
+                cv.maxRepetitiveDefLevel,
                 rowGroup,
                 null,
                 dateRebaseMode.value,

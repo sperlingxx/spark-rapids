@@ -83,6 +83,8 @@ final class ParquetReadState {
 	 * levels. */
 	boolean shouldSkip;
 
+	int maxRepetitiveDefLevel;
+
 	ParquetReadState(
 			ColumnDescriptor descriptor,
 			boolean isRequired,

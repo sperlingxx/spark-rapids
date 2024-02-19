@@ -92,6 +92,7 @@ public class VectorizedColumnReader {
   public VectorizedColumnReader(
       ColumnDescriptor descriptor,
       boolean isRequired,
+      int maxRepetitiveDefLevel,
       PageReadStore pageReadStore,
       ZoneId convertTz,
       String datetimeRebaseMode,
@@ -103,6 +104,7 @@ public class VectorizedColumnReader {
     this.pageReader = pageReadStore.getPageReader(descriptor);
     this.readState = new ParquetReadState(descriptor, isRequired,
       pageReadStore.getRowIndexes().orElse(null));
+    this.readState.maxRepetitiveDefLevel = maxRepetitiveDefLevel;
     this.logicalTypeAnnotation = descriptor.getPrimitiveType().getLogicalTypeAnnotation();
     this.updaterFactory = new ParquetVectorUpdaterFactory(
       logicalTypeAnnotation,

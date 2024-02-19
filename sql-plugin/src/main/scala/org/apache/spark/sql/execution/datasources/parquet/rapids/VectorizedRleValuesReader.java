@@ -242,17 +242,18 @@ public final class VectorizedRleValuesReader extends ValuesReader
 					case RLE:
 						if (currentValue == state.maxDefinitionLevel) {
 							updater.readValues(n, state.valueOffset, values, valueReader);
-						} else {
+							state.valueOffset += n;
+						} else if (currentValue > state.maxRepetitiveDefLevel) {
 							nulls.putNulls(state.valueOffset, n);
+							state.valueOffset += n;
 						}
-						state.valueOffset += n;
 						break;
 					case PACKED:
 						for (int i = 0; i < n; ++i) {
 							int currentValue = currentBuffer[currentBufferIdx++];
 							if (currentValue == state.maxDefinitionLevel) {
 								updater.readValue(state.valueOffset++, values, valueReader);
-							} else {
+							} else if (currentValue > state.maxRepetitiveDefLevel) {
 								nulls.putNull(state.valueOffset++);
 							}
 						}
@@ -632,10 +633,11 @@ public final class VectorizedRleValuesReader extends ValuesReader
 			case RLE:
 				if (currentValue == state.maxDefinitionLevel) {
 					updater.readValues(n, state.valueOffset, values, valueReader);
-				} else {
+					state.valueOffset += n;
+				} else if (currentValue > state.maxRepetitiveDefLevel) {
 					nulls.putNulls(state.valueOffset, n);
+					state.valueOffset += n;
 				}
-				state.valueOffset += n;
 				defLevels.putInts(state.levelOffset, n, currentValue);
 				break;
 			case PACKED:
@@ -643,7 +645,7 @@ public final class VectorizedRleValuesReader extends ValuesReader
 					int currentValue = currentBuffer[currentBufferIdx++];
 					if (currentValue == state.maxDefinitionLevel) {
 						updater.readValue(state.valueOffset++, values, valueReader);
-					} else {
+					} else if (currentValue > state.maxRepetitiveDefLevel) {
 						nulls.putNull(state.valueOffset++);
 					}
 					defLevels.putInt(state.levelOffset + i, currentValue);
