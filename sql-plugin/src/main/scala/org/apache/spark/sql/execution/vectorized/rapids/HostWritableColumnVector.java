@@ -170,10 +170,6 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		elementsAppended = 0;
 	}
 
-	public void deepReset() {
-		reallocate(capacity);
-	}
-
 	public void reallocate(int newCapacity) {
 		this.capacity = 0;
 		this.elementsAppended = 0;
@@ -540,14 +536,12 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	@Override
 	public WritableColumnVector reserveDictionaryIds(int capacity) {
 		if (dictionaryIds == null) {
-			dictionaryIds = new HostWritableColumnVector(capacity, DataTypes.IntegerType);
+			dictionaryIds = new ParquetHelperVector(capacity, ParquetHelperVector.PinMode.SYSTEM_DEFAULT);
 		} else {
-			HostWritableColumnVector ids = (HostWritableColumnVector) dictionaryIds;
+			ParquetHelperVector ids = (ParquetHelperVector) dictionaryIds;
 			ids.elementsAppended = 0;
-			ids.rowGroupIndex = 0;
-			ids.resetAllBuffers(capacity, false);
+			ids.resetBuffer(capacity, false);
 		}
-
 		return dictionaryIds;
 	}
 
@@ -581,7 +575,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	public int getDictId(int rowId) {
-		return data.getInt(rowId * 4L);
+		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
 	}
 
 	@Override

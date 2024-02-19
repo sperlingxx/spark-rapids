@@ -23,14 +23,9 @@ import java.util.Set;
 
 import com.google.common.base.Preconditions;
 
-import org.apache.spark.memory.MemoryMode;
-import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector;
-import org.apache.spark.sql.execution.vectorized.rapids.OffHeapColumnVector;
-import org.apache.spark.sql.execution.vectorized.rapids.OnHeapColumnVector;
-import org.apache.spark.sql.execution.vectorized.rapids.WritableColumnVector;
+import org.apache.spark.sql.execution.vectorized.rapids.*;
 import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
-import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.MapType;
 import org.apache.spark.sql.types.StructType;
 
@@ -107,11 +102,11 @@ final class ParquetColumnVector {
 
 		if (isPrimitive) {
 			if (column.repetitionLevel() > 0) {
-				repetitionLevels = new HostWritableColumnVector(capacity, DataTypes.IntegerType);
+				repetitionLevels = new ParquetHelperVector(capacity, ParquetHelperVector.PinMode.SYSTEM_DEFAULT);
 			}
 			// We don't need to create and store definition levels if the column is top-level.
 			if (!isTopLevel) {
-				definitionLevels = new HostWritableColumnVector(capacity, DataTypes.IntegerType);
+				definitionLevels = new ParquetHelperVector(capacity, ParquetHelperVector.PinMode.SYSTEM_DEFAULT);
 			}
 		} else {
 			Preconditions.checkArgument(column.children().size() == vector.getNumChildren());
@@ -206,10 +201,10 @@ final class ParquetColumnVector {
 
 		vector.reset();
 		if (repetitionLevels != null) {
-			((HostWritableColumnVector) repetitionLevels).deepReset();
+			repetitionLevels.reset();
 		}
 		if (definitionLevels != null) {
-			((HostWritableColumnVector) definitionLevels).deepReset();
+			definitionLevels.reset();
 		}
 		for (ParquetColumnVector child : children) {
 			child.reset();
