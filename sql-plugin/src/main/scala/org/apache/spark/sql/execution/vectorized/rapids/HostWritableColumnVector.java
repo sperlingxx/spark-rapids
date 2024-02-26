@@ -215,7 +215,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	public boolean isNullAt(int rowId) {
 		if (isAllNull) return true;
 		if (valids == null) return false;
-		return valids.getBoolean(rowGroupOffset + rowId);
+		return valids.getByte(rowGroupOffset + rowId) == 1;
 	}
 
 	@Override

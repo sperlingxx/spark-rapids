@@ -24,10 +24,7 @@ import java.util.Set;
 import com.google.common.base.Preconditions;
 
 import org.apache.spark.sql.execution.vectorized.rapids.*;
-import org.apache.spark.sql.types.ArrayType;
-import org.apache.spark.sql.types.DataType;
-import org.apache.spark.sql.types.MapType;
-import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.types.*;
 
 /**
  * Contains necessary information representing a Parquet column, either of primitive or nested type.

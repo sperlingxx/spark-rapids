@@ -1988,16 +1988,23 @@ class MultiFileParquetPartitionReader(
       clippedSchema: SchemaBase, readDataSchema: StructType,
       extraInfo: ExtraInfo): GpuDataProducer[Table] = {
 
-    val canReadOnHost = readOnHostOpts > 0 &&
+    val canReadOnHost = readOnHostOpts > -1 &&
       VectorizedParquetGpuProducer.schemaSupportCheck(readDataSchema.fields.map(_.dataType))
 
     val readOnHost = if (canReadOnHost) {
-      if (readOnHostOpts == 2) {
+      if (readOnHostOpts == 0) {
         true
       } else {
         GpuSemaphore.tryAcquire(TaskContext.get()) match {
-          case SemaphoreAcquired => false
-          case AcquireFailed(_) => true
+          case SemaphoreAcquired =>
+            false
+          case AcquireFailed(_) =>
+            if (VectorizedParquetGpuProducer.acquireHostResource(readOnHostOpts)) {
+              true
+            } else {
+              GpuSemaphore.acquireIfNecessary(TaskContext.get())
+              false
+            }
         }
       }
     } else {
@@ -2588,16 +2595,23 @@ class MultiFileCloudParquetPartitionReader(
       Seq(hostBuffer)
     }
 
-    val canReadOnHost = readOnHostOpts > 0 &&
+    val canReadOnHost = readOnHostOpts > -1 &&
       VectorizedParquetGpuProducer.schemaSupportCheck(readDataSchema.fields.map(_.dataType))
 
     val readOnHost = if (canReadOnHost) {
-      if (readOnHostOpts == 2) {
+      if (readOnHostOpts == 0) {
         true
       } else {
         GpuSemaphore.tryAcquire(TaskContext.get()) match {
-          case SemaphoreAcquired => false
-          case AcquireFailed(_) => true
+          case SemaphoreAcquired =>
+            false
+          case AcquireFailed(_) =>
+            if (VectorizedParquetGpuProducer.acquireHostResource(readOnHostOpts)) {
+              true
+            } else {
+              GpuSemaphore.acquireIfNecessary(TaskContext.get())
+              false
+            }
         }
       }
     } else {

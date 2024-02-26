@@ -1466,7 +1466,7 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       "The host-side reader produces cuDF column vector directly. R2C is unnecessary.")
     .internal()
     .integerConf
-    .createWithDefault(0)
+    .createWithDefault(-1)
 
   val ORC_DEBUG_DUMP_PREFIX = conf("spark.rapids.sql.orc.debug.dumpPrefix")
     .doc("A path prefix where ORC split file data is dumped for debugging.")

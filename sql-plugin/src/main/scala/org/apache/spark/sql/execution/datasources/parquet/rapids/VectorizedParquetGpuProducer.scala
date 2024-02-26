@@ -17,11 +17,12 @@
 package org.apache.spark.sql.execution.datasources.parquet.rapids
 
 import java.util.TimeZone
+import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 
-import ai.rapids.cudf.{HostColumnVector, HostMemoryBuffer, Table}
+import ai.rapids.cudf.{HostColumnVector, HostMemoryBuffer, PinnedMemoryPool, Table}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
 import org.apache.hadoop.conf.Configuration
@@ -33,8 +34,10 @@ import org.apache.parquet.schema.MessageType
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.execution.datasources.parquet.ParquetCodecFactory
 import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector
 import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DecimalType, MapType, StructType}
+
 
 class VectorizedParquetGpuProducer(
     conf: Configuration,
@@ -49,13 +52,16 @@ class VectorizedParquetGpuProducer(
     clippedSchema: MessageType,
     readDataSchema: StructType) extends GpuDataProducer[Table] with Logging {
 
-  logInfo(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
-  logInfo(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
-  logInfo(s"ReadDataSchema ${readDataSchema.sql}")
+  logDebug(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
+  logDebug(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
+  logDebug(s"ReadDataSchema ${readDataSchema.sql}")
+
+  private var readerClosed = false
 
   private val pageReader: ParquetFileReader = {
     val options = HadoopReadOptions.builder(conf)
         .withRange(offset, offset + len)
+        .withCodecFactory(new ParquetCodecFactory(conf, 0))
         .build()
     val bufferFile = new HMBInputFile(fileBuffer, length = Some(offset + len))
     val reader = new ParquetFileReader(bufferFile, options)
@@ -96,11 +102,14 @@ class VectorizedParquetGpuProducer(
   private def releaseEverything(parquetCVs: Array[ParquetColumnVector]): Unit = {
     parquetCVs.foreach { pcv =>
       pcv.getValueVector.close()
-      if (pcv.getDefinitionLevelVector != null) {
-        pcv.getDefinitionLevelVector.close()
-      }
-      if (pcv.getRepetitionLevelVector != null) {
-        pcv.getRepetitionLevelVector.close()
+      if (pcv.getColumn.isPrimitive) {
+        pcv.setColumnReader(null)
+        if (pcv.getDefinitionLevelVector != null) {
+          pcv.getDefinitionLevelVector.close()
+        }
+        if (pcv.getRepetitionLevelVector != null) {
+          pcv.getRepetitionLevelVector.close()
+        }
       }
       if (pcv.getChildren.size() > 0) {
         releaseEverything(pcv.getChildren.asScala.toArray)
@@ -187,6 +196,15 @@ class VectorizedParquetGpuProducer(
     // release all work buffers since all work are done
     releaseEverything(columnVectors)
 
+    // close file buffer ASAP
+    fileBuffer.close()
+    // close ParquetFileReader to release all decompressors
+    pageReader.close()
+    readerClosed = true
+
+    // release host resource slot if allocated
+    VectorizedParquetGpuProducer.hostResourceSemaphore.foreach(_.getAndIncrement())
+
     buffer
   }
 
@@ -205,7 +223,9 @@ class VectorizedParquetGpuProducer(
       }
 
       val batchRows = hostCVs.head.getRowCount
-      logInfo(s"VectorizedParquetGpuProducer batches $batchRows rows")
+      logInfo(s"VectorizedParquetGpuProducer batches $batchRows rows; " +
+        s"PinnedPoolSize:${PinnedMemoryPool.getTotalPoolSizeBytes};" +
+        s" remain:${PinnedMemoryPool.getAvailableBytes}")
       metrics.get("hostDecodeRows").foreach(_.+=(batchRows))
       metrics.get("hostDecodeBatches").foreach(_.+=(1))
       metrics.get("numOutputBatches").foreach(_.+=(1))
@@ -220,8 +240,10 @@ class VectorizedParquetGpuProducer(
     if (!firstBatch) {
       hostBatches.foreach { hcvArray => hcvArray.foreach(_.close()) }
     }
-    pageReader.close()
-    fileBuffer.close()
+    if(!readerClosed) {
+      pageReader.close()
+      fileBuffer.close()
+    }
   }
 }
 
@@ -231,7 +253,8 @@ object VectorizedParquetGpuProducer {
     types.collectFirst {
       case _: BinaryType =>
         false
-      case dt: DecimalType if DecimalType.isByteArrayDecimalType(dt) =>
+      case _: DecimalType =>
+        // if DecimalType.isByteArrayDecimalType(dt) =>
         false
       case st: StructType =>
         schemaSupportCheck(st.fields.map(_.dataType))
@@ -240,6 +263,24 @@ object VectorizedParquetGpuProducer {
       case MapType(kt, vt, _) =>
         schemaSupportCheck(Array(kt, vt))
     }.getOrElse(true)
+  }
+
+  private var hostResourceSemaphore: Option[AtomicInteger] = None
+
+  def acquireHostResource(totalSize: Int): Boolean = {
+    if (hostResourceSemaphore.isEmpty) {
+      synchronized {
+        if (hostResourceSemaphore.isEmpty) {
+          hostResourceSemaphore = Some(new AtomicInteger(totalSize))
+        }
+      }
+    }
+    if (hostResourceSemaphore.get.getAndDecrement() < 1) {
+      hostResourceSemaphore.get.getAndIncrement()
+      false
+    } else {
+      true
+    }
   }
 
 }

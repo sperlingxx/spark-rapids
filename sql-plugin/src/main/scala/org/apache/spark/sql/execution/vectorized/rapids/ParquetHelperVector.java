@@ -59,6 +59,7 @@ public class ParquetHelperVector extends WritableColumnVector {
 				data.close();
 			}
 			data = buffer;
+			this.capacity = capacity;
 		}
 	}
 
@@ -123,202 +124,202 @@ public class ParquetHelperVector extends WritableColumnVector {
 
 	@Override
 	public void putNotNull(int rowId) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putNull(int rowId) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putNulls(int rowId, int count) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putNotNulls(int rowId, int count) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putBoolean(int rowId, boolean value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putBooleans(int rowId, int count, boolean value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putBooleans(int rowId, byte src) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putByte(int rowId, byte value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putBytes(int rowId, int count, byte value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putBytes(int rowId, int count, byte[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putShort(int rowId, short value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putShorts(int rowId, int count, short value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putShorts(int rowId, int count, short[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putShorts(int rowId, int count, byte[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putLong(int rowId, long value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putLongs(int rowId, int count, long value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putLongs(int rowId, int count, long[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putLongs(int rowId, int count, byte[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putLongsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putFloat(int rowId, float value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putFloats(int rowId, int count, float value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putFloats(int rowId, int count, float[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putFloats(int rowId, int count, byte[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putFloatsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putDouble(int rowId, double value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putDoubles(int rowId, int count, double value) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putDoubles(int rowId, int count, double[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putDoubles(int rowId, int count, byte[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putDoublesLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public void putArray(int rowId, int offset, int length) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	public int putByteArray(int rowId, byte[] value, int offset, int count) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support putters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support putters");
 	}
 
 	@Override
 	protected UTF8String getBytesAsUTF8String(int rowId, int count) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support getters");
 	}
 
 	@Override
 	public ByteBuffer getByteBuffer(int rowId, int count) {
-		return null;
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support getters");
 	}
 
 	@Override
 	public int getArrayLength(int rowId) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support getters");
 	}
 
 	@Override
 	public int getArrayOffset(int rowId) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support getters");
 	}
 
 	@Override
 	protected WritableColumnVector reserveNewColumn(int capacity, DataType type) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support reserveNewColumn");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support reserveNewColumn");
 	}
 
 	@Override
 	public boolean isNullAt(int rowId) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support getters");
 	}
 
 	@Override
 	public boolean getBoolean(int rowId) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support getters");
 	}
 
 	@Override
 	public byte getByte(int rowId) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support getters");
 	}
 
 	@Override
 	public short getShort(int rowId) {
-		throw new UnsupportedOperationException("RapidsWritableColumnVector does NOT support getters");
+		throw new UnsupportedOperationException("ParquetHelperVector does NOT support getters");
 	}
 
 	@Override
