@@ -34,7 +34,6 @@ import org.apache.parquet.schema.MessageType
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.execution.datasources.parquet.ParquetCodecFactory
 import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector
 import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DecimalType, MapType, StructType}
 
