@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 
-import ai.rapids.cudf.{HostColumnVector, HostMemoryBuffer, PinnedMemoryPool, Table}
+import ai.rapids.cudf.{HostColumnVector, HostMemoryBuffer, NvtxColor, PinnedMemoryPool, Table}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
 import org.apache.hadoop.conf.Configuration
@@ -129,7 +129,7 @@ class VectorizedParquetGpuProducer(
 
     val totalRowCnt = rowGroups.foldLeft(0)((s, x) => s + x.getRowCount.toInt)
     val rowBatchSize = (tgtBatchSize.toDouble / len * totalRowCnt).toInt max 1
-    logWarning(s"total row count: $totalRowCnt ; batch size in row: $rowBatchSize")
+    logInfo(s"total row count: $totalRowCnt ; batch size in row: $rowBatchSize")
 
     var remainTotalRows = totalRowCnt
     var remainBatchRows = rowBatchSize min totalRowCnt
@@ -137,24 +137,26 @@ class VectorizedParquetGpuProducer(
 
     rowGroups.foreach { rowGroup: PageReadStore =>
       // update column readers to read the new page
-      val stack = mutable.Stack[ParquetColumnVector](columnVectors: _*)
-      while (stack.nonEmpty) {
-        stack.pop() match {
-          case cv if cv.getColumn.isPrimitive =>
-            cv.setColumnReader(
-              new VectorizedColumnReader(
-                cv.getColumn.descriptor.get,
-                cv.getColumn.required,
-                cv.maxRepetitiveDefLevel,
-                rowGroup,
-                null,
-                dateRebaseMode.value,
-                TimeZone.getDefault.getID,
-                timestampRebaseMode.value,
-                TimeZone.getDefault.getID,
-                writerVersion))
-          case cv =>
-            cv.getChildren.asScala.foreach(stack.push)
+      metrics("cpuDecodeDictTime").ns {
+        val stack = mutable.Stack[ParquetColumnVector](columnVectors: _*)
+        while (stack.nonEmpty) {
+          stack.pop() match {
+            case cv if cv.getColumn.isPrimitive =>
+              cv.setColumnReader(
+                new VectorizedColumnReader(
+                  cv.getColumn.descriptor.get,
+                  cv.getColumn.required,
+                  cv.maxRepetitiveDefLevel,
+                  rowGroup,
+                  null,
+                  dateRebaseMode.value,
+                  TimeZone.getDefault.getID,
+                  timestampRebaseMode.value,
+                  TimeZone.getDefault.getID,
+                  writerVersion))
+            case cv =>
+              cv.getChildren.asScala.foreach(stack.push)
+          }
         }
       }
 
@@ -165,29 +167,34 @@ class VectorizedParquetGpuProducer(
         remainBatchRows -= readSize
         remainTotalRows -= readSize
 
-        columnVectors.foreach { cv =>
-          cv.getLeaves.asScala.foreach {
-            case leaf if leaf.getColumnReader != null =>
-              leaf.getColumnReader.readBatch(readSize, leaf.getValueVector,
-                leaf.getRepetitionLevelVector, leaf.getDefinitionLevelVector)
-            case _ =>
+        metrics("cpuDecodeDataTime").ns {
+          columnVectors.foreach { cv =>
+            cv.getLeaves.asScala.foreach {
+              case leaf if leaf.getColumnReader != null =>
+                leaf.getColumnReader.readBatch(readSize, leaf.getValueVector,
+                  leaf.getRepetitionLevelVector, leaf.getDefinitionLevelVector)
+              case _ =>
+            }
+            cv.assemble()
+            // Reset all value vectors(HostWritableColumnVector) along with def/repVectors.
+            // The reset is essential because we are going to either finalize current batch
+            // or read another RowGroup, or even both.
+            // As of value vectors, reset means update the offsets of target buffers.
+            // As of def/repVectors vectors, reset simply means re-initialize.
+            cv.reset()
           }
-          cv.assemble()
-          // Reset all value vectors(HostWritableColumnVector) along with def/repVectors.
-          // The reset is essential because we are going to either finalize current batch
-          // or read another RowGroup, or even both.
-          // As of value vectors, reset means update the offsets of target buffers.
-          // As of def/repVectors vectors, reset simply means re-initialize.
-          cv.reset()
         }
 
+        // Finalize current batch and reset all buffers for the next batch
         if (remainBatchRows == 0) {
-          // materialize current batch in the memory layout of cuDF column vector
-          buffer.enqueue(hostColumnBuilders.map(_.build()))
-          // update batch size and remaining
-          remainBatchRows = rowBatchSize min remainTotalRows
-          // Reset all the HostColumnBuffers for the upcoming batch
-          hostColumnBuilders.foreach(_.reallocate(remainBatchRows))
+          metrics("hostVecBuildTime").ns {
+            // materialize current batch in the memory layout of cuDF column vector
+            buffer.enqueue(hostColumnBuilders.map(_.build()))
+            // update batch size and remaining
+            remainBatchRows = rowBatchSize min remainTotalRows
+            // Reset all the HostColumnBuffers for the upcoming batch
+            hostColumnBuilders.foreach(_.reallocate(remainBatchRows))
+          }
         }
       }
     }
@@ -210,6 +217,17 @@ class VectorizedParquetGpuProducer(
   private var firstBatch = true
 
   override def hasNext: Boolean = {
+    if (firstBatch) {
+      try {
+        withResource(new NvtxWithMetrics("cpuDecodeTime", NvtxColor.GREEN,
+          metrics("cpuDecodeTime"))) { _ =>
+          hostBatches
+        }
+      } catch {
+        case _: Throwable =>
+          hostBatches.foreach(batch => batch.foreach(_.close()))
+      }
+    }
     hostBatches.nonEmpty
   }
 
@@ -225,12 +243,15 @@ class VectorizedParquetGpuProducer(
       logInfo(s"VectorizedParquetGpuProducer batches $batchRows rows; " +
         s"PinnedPoolSize:${PinnedMemoryPool.getTotalPoolSizeBytes};" +
         s" remain:${PinnedMemoryPool.getAvailableBytes}")
-      metrics.get("hostDecodeRows").foreach(_.+=(batchRows))
-      metrics.get("hostDecodeBatches").foreach(_.+=(1))
+      metrics.get("cpuDecodeRows").foreach(_.+=(batchRows))
+      metrics.get("cpuDecodeBatches").foreach(_.+=(1))
       metrics.get("numOutputBatches").foreach(_.+=(1))
 
-      withResource(hostCVs.indices.map(i => hostCVs(i).copyToDevice())) { dCVs =>
-        new Table(dCVs: _*)
+      withResource(new NvtxWithMetrics("Transfer HostVectors to Device", NvtxColor.CYAN,
+        metrics.get("hostVecToDeviceTime").toArray: _*)) { _ =>
+        withResource(hostCVs.indices.map(i => hostCVs(i).copyToDevice())) { dCVs =>
+          new Table(dCVs: _*)
+        }
       }
     }
   }
