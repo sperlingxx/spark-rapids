@@ -21,6 +21,12 @@ import java.util.concurrent.*;
 
 public class ComputeThreadPool {
 
+	public enum TaskStatus {
+		PENDING,
+		RUNNING,
+		SUCCESSFUL,
+		FAILED
+	}
 
 	public static class TaskWithPriority<Result> {
 
@@ -28,24 +34,45 @@ public class ComputeThreadPool {
 			this.task = task;
 			this.priority = priority;
 			this.promise = new CompletableFuture<>();
+			this.status = TaskStatus.PENDING;
 		}
 
-		private void run() {
+		private void run() throws Exception {
 			try {
 				Result ret = task.call();
 				promise.complete(ret);
 			} catch (Exception e) {
 				promise.completeExceptionally(e);
+				throw e;
 			}
+		}
+
+		public TaskStatus status() {
+			return this.status;
 		}
 
 		public Future<Result> future() {
 			return promise;
 		}
 
+		public Result getResult() throws ExecutionException, InterruptedException {
+			return promise.get();
+		}
+
+		public void cancel() {
+			if (status == TaskStatus.PENDING) {
+				if (!ComputeThreadPool.removeTask(this)) {
+					promise.cancel(true);
+				}
+			} else if (status == TaskStatus.RUNNING) {
+				promise.cancel(true);
+			}
+		}
+
 		private final CompletableFuture<Result> promise;
 		private final Callable<Result> task;
 		private final int priority;
+		private volatile TaskStatus status;
 	}
 
 	private ComputeThreadPool(int threadNum, int taskQueueCapacity) {
@@ -68,9 +95,21 @@ public class ComputeThreadPool {
 				while (true) {
 					try {
 						TaskWithPriority<?> task = taskQueue.take();
+						task.status = TaskStatus.RUNNING;
 						workerSemaphore.acquire();
-						task.run();
+						try {
+							task.run();
+						} catch (Exception ex) {
+							task.status = TaskStatus.FAILED;
+							StringBuilder stackTrace = new StringBuilder();
+							stackTrace.append(ex).append('\n');
+							for (StackTraceElement elem : ex.getStackTrace()) {
+								stackTrace.append(elem.toString()).append('\n');
+							}
+							System.err.println("ComputeThreadPool: background task failed: " + stackTrace);
+						}
 						workerSemaphore.release();
+						task.status = TaskStatus.SUCCESSFUL;
 					} catch (InterruptedException e) {
 						throw new RuntimeException(e);
 					}
@@ -116,6 +155,13 @@ public class ComputeThreadPool {
 			throw new RuntimeException("CpuIntensiveThreadPool is NOT initialized");
 		}
 		return INSTANCE;
+	}
+
+	public static boolean removeTask(TaskWithPriority<?> task) {
+		if (INSTANCE == null) {
+			throw new RuntimeException("CpuIntensiveThreadPool is NOT initialized");
+		}
+		return INSTANCE.taskQueue.remove(task);
 	}
 
 	private static ComputeThreadPool INSTANCE = null;

@@ -17,8 +17,9 @@
 package org.apache.spark.sql.execution.datasources.parquet.rapids
 
 import java.util.TimeZone
-import java.util.concurrent.Future
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+import java.util.concurrent.locks.ReentrantLock
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -39,6 +40,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.datasources.parquet.rapids.HybridTableProducer.preloadMemPool
 import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector
 import org.apache.spark.sql.rapids.ComputeThreadPool
+import org.apache.spark.sql.rapids.ComputeThreadPool.TaskWithPriority
 import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DecimalType, MapType, StructType}
 
 
@@ -56,7 +58,16 @@ class AsyncParquetReader(
     clippedSchema: MessageType)
   extends Iterator[AsyncBatchResult] with AutoCloseable with Logging {
 
-  private var readerClosed = false
+  private val initialized = new AtomicBoolean(false)
+  @volatile private var cancelled = false
+  private val taskID = TaskContext.get().taskAttemptId()
+  private val runningLock = new ReentrantLock()
+
+  private lazy val resultQueue = new LinkedBlockingQueue[AsyncBatchResult]()
+
+  private var task: TaskWithPriority[Unit] = _
+
+  private var currentGroup: PageReadStore = _
 
   private val pageReader: ParquetFileReader = {
     val options = HadoopReadOptions.builder(conf)
@@ -94,11 +105,12 @@ class AsyncParquetReader(
     rowGroups
   }
 
-  private lazy val totalRowCnt = rowGroupQueue.foldLeft(0)((s, x) => s + x.getRowCount.toInt)
+  private lazy val totalRowCnt = {
+    remainTotalRows = rowGroupQueue.foldLeft(0)((s, x) => s + x.getRowCount.toInt)
+    remainTotalRows
+  }
   private lazy val rowBatchSize = {
     val value = (tgtBatchSize.toDouble / len * totalRowCnt).toInt max 1
-    logInfo(s"total row count: $totalRowCnt ; batch size in row: $value")
-    remainTotalRows = totalRowCnt
     remainBatchRows = value min totalRowCnt
     remainBatchRows
   }
@@ -106,12 +118,23 @@ class AsyncParquetReader(
   private var remainBatchRows: Int = _
   private var remainPageRows: Int = 0
 
+  private lazy val numBatches = {
+    val value = (totalRowCnt + rowBatchSize - 1) / rowBatchSize
+    logError(s"[$taskID] rowCount:$totalRowCnt; rowBatchSize:$rowBatchSize; numBatches:$value")
+    value
+  }
+  private val consumedBatches = new AtomicInteger(0)
+  private val producedBatches = new AtomicInteger(0)
+
   private lazy val hostColumnBuilders: Array[HostWritableColumnVector] = {
     parquetColumn.sparkType.asInstanceOf[StructType].fields.map { f =>
       new HostWritableColumnVector(rowBatchSize min totalRowCnt, f.dataType)
     }
   }
+
   private lazy val columnVectors: Array[ParquetColumnVector] =  {
+    initialized.getAndSet(true)
+
     hostColumnBuilders.indices.toArray.map { i =>
       new ParquetColumnVector(parquetColumn.children(i),
         hostColumnBuilders(i),
@@ -138,14 +161,11 @@ class AsyncParquetReader(
     }
   }
 
-  private def readImpl(): AsyncBatchResult = {
-    var currentGroup = rowGroupQueue.head
-
+  private def readImpl(): AsyncBatchResult = metrics("cpuDecodeTime").ns {
     while (remainBatchRows > 0) {
-      if (remainPageRows == 0) {
-        rowGroupQueue.dequeue()
-        currentGroup = rowGroupQueue.head
-
+      if (currentGroup == null || remainPageRows == 0) {
+        currentGroup = rowGroupQueue.dequeue()
+        remainPageRows = currentGroup.getRowCount.toInt
         // update column readers to read the new page
         metrics("cpuDecodeDictTime").ns {
           val stack = mutable.Stack[ParquetColumnVector](columnVectors: _*)
@@ -169,8 +189,6 @@ class AsyncParquetReader(
             }
           }
         }
-
-        remainPageRows = currentGroup.getRowCount.toInt
       }
 
       metrics("cpuDecodeDataTime").ns {
@@ -211,44 +229,70 @@ class AsyncParquetReader(
     }
   }
 
-  private def launchTask(): Unit = {
-    val task = new ComputeThreadPool.TaskWithPriority(() => readImpl(), 1)
-    future = task.future()
+  private def readAsProducer(): Unit = {
+    // Ensure all lazy variables are initialized before the start of decoding
+    columnVectors
+
+    var numProduced = producedBatches.get()
+    while (numProduced < numBatches && !cancelled) {
+      val batchResult = try {
+        runningLock.lock()
+        if (cancelled) None else Option(readImpl())
+      } finally {
+        runningLock.unlock()
+      }
+      batchResult.foreach { ret =>
+        resultQueue.offer(ret)
+        numProduced = producedBatches.incrementAndGet()
+        logDebug(s"[$taskID] produced a new batch($numProduced/$numBatches)")
+      }
+    }
+  }
+
+  private def launchTask(): Unit = if (task == null) {
+    task = new TaskWithPriority(() => readAsProducer(), 0)
     ComputeThreadPool.submitTask(task)
   }
 
   override def hasNext: Boolean = {
-    if (future != null || remainTotalRows > 0) {
-      if (future == null) launchTask()
-      true
-    } else {
-      false
-    }
+    launchTask()
+    consumedBatches.get() < numBatches
   }
 
   override def next(): AsyncBatchResult = {
-    val ret = future.get()
-    future = null
-    if (remainTotalRows > 0) launchTask()
+    val ret = resultQueue.take()
+    val numConsumed = consumedBatches.incrementAndGet()
+    logDebug(s"[$taskID] consumed a new batch($numConsumed/$numBatches)")
     ret
   }
 
   override def close(): Unit = {
-    if(!readerClosed) {
-      if (future != null) {
-        future.cancel(true)
+    if (task != null && !cancelled) {
+      if (producedBatches.get() < numBatches) {
+        logError(s"[$taskID] Close while producer still running asynchronously(total:$numBatches" +
+          s"/consumed:${consumedBatches.get()}/produced:${producedBatches.get()})")
       }
-      // release all work buffers since all work are done
-      releaseParquetCV(columnVectors)
-      // close ParquetFileReader to release all decompressors
-      pageReader.close()
-      // close fileBuffer additionally to reduce refCount to 0
-      fileBuffer.close()
-      readerClosed = true
+      task.cancel()
+      cancelled = true
     }
-  }
 
-  private var future: Future[AsyncBatchResult] = _
+    runningLock.lock()
+    // release all prefetched batches
+    while (!resultQueue.isEmpty) {
+      resultQueue.take().data.foreach(_.close())
+    }
+    // release all work buffers since all work are done
+    if (initialized.get()) {
+      releaseParquetCV(columnVectors)
+    }
+    // close ParquetFileReader to release all decompressors
+    pageReader.close()
+    // close fileBuffer additionally to reduce refCount to 0
+    if (fileBuffer.getRefCount > 0) {
+      fileBuffer.close()
+    }
+    runningLock.unlock()
+  }
 
 }
 
@@ -294,6 +338,7 @@ class HybridTableProducer(
     if (!holdGPUSemaphore) {
       if (enablePreload && tryAcquirePreloadH2DSlots(asyncRet.sizeInByte)) {
         preloadedMemSize += asyncRet.sizeInByte
+        metrics("preloadH2DBatches") += 1
       } else {
         withResource(new NvtxWithMetrics(
           "Wait GPU for HostToDevice", NvtxColor.WHITE, metrics("h2dWaitGPU"))) { _ =>
@@ -322,6 +367,10 @@ class HybridTableProducer(
     }
   }
 
+  override def foreach[U](func: Table => U): Unit = {
+    super.foreach(func)
+  }
+
   private def tryAcquirePreloadH2DSlots(batchMemSize: Long): Boolean = {
     if (preloadMemPool.getAndAdd(-batchMemSize) < 0) {
       preloadMemPool.getAndAdd(batchMemSize)
@@ -335,7 +384,7 @@ class HybridTableProducer(
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
     holdGPUSemaphore = true
     if (enablePreload) {
-      preloadMemPool.getAndAdd(-preloadedMemSize)
+      preloadMemPool.getAndAdd(preloadedMemSize)
       preloadedMemSize = 0
     }
   }
@@ -354,8 +403,11 @@ object HybridTableProducer {
         HybridParquetOpts(DeviceOnly, 0, 0, 0L)
       case "GPU_ONLY" =>
         HybridParquetOpts(DeviceOnly, 0, 0, 0L)
-      case "CPU_ONLY" =>
-        HybridParquetOpts(HostOnly, 0, 0, 0L)
+      case s if s.startsWith("CPU_ONLY(") && s.endsWith(")") =>
+        val args = s.slice(9, str.length -1).split(",")
+        val maxHostThreads = args(0).toInt
+        val maxDevicePreloadBytes = if (args.length > 1) args(1).toLong else 0L
+        HybridParquetOpts(HostOnly, maxHostThreads, 0, maxDevicePreloadBytes)
       case s if s.startsWith("DeviceFirst(") && s.endsWith(")") =>
         val args = s.slice(12, str.length -1).split(",")
         val maxHostThreads = args(0).toInt
