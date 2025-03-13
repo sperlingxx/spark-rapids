@@ -363,6 +363,7 @@ class GpuMultiFileBatchReader extends BaseDataReader<ColumnarBatch> {
           new CombineConf(
               -1, // combineThresholdsize
               -1) // combineWaitTime
+          ,0 // maxBufferBlockSizeInMB
       );
     }
 

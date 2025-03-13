@@ -1240,6 +1240,16 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v > 0, "The maximum number of files must be greater than 0.")
       .createWithDefault(Integer.MAX_VALUE)
 
+  val PARQUET_MULTITHREAD_MAX_BUFFER_BLOCK_SIZE =
+    conf("spark.rapids.sql.format.parquet.multiThreadedRead.maxBufferBlockSize")
+      .doc("A threshold on the largest block size (in MB) for a single I/O buffering subtask." +
+        " This threshold is specialized for reading super large parquet files in multiThread " +
+        " mode. Large files whose size exceeds the threshold will be read by several sub-tasks " +
+        "in parallel. If value = 0, then disables this feature.")
+      .integerConf
+      .checkValue(v => v >= 0, "The maximum buffer block size must be >= 0.")
+      .createWithDefault(0)
+
   val ENABLE_PARQUET_READ = conf("spark.rapids.sql.format.parquet.read.enabled")
     .doc("When set to false disables parquet input acceleration")
     .booleanConf
@@ -3073,6 +3083,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val parquetDecompressCpuZstd: Boolean = get(PARQUET_DECOMPRESS_CPU_ZSTD)
 
   lazy val maxNumParquetFilesParallel: Int = get(PARQUET_MULTITHREAD_READ_MAX_NUM_FILES_PARALLEL)
+
+  lazy val parquetReadMaxBufferBlockSize: Int = get(PARQUET_MULTITHREAD_MAX_BUFFER_BLOCK_SIZE)
 
   lazy val isParquetReadEnabled: Boolean = get(ENABLE_PARQUET_READ)
 

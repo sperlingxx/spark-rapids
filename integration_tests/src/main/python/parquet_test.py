@@ -1650,3 +1650,27 @@ def test_parquet_partition_batch_row_count_only_splitting(spark_tmp_path):
     with_cpu_session(lambda spark: setup_table(spark))
     assert_gpu_and_cpu_are_equal_collect(lambda spark: spark.read.parquet(data_path).select("p"),
                                          conf={"spark.rapids.sql.columnSizeBytes": "100"})
+
+@pytest.mark.parametrize('parquet_gens', parquet_gens_list, ids=idfn)
+@pytest.mark.parametrize('reader_confs', [multithreaded_parquet_file_reader_conf,
+                                          native_multithreaded_parquet_file_reader_conf,
+                                          combining_multithreaded_parquet_file_reader_conf_ordered,
+                                          combining_multithreaded_parquet_file_reader_conf_unordered,
+                                          combining_multithreaded_parquet_file_reader_deprecated_conf_ordered
+                                          ], ids=idfn)
+@pytest.mark.parametrize('max_buffer_block_size', [1, 4, 16], ids=idfn)
+@allow_non_gpu(*non_utc_allow)
+def test_parquet_read_multithreaded_subfiletasks(spark_tmp_path, parquet_gens, reader_confs, max_buffer_block_size):
+    gen_list = [('_c' + str(i), gen) for i, gen in enumerate(parquet_gens)]
+    data_path = spark_tmp_path + '/PARQUET_DATA'
+    with_cpu_session(
+        lambda spark: gen_df(spark, gen_list, length=4096).write.parquet(data_path),
+        conf=rebase_write_corrected_conf)
+    all_confs = copy_and_update(reader_confs, {
+        'spark.sql.sources.useV1SourceList': "parquet",
+        int96RebaseModeInReadKey: 'CORRECTED',
+        datetimeRebaseModeInReadKey: 'CORRECTED',
+        'spark.rapids.sql.format.parquet.multiThreadedRead.maxBufferBlockSize': max_buffer_block_size
+    })
+    assert_gpu_and_cpu_are_equal_collect(read_parquet_df(data_path),
+                                         conf=all_confs)

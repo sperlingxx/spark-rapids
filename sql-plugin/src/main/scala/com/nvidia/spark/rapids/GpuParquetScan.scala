@@ -1066,6 +1066,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
   private val debugDumpAlways = rapidsConf.parquetDebugDumpAlways
   private val numThreads = rapidsConf.multiThreadReadNumThreads
   private val maxNumFileProcessed = rapidsConf.maxNumParquetFilesParallel
+  private val maxBufferBlockSizeInMB: Int = rapidsConf.parquetReadMaxBufferBlockSize
   private val ignoreMissingFiles = sqlConf.ignoreMissingFiles
   private val ignoreCorruptFiles = sqlConf.ignoreCorruptFiles
   private val filterHandler = GpuParquetFileFilterHandler(sqlConf, metrics)
@@ -1130,7 +1131,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, compressCfg,
       metrics, partitionSchema, numThreads, maxNumFileProcessed, ignoreMissingFiles,
       ignoreCorruptFiles, readUseFieldId, queryUsesInputFile, keepReadsInOrderFromConf,
-      combineConf)
+      combineConf, maxBufferBlockSizeInMB)
   }
 
   private def filterBlocksForCoalescingReader(
@@ -1354,6 +1355,8 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
 
   val copyBufferSize = conf.getInt("parquet.read.allocation.size", 8 * 1024 * 1024)
 
+  val maxBufBlockSize = conf.getLong("parquet.read.maxBufferBlockSize", 512 * 1024 * 1024)
+
   def checkIfNeedToSplitBlocks(currentDateRebaseMode: DateTimeRebaseMode,
       nextDateRebaseMode: DateTimeRebaseMode,
       currentTimestampRebaseMode: DateTimeRebaseMode,
@@ -1457,6 +1460,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       // downcast is safe because copyBuffer.length is an int
       val readLength = Math.min(bytesLeft, copyBuffer.length).toInt
       val start = System.nanoTime()
+      in.read(0, copyBuffer, 0, readLength)
       in.readFully(copyBuffer, 0, readLength)
       val mid = System.nanoTime()
       out.write(copyBuffer, 0, readLength)
@@ -1529,6 +1533,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
    * @param out the output stream to receive the data
    * @param blocks block metadata from the original file that will appear in the computed file
    * @param realStartOffset starting file offset of the first block
+   * @param threadPool ThreadPool for reading large blocks in parallel
    * @return updated block metadata corresponding to the output
    */
   protected def copyBlocksData(
@@ -1820,7 +1825,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     }
   }
 
-  private def copyRemoteBlocksData(
+  protected def copyRemoteBlocksData(
       remoteCopies: Seq[CopyRange],
       filePath: Path,
       filePathString: String,
@@ -1833,16 +1838,16 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     val coalescedRanges = coalesceReads(remoteCopies)
 
     val totalBytesCopied = PerfIO.readToHostMemory(
-        conf, out.buffer, filePath.toUri,
-        coalescedRanges.map(r => IntRangeWithOffset(r.offset, r.length, r.outputOffset))
-      ).getOrElse {
-        withResource(filePath.getFileSystem(conf).open(filePath)) { in =>
-          val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
-          coalescedRanges.foldLeft(0L) { (acc, blockCopy) =>
-            acc + copyDataRange(blockCopy, in, out, copyBuffer)
-          }
+      conf, out.buffer, filePath.toUri,
+      coalescedRanges.map(r => IntRangeWithOffset(r.offset, r.length, r.outputOffset))
+    ).getOrElse {
+      withResource(filePath.getFileSystem(conf).open(filePath)) { in =>
+        val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
+        coalescedRanges.foldLeft(0L) { (acc, blockCopy) =>
+          acc + copyDataRange(blockCopy, in, out, copyBuffer)
         }
       }
+    }
     // try to cache the remote ranges that were copied
     remoteCopies.foreach { range =>
       metrics.getOrElse(GpuMetric.FILECACHE_DATA_RANGE_MISSES, NoopMetric) += 1
@@ -1858,7 +1863,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     totalBytesCopied
   }
 
-  private def coalesceReads(ranges: Seq[CopyRange]): Seq[CopyRange] = {
+  protected def coalesceReads(ranges: Seq[CopyRange]): Seq[CopyRange] = {
     val coalesced = new ArrayBuffer[CopyRange](ranges.length)
     var currentRange: CopyRange = null
     var currentRangeEnd = 0L
@@ -2343,11 +2348,186 @@ class MultiFileCloudParquetPartitionReader(
     useFieldId: Boolean,
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
-    combineConf: CombineConf)
+    combineConf: CombineConf,
+    maxBufferBlockSizeInMB: Int)
   extends MultiFileCloudPartitionReaderBase(conf, files, numThreads, maxNumFileProcessed, null,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
     keepReadsInOrder, combineConf)
   with ParquetPartitionReaderBase {
+
+  // The block size threshold is used to split IO buffering task into multiple subtasks, which
+  // might be executed in parallel.
+  private val maxBufferBlockSize = maxBufferBlockSizeInMB match {
+    case 0L => None
+    case v if v > 0L => Some(v)
+    case _ => throw new IllegalArgumentException("this line should NOT be reached")
+  }
+
+  // The reference of IO threadpool is used to spawn workers for subtasks of IO buffering.
+  @transient
+  private lazy val subTaskThreadPool: ThreadPoolExecutor = {
+    MultiFileReaderThreadPool.getOrCreateThreadPool(numThreads)
+  }
+
+  override protected def copyRemoteBlocksData(
+      remoteCopies: Seq[CopyRange],
+      filePath: Path,
+      filePathString: String,
+      out: HostMemoryOutputStream,
+      metrics: Map[String, GpuMetric]): Long = {
+    if (remoteCopies.isEmpty) {
+      return 0L
+    }
+
+    val coalescedRanges = coalesceReads(remoteCopies)
+
+    // Do not close the input stream for potential reuse.
+    val doCopy = (inStream: FSDataInputStream,
+                  outStream: HostMemoryOutputStream, ranges: Seq[CopyRange]) => {
+      closeOnExcept(outStream.buffer) { _ =>
+        val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
+        ranges.foldLeft(0L) { (acc, blockCopy) =>
+          acc + copyDataRange(blockCopy, inStream, outStream, copyBuffer)
+        }
+      }
+    }
+
+    val totalBytesCopied = PerfIO.readToHostMemory(
+      conf, out.buffer, filePath.toUri,
+      coalescedRanges.map(r => IntRangeWithOffset(r.offset, r.length, r.outputOffset))
+    ).getOrElse {
+      maxBufferBlockSize match {
+        case None =>
+          doCopy(filePath.getFileSystem(conf).open(filePath), out, coalescedRanges)
+
+        // Group coalesced ranges into one or multiple subgroups as subtasks. Then, try to execute
+        // subtasks in parallel through dispatching some of subtasks to other idle IO threads.
+        // Since current thread is also one of IO thread, it will complete at least one subtask (
+        // the last task) by itself in case that one of IO thread does nothing but waiting for the
+        // results from other IO threads. (Of course, the pure wait may still happen if subtasks
+        // being assigned to other threads takes much longer time to complete.)
+        case Some(sizeInMB) =>
+          lazy val defaultInStream = filePath.getFileSystem(conf).open(filePath)
+
+          val (subRanges, totalSize) = splitCopyRanges(coalescedRanges, sizeInMB << 20)
+          val taskId = TaskContext.get().taskAttemptId()
+          logInfo(s"[$taskId] file($filePathString), total size ${totalSize >> 10}KB, ranges[" +
+            s"${coalescedRanges.map(p => s"${p.length >> 10}KB").mkString(", ")}], parallel " +
+            s"blocks: [${subRanges.map(p => s"${p.blockSize >> 10}KB").mkString(", ")}]")
+
+          // Execute all subtasks except the last one. For each subtask, at first, try to handover
+          // it to other idle IO threads. If no idle thread is available, run it in this thread.
+          // NOTE: Because the standard threadpool does not support `submitNoWait`, use underlying
+          // TaskQueue to inspect if the thread pool is full. If full, runs the next task in this
+          // thread. Otherwise, submit the next task to the ThreadPool.
+          // TODO: Replace with customized ThreadPool which supports `submitNoWait`.
+          val sharedTaskQueue = subTaskThreadPool.getQueue
+          val futOrRets: Seq[Either[Long, Future[Long]]] = {
+            (0 until subRanges.length - 1).map { i =>
+              if (sharedTaskQueue.size() > 0) {
+                logInfo(s"[$taskId] I/O ThreadPool is full, run next IO subtask sequentially")
+                Left(doCopy(defaultInStream, out, subRanges(i).ranges))
+              } else {
+                val fut = subTaskThreadPool.submit(new Callable[Long] {
+                  override def call(): Long = {
+                    withResource(filePath.getFileSystem(conf).open(filePath)) { inStream =>
+                      val outStream = new HostMemoryOutputStream(out.buffer)
+                      doCopy(inStream, outStream, subRanges(i).ranges)
+                    }
+                  }
+                })
+                Right(fut)
+              }
+            }
+          }
+          // Run the last task, then wait for all other subtasks to complete.
+          val lastTask = withResource(defaultInStream) { inStream =>
+            doCopy(inStream, out, subRanges.last.ranges)
+          }
+          futOrRets.foldLeft(lastTask) {
+            case (acc, Left(subRet)) => acc + subRet
+            case (acc, Right(subFut)) => acc + subFut.get()
+          }
+      }
+    }
+    // try to cache the remote ranges that were copied
+    remoteCopies.foreach { range =>
+      metrics.getOrElse(GpuMetric.FILECACHE_DATA_RANGE_MISSES, NoopMetric) += 1
+      metrics.getOrElse(GpuMetric.FILECACHE_DATA_RANGE_MISSES_SIZE, NoopMetric) += range.length
+      val cacheToken = FileCache.get.startDataRangeCache(
+        filePathString, range.offset, range.length, conf)
+      // If we get a filecache token then we can complete the caching by providing the data.
+      // If we do not get a token then we should not cache this data.
+      cacheToken.foreach { token =>
+        token.complete(out.buffer.slice(range.outputOffset, range.length))
+      }
+    }
+    totalBytesCopied
+  }
+
+  // Helper class represents the buffering subtask which can be executed independently.
+  private case class SubFileBufferBlock(ranges: Array[CopyRange], blockSize: Long)
+
+  /**
+   * Assigns given CopyRanges into one or multiple subtasks according to splitThreshold.
+   *
+   * 1. For range larger than splitThreshold, split it into multiple pieces evenly by the
+   * threshold. In details,
+   *   1.1 number of pieces = ceil(length / splitThreshold)
+   *   1.2 unit length of each piece = floor(length / number of pieces)
+   *   1.3 split by the unit length. The size of last piece will be the remaining length.
+   * For example,
+   *    threshold = 100 and range = [0, 200) => result = [0, 100), [100, 200)
+   *    threshold = 100 and range = [0, 250) => result = [0, 83), [83, 166), [166, 250)
+   *
+   * 2. For range smaller than splitThreshold, try to merge it with previous ranges if the sum of
+   * their lengths does not exceed the threshold. Otherwise, assign the previous merged ranges as
+   * a subtask and rebuild "the previous stack" with the current range.
+   *
+   * Here is a comprehensive example:
+   * threshold = 100 and input ranges are [0, 30), [130, 190), [210, 400), [500, 560), [600, 650)
+   * should be spilt into 5 sub blocks:
+   *  1. SubBlock(ranges = {[0, 30), [130, 190)}, blockSize = 90)
+   *  2. SubBlock(ranges = {[210, 305)}, blockSize = 95)
+   *  3. SubBlock(ranges = {[305, 410)}, blockSize = 95)
+   *  4. SubBlock(ranges = {[500, 560)}, blockSize = 60)
+   *  4. SubBlock(ranges = {[650, 650)}, blockSize = 50)
+   */
+  private def splitCopyRanges(ranges: Seq[CopyRange],
+                              splitThreshold: Long): (Array[SubFileBufferBlock], Long) = {
+    var totalFileSize = 0L
+    val result = ArrayBuffer.empty[SubFileBufferBlock]
+    val curSlice = ArrayBuffer.empty[CopyRange]
+    var sliceLength: Long = 0L
+    ranges.foreach {
+      case range@CopyRange(nextOffset, nextLength, outputOffset) =>
+        if (sliceLength + nextLength <= splitThreshold) {
+          curSlice += range
+          sliceLength += nextLength
+        } else {
+          if (curSlice.nonEmpty) {
+            result += SubFileBufferBlock(curSlice.toArray, sliceLength)
+            totalFileSize += sliceLength
+            curSlice.clear()
+            sliceLength = 0L
+          }
+          val numSplit = Math.ceil(nextLength.toDouble / splitThreshold).toInt
+          val unitLen: Long = nextLength / numSplit
+          (0 until numSplit - 1).foreach { i =>
+            result += SubFileBufferBlock(
+              Array(CopyRange(nextOffset + i * unitLen, unitLen, outputOffset + i * unitLen)),
+              unitLen)
+            totalFileSize += unitLen
+          }
+          val localOff = (numSplit - 1) * unitLen
+          sliceLength = nextLength - localOff
+          curSlice += CopyRange(nextOffset + localOff, sliceLength, outputOffset + localOff)
+        }
+    }
+    result += SubFileBufferBlock(curSlice.toArray, sliceLength)
+    totalFileSize += sliceLength
+    (result.toArray, totalFileSize)
+  }
 
   def checkIfNeedToSplit(current: HostMemoryBuffersWithMetaData,
       next: HostMemoryBuffersWithMetaData): Boolean = {
