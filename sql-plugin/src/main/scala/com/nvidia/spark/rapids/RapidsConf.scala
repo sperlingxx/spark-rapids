@@ -1246,9 +1246,10 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
         " This threshold is specialized for reading super large parquet files in multiThread " +
         " mode. Large files whose size exceeds the threshold will be read by several sub-tasks " +
         "in parallel. If value = 0, then disables this feature.")
+      .internal()
       .integerConf
       .checkValue(v => v >= 0, "The maximum buffer block size must be >= 0.")
-      .createWithDefault(0)
+      .createWithDefault(256)
 
   val ENABLE_PARQUET_READ = conf("spark.rapids.sql.format.parquet.read.enabled")
     .doc("When set to false disables parquet input acceleration")
