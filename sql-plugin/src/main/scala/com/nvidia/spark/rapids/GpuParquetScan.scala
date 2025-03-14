@@ -1355,8 +1355,6 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
 
   val copyBufferSize = conf.getInt("parquet.read.allocation.size", 8 * 1024 * 1024)
 
-  val maxBufBlockSize = conf.getLong("parquet.read.maxBufferBlockSize", 512 * 1024 * 1024)
-
   def checkIfNeedToSplitBlocks(currentDateRebaseMode: DateTimeRebaseMode,
       nextDateRebaseMode: DateTimeRebaseMode,
       currentTimestampRebaseMode: DateTimeRebaseMode,
@@ -1460,7 +1458,6 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       // downcast is safe because copyBuffer.length is an int
       val readLength = Math.min(bytesLeft, copyBuffer.length).toInt
       val start = System.nanoTime()
-      in.read(0, copyBuffer, 0, readLength)
       in.readFully(copyBuffer, 0, readLength)
       val mid = System.nanoTime()
       out.write(copyBuffer, 0, readLength)
