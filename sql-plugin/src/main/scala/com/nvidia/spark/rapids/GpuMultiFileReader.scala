@@ -353,6 +353,7 @@ abstract class MultiFileCloudPartitionReaderBase(
   private var fcs: ExecutorCompletionService[HostMemoryBuffersWithMetaDataBase] = null
 
   private def initAndStartReaders(): Unit = {
+    execMetrics.get("numPartFiles").foreach(_.add(inputFiles.length))
     // limit the number we submit at once according to the config if set
     val limit = math.min(maxNumFileProcessed, inputFiles.length)
     val tc = TaskContext.get

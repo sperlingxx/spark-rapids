@@ -1450,7 +1450,9 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     var readTime = 0L
     var writeTime = 0L
     if (in.getPos != range.offset) {
+      val seekStart = System.nanoTime()
       in.seek(range.offset)
+      execMetrics.get(READ_FS_SEEK_TIME).foreach(_.add(System.nanoTime() - seekStart))
     }
     out.seek(range.outputOffset)
     var bytesLeft = range.length
@@ -2377,6 +2379,9 @@ class MultiFileCloudParquetPartitionReader(
     }
 
     val coalescedRanges = coalesceReads(remoteCopies)
+    execMetrics.get("filteredFileSize").foreach { m =>
+      coalescedRanges.foreach(range => m.add(range.length))
+    }
 
     // Do not close the input stream for potential reuse.
     val doCopy = (inStream: FSDataInputStream,
@@ -2407,6 +2412,7 @@ class MultiFileCloudParquetPartitionReader(
           lazy val defaultInStream = filePath.getFileSystem(conf).open(filePath)
 
           val (subRanges, totalSize) = splitCopyRanges(coalescedRanges, sizeInMB << 20)
+           execMetrics.get("subFileSplits").foreach(_.add(subRanges.length))
           val taskId = TaskContext.get().taskAttemptId()
           logInfo(s"[$taskId] file($filePathString), total size ${totalSize >> 10}KB, ranges[" +
             s"${coalescedRanges.map(p => s"${p.length >> 10}KB").mkString(", ")}], parallel " +
@@ -2422,7 +2428,7 @@ class MultiFileCloudParquetPartitionReader(
           val futOrRets: Seq[Either[Long, Future[Long]]] = {
             (0 until subRanges.length - 1).map { i =>
               if (sharedTaskQueue.size() > 0) {
-                logInfo(s"[$taskId] I/O ThreadPool is full, run next IO subtask sequentially")
+                logWarning(s"[$taskId] I/O ThreadPool is full, run next I/O subtask in here")
                 Left(doCopy(defaultInStream, out, subRanges(i).ranges))
               } else {
                 val fut = subTaskThreadPool.submit(new Callable[Long] {

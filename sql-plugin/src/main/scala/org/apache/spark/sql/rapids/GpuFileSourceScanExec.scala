@@ -397,6 +397,13 @@ case class GpuFileSourceScanExec(
     DELETION_VECTOR_SIZE -> createSizeMetric(MODERATE_LEVEL, DESCRIPTION_DELETION_VECTOR_SIZE)
   ) ++ fileCacheMetrics ++ {
     relation.fileFormat match {
+      case _: GpuReadParquetFileFormat if rapidsConf.isParquetMultiThreadReadEnabled =>
+        Map(READ_FS_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_READ_FS_TIME),
+          WRITE_BUFFER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_WRITE_BUFFER_TIME),
+          READ_FS_SEEK_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_READ_FS_SEEK_TIME),
+          "filteredFileSize" -> createSizeMetric(DEBUG_LEVEL, "size of filtered files"),
+          "numPartFiles" -> createMetric(DEBUG_LEVEL, "number of PartitionedFiles"),
+          "subFileSplits" -> createMetric(DEBUG_LEVEL, "number of sub-file I/O splits"))
       case _: GpuReadParquetFileFormat | _: GpuOrcFileFormat =>
         Map(READ_FS_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_READ_FS_TIME),
           WRITE_BUFFER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_WRITE_BUFFER_TIME))
