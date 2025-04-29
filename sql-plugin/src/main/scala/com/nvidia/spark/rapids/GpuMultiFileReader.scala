@@ -79,6 +79,8 @@ trait HostMemoryBuffersWithMetaDataBase {
   private var _filterTime: Long = 0L
   // Time spent on buffering
   private var _bufferTime: Long = 0L
+  // Time spent on precaching
+  private var _precacheTime: Long = 0L
 
   // The partition values which are needed if combining host memory buffers
   // after read by the multithreaded reader but before sending to GPU.
@@ -86,22 +88,31 @@ trait HostMemoryBuffersWithMetaDataBase {
 
   // Called by parquet/orc/avro scanners to set the amount of time (in nanoseconds)
   // that filtering and buffering incurred in one of the scan runners.
-  def setMetrics(filterTime: Long, bufferTime: Long): Unit = {
+  def setMetrics(filterTime: Long, bufferTime: Long, precacheTime: Option[Long] = None): Unit = {
     _bufferTime = bufferTime
     _filterTime = filterTime
+    precacheTime.foreach {
+      _precacheTime = _
+    }
   }
 
   def getBufferTime: Long = _bufferTime
   def getFilterTime: Long = _filterTime
+  def getPrecacheTime: Long = _precacheTime
 
   def getBufferTimePct: Double = {
-    val totalTime = _filterTime + _bufferTime
+    val totalTime = _filterTime + _bufferTime + _precacheTime
     _bufferTime.toDouble / totalTime
   }
 
   def getFilterTimePct: Double = {
-    val totalTime = _filterTime + _bufferTime
+    val totalTime = _filterTime + _bufferTime + _precacheTime
     _filterTime.toDouble / totalTime
+  }
+
+  def getPrecacheTimePct: Double = {
+    val totalTime = _filterTime + _bufferTime + _precacheTime
+    _precacheTime.toDouble / totalTime
   }
 }
 
@@ -626,6 +637,9 @@ abstract class MultiFileCloudPartitionReaderBase(
           }
           metrics.get(BUFFER_TIME).foreach {
             _ += (blockedTime * fileBufsAndMeta.getBufferTimePct).toLong
+          }
+          metrics.get("precacheTime").foreach {
+            _ += (blockedTime * fileBufsAndMeta.getPrecacheTimePct).toLong
           }
 
           TrampolineUtil.incBytesRead(inputMetrics, fileBufsAndMeta.bytesRead)
