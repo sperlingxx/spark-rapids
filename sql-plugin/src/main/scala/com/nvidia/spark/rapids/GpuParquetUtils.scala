@@ -199,11 +199,11 @@ object ParquetReadHelper {
       bounceBuffer: Array[Byte],
       execMetrics: Map[String, GpuMetric]): MemoryParquetReadHelper = {
     val fileBuffer = withResource(new NvtxRange("cacheFile", NvtxColor.ORANGE)) { _ =>
-      val clippedLen = status.getLen - file.start
-      closeOnExcept(HostMemoryBuffer.allocate(clippedLen, false)) { outBuf =>
+      val fileLen = status.getLen
+      closeOnExcept(HostMemoryBuffer.allocate(fileLen, false)) { outBuf =>
         val out = new HostMemoryOutputStream(outBuf)
         withResource(openInputStream(status.getPath, hadoopConf)) { in =>
-          val range = CopyRange(file.start, clippedLen, 0)
+          val range = CopyRange(0, fileLen, 0)
           GpuParquetUtils.copyDataRange(range, in, out, bounceBuffer, execMetrics)
         }
         outBuf
@@ -276,7 +276,8 @@ class MemoryParquetReadHelper(
   }
 
   private def buildOptions(conf: Configuration): ParquetReadOptions = {
-    val metaFilter = ParquetMetadataConverter.range(0,partFile.length)
+    val metaFilter = ParquetMetadataConverter.range(
+      partFile.start, partFile.start + partFile.length)
     HadoopReadOptions.builder(conf).withMetadataFilter(metaFilter).build()
   }
 

@@ -1044,8 +1044,8 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       val hadoopConf = new Configuration(conf)
       val filePath = new Path(new URI(file.filePath.toString()))
       lazy val fileStatus = filePath.getFileSystem(hadoopConf).getFileStatus(filePath)
-      lazy val clippedFileLen = fileStatus.getLen - file.start
-      if (precacheThreshold > 0 && clippedFileLen <= precacheThreshold) {
+      lazy val fileLen = fileStatus.getLen
+      if (precacheThreshold > 0 && fileLen <= precacheThreshold) {
         filterHandler.cacheFileAndFilterBlocks(
           footerReadType, file, hadoopConf, filters, readDataSchema, fileStatus, metrics)
       } else {
