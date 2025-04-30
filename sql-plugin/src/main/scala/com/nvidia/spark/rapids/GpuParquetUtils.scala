@@ -19,22 +19,25 @@ package com.nvidia.spark.rapids
 import java.io.{Closeable, EOFException, IOException}
 import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
-import java.util.{Collections, Locale, List => JList}
+import java.util.{List => JList, Locale}
+
 import scala.collection.JavaConverters._
 import scala.collection.mutable
+
 import ai.rapids.cudf.{HostMemoryBuffer, NvtxColor, NvtxRange}
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric.{READ_FS_TIME, WRITE_BUFFER_TIME}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hadoop.fs.{FileStatus, FSDataInputStream, Path}
 import org.apache.parquet.{HadoopReadOptions, ParquetReadOptions}
-import org.apache.parquet.column.ColumnDescriptor
+import org.apache.parquet.bytes.BytesUtils.readIntLittleEndian
 import org.apache.parquet.format.converter.ParquetMetadataConverter
 import org.apache.parquet.hadoop.ParquetFileReader
+import org.apache.parquet.hadoop.ParquetFileWriter.MAGIC
 import org.apache.parquet.hadoop.metadata.{BlockMetaData, ColumnChunkMetaData, ColumnPath, ParquetMetadata}
-import org.apache.parquet.hadoop.util.HadoopStreams
 import org.apache.parquet.io.{InputFile, SeekableInputStream}
 import org.apache.parquet.schema.MessageType
+
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.datasources.PartitionedFile
 
@@ -179,8 +182,10 @@ private[rapids] case class CopyRange(
     length: Long,
     outputOffset: Long) extends CopyItem
 
-trait ParquetReadHelper {
+trait ParquetReadHelper extends AutoCloseable {
+  val fileLength: Long
   val partFile: PartitionedFile
+  val fileBuffer: HostMemoryBuffer
 
   def filePath(): Path
 
@@ -189,6 +194,8 @@ trait ParquetReadHelper {
   def getFooter(conf: Configuration): ParquetMetadata
 
   def filterRowGroups(conf: Configuration): JList[BlockMetaData]
+
+  def footerOffset(): Long
 }
 
 object ParquetReadHelper {
@@ -198,50 +205,25 @@ object ParquetReadHelper {
       status: FileStatus,
       bounceBuffer: Array[Byte],
       execMetrics: Map[String, GpuMetric]): MemoryParquetReadHelper = {
+    val fileLen = status.getLen
+    val filePath = status.getPath
     val fileBuffer = withResource(new NvtxRange("cacheFile", NvtxColor.ORANGE)) { _ =>
-      val fileLen = status.getLen
-      closeOnExcept(HostMemoryBuffer.allocate(fileLen, false)) { outBuf =>
+      closeOnExcept(HostMemoryBuffer.allocate(fileLen)) { outBuf =>
         val out = new HostMemoryOutputStream(outBuf)
-        withResource(openInputStream(status.getPath, hadoopConf)) { in =>
+        withResource(filePath.getFileSystem(hadoopConf).open(filePath)) { in =>
           val range = CopyRange(0, fileLen, 0)
           GpuParquetUtils.copyDataRange(range, in, out, bounceBuffer, execMetrics)
         }
         outBuf
       }
     }
-    new MemoryParquetReadHelper(file, fileBuffer)
+    new MemoryParquetReadHelper(file, fileLen, fileBuffer)
   }
 
   def fromPath(path: Path): Option[ParquetReadHelper] = {
     path match {
       case path: MemoryVirtualPath => Some(path.readHelper)
       case _ => None
-    }
-  }
-
-  def openInputStream(path: Path, conf: Configuration): SeekableInputStream = {
-    path match {
-      case p: MemoryVirtualPath =>
-        p.readHelper.inputStream
-      case p =>
-        HadoopStreams.wrap(p.getFileSystem(conf).open(p))
-    }
-  }
-
-  @scala.annotation.nowarn
-  def filterRowGroups(
-      conf: Configuration,
-      footer: ParquetMetadata,
-      filePath: Path): JList[BlockMetaData] = {
-    filePath match {
-      case p: MemoryVirtualPath =>
-        p.readHelper.filterRowGroups(conf)
-      case p =>
-        //noinspection ScalaDeprecation
-        withResource(new ParquetFileReader(conf, footer.getFileMetaData, p,
-          footer.getBlocks, Collections.emptyList[ColumnDescriptor])) { parquetReader =>
-          parquetReader.getRowGroups
-        }
     }
   }
 }
@@ -255,12 +237,16 @@ private object MemoryVirtualPath {
 
 class MemoryParquetReadHelper(
     override val partFile: PartitionedFile,
-    val fileBuffer: HostMemoryBuffer) extends ParquetReadHelper {
+    override val fileLength: Long,
+    override val fileBuffer: HostMemoryBuffer) extends ParquetReadHelper {
+  @transient
+  private lazy val metaFilter: ParquetMetadataConverter.MetadataFilter = {
+    ParquetMetadataConverter.range(partFile.start, partFile.start + partFile.length)
+  }
 
   override def filePath(): Path = new MemoryVirtualPath(this)
 
   override def inputStream: SeekableInputStream = new HMBInputFile(fileBuffer).newStream()
-
   override def getFooter(conf: Configuration): ParquetMetadata = {
     val reader = ParquetFileReader.open(new HMBInputFile(fileBuffer), buildOptions(conf))
     withResource(reader) {
@@ -275,41 +261,21 @@ class MemoryParquetReadHelper(
     }
   }
 
+  override def footerOffset(): Long = {
+    withResource(inputStream) { stream =>
+      val footerLengthIndex = fileLength - 4 - MAGIC.length
+      stream.seek(footerLengthIndex)
+      val footerLength = readIntLittleEndian(stream)
+      footerLengthIndex - footerLength
+    }
+  }
+
+  override def close(): Unit = {
+    fileBuffer.close()
+  }
+
   private def buildOptions(conf: Configuration): ParquetReadOptions = {
-    val metaFilter = ParquetMetadataConverter.range(
-      partFile.start, partFile.start + partFile.length)
     HadoopReadOptions.builder(conf).withMetadataFilter(metaFilter).build()
-  }
-
-  private def copyDataRanges(
-      ranges: Seq[CopyRange],
-      out: HostMemoryOutputStream,
-      metrics: Option[GpuMetric]): Unit = {
-    val start = System.nanoTime()
-    ranges.foreach { case CopyRange(offset, length, outputOffset) =>
-      out.buffer.copyFromHostBuffer(outputOffset, fileBuffer, offset, length)
-    }
-    metrics.foreach(_ += System.nanoTime() - start)
-  }
-
-  def copyBlockData(
-      out: HostMemoryOutputStream,
-      blocks: Seq[BlockMetaData],
-      metric: Option[GpuMetric]): Unit = {
-    val startPos = out.getPos
-    var totalBytesToCopy = 0L
-    val ranges = blocks.flatMap { block =>
-      block.getColumns.asScala.map { column =>
-        val columnSize = column.getTotalSize
-        val outputOffset = totalBytesToCopy + startPos
-        totalBytesToCopy += columnSize
-        CopyRange(column.getStartingPos, columnSize, outputOffset)
-      }
-    }
-    val coalescedRanges = GpuParquetUtils.coalesceRanges(ranges)
-    copyDataRanges(coalescedRanges, out, metric)
-    // fixup output pos after blocks were copied possibly out of order
-    out.seek(startPos + totalBytesToCopy)
   }
 }
 
@@ -372,40 +338,9 @@ object GpuParquetUtils extends Logging {
     block
   }
 
-  def coalesceRanges(ranges: Seq[CopyRange]): Seq[CopyRange] = {
-    val coalesced = new mutable.ArrayBuffer[CopyRange](ranges.length)
-    var currentRange: CopyRange = null
-    var currentRangeEnd = 0L
-
-    def addCurrentRange(): Unit = {
-      if (currentRange != null) {
-        val rangeLength = currentRangeEnd - currentRange.offset
-        if (rangeLength == currentRange.length) {
-          coalesced += currentRange
-        } else {
-          coalesced += currentRange.copy(length = rangeLength)
-        }
-        currentRange = null
-        currentRangeEnd = 0L
-      }
-    }
-
-    ranges.foreach { c =>
-      if (c.offset == currentRangeEnd) {
-        currentRangeEnd += c.length
-      } else {
-        addCurrentRange()
-        currentRange = c
-        currentRangeEnd = c.offset + c.length
-      }
-    }
-    addCurrentRange()
-    coalesced.toSeq
-  }
-
   def copyDataRange(
       range: CopyRange,
-      in: SeekableInputStream,
+      in: FSDataInputStream,
       out: HostMemoryOutputStream,
       copyBuffer: Array[Byte],
       execMetrics: Map[String, GpuMetric]): Long = {
