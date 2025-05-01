@@ -55,7 +55,8 @@ import org.apache.spark.util.SerializableConfiguration
  * for combining the buffers before sending to GPU.
  */
 case class SingleHMBAndMeta(hmbs: Array[SpillableHostBuffer], bytes: Long, numRows: Long,
-    blockMeta: Seq[DataBlockBase])
+    blockMeta: Seq[DataBlockBase],
+    footerOffset: Option[Long] = None)
 
 object SingleHMBAndMeta {
   // Contains no data but could have number of rows for things like count().

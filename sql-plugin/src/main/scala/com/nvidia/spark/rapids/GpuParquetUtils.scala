@@ -16,10 +16,11 @@
 
 package com.nvidia.spark.rapids
 
-import java.io.{Closeable, EOFException, IOException}
+import java.io.{Closeable, EOFException, IOException, OutputStream}
 import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
-import java.util.{List => JList, Locale}
+import java.nio.charset.StandardCharsets
+import java.util.{Collections, List => JList, Locale}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -30,17 +31,17 @@ import com.nvidia.spark.rapids.GpuMetric.{READ_FS_TIME, WRITE_BUFFER_TIME}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FSDataInputStream, Path}
 import org.apache.parquet.{HadoopReadOptions, ParquetReadOptions}
+import org.apache.parquet.bytes.BytesUtils
 import org.apache.parquet.bytes.BytesUtils.readIntLittleEndian
 import org.apache.parquet.format.converter.ParquetMetadataConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.ParquetFileWriter.MAGIC
-import org.apache.parquet.hadoop.metadata.{BlockMetaData, ColumnChunkMetaData, ColumnPath, ParquetMetadata}
+import org.apache.parquet.hadoop.metadata._
 import org.apache.parquet.io.{InputFile, SeekableInputStream}
 import org.apache.parquet.schema.MessageType
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.datasources.PartitionedFile
-
 
 /**
  * A parquet compatible stream that allows reading from a HostMemoryBuffer to Parquet.
@@ -185,7 +186,6 @@ private[rapids] case class CopyRange(
 trait ParquetReadHelper extends AutoCloseable {
   val fileLength: Long
   val partFile: PartitionedFile
-  val fileBuffer: HostMemoryBuffer
 
   def filePath(): Path
 
@@ -196,6 +196,11 @@ trait ParquetReadHelper extends AutoCloseable {
   def filterRowGroups(conf: Configuration): JList[BlockMetaData]
 
   def footerOffset(): Long
+
+  def clipAndBuild(
+      blocks: Seq[BlockMetaData],
+      schema: MessageType,
+      toDataBlockBase: Seq[BlockMetaData] => Seq[DataBlockBase]): SingleHMBAndMeta
 }
 
 object ParquetReadHelper {
@@ -238,15 +243,18 @@ private object MemoryVirtualPath {
 class MemoryParquetReadHelper(
     override val partFile: PartitionedFile,
     override val fileLength: Long,
-    override val fileBuffer: HostMemoryBuffer) extends ParquetReadHelper {
+    val fileBuffer: HostMemoryBuffer) extends ParquetReadHelper with Logging {
   @transient
   private lazy val metaFilter: ParquetMetadataConverter.MetadataFilter = {
     ParquetMetadataConverter.range(partFile.start, partFile.start + partFile.length)
   }
 
+  private var built = false
+
   override def filePath(): Path = new MemoryVirtualPath(this)
 
   override def inputStream: SeekableInputStream = new HMBInputFile(fileBuffer).newStream()
+
   override def getFooter(conf: Configuration): ParquetMetadata = {
     val reader = ParquetFileReader.open(new HMBInputFile(fileBuffer), buildOptions(conf))
     withResource(reader) {
@@ -270,6 +278,56 @@ class MemoryParquetReadHelper(
     }
   }
 
+  override def clipAndBuild(
+      blocks: Seq[BlockMetaData],
+      schema: MessageType,
+      toDataBlockBase: Seq[BlockMetaData] => Seq[DataBlockBase]): SingleHMBAndMeta = {
+    require(!built, "Already built")
+    built = true
+
+    val footerPos = footerOffset()
+    val blkEnd = footerPos
+    val blkStart = blocks.foldLeft(footerPos) { case (start, block) =>
+      block.getColumns.asScala.foldLeft(start) { case (lb, column) =>
+        lb min column.getStartingPos
+      }
+    }
+    /*
+    val (blkStart, blkEnd) = blocks.foldLeft((footerPos, 0L)) {
+      case ((start, end), block) =>
+        block.getColumns.asScala.foldLeft((start, end)) {
+          case ((lb, ub), column) =>
+            val newStart = column.getStartingPos
+            val newEnd = newStart + column.getTotalSize
+            (lb min newStart, ub max newEnd)
+        }
+    }
+    */
+
+    val headLen = GpuParquetUtils.PARQUET_MAGIC.length
+    require(blkStart >= headLen && blkStart <= blkEnd && blkEnd <= footerPos,
+      s"Invalid blocks: BlockStart($blkStart), BlockEnd($blkEnd)," +
+        s" footerPos($footerPos), fileLength($fileLength)")
+    val alignedBlocks = GpuParquetUtils.alignBlockMetaData(blocks, headLen - blkStart)
+
+    val bufStart = blkStart - headLen
+    val out = new HostMemoryOutputStream(fileBuffer)
+    out.seek(bufStart)
+    out.write(GpuParquetUtils.PARQUET_MAGIC)
+    out.seek(blkEnd)
+    GpuParquetUtils.writeFooter(out, alignedBlocks, schema)
+    BytesUtils.writeIntLittleEndian(out, (out.getPos - blkEnd).toInt)
+    out.write(GpuParquetUtils.PARQUET_MAGIC)
+    val clippedBuffer = fileBuffer.slice(bufStart, out.getPos - bufStart)
+    val newFooterPos = blkEnd - bufStart
+
+    val scb = SpillableHostBuffer(clippedBuffer,
+      clippedBuffer.getLength, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+    val numRows = alignedBlocks.map(_.getRowCount).sum.toInt
+    SingleHMBAndMeta(Array(scb),
+      scb.length, numRows, toDataBlockBase(alignedBlocks), Some(newFooterPos))
+  }
+
   override def close(): Unit = {
     fileBuffer.close()
   }
@@ -280,6 +338,10 @@ class MemoryParquetReadHelper(
 }
 
 object GpuParquetUtils extends Logging {
+  private[rapids] val PARQUET_MAGIC = "PAR1".getBytes(StandardCharsets.US_ASCII)
+  private[rapids] val PARQUET_CREATOR = "RAPIDS Spark Plugin"
+  private[rapids] val PARQUET_VERSION = 1
+
   /**
    * Trim block metadata to contain only the column chunks that occur in the specified schema.
    * The column chunks that are returned are preserved verbatim
@@ -366,5 +428,56 @@ object GpuParquetUtils extends Logging {
     execMetrics.get(READ_FS_TIME).foreach(_.add(readTime))
     execMetrics.get(WRITE_BUFFER_TIME).foreach(_.add(writeTime))
     range.length
+  }
+
+  @scala.annotation.nowarn(
+    "msg=method getPath in class ColumnChunkMetaData is deprecated"
+  )
+  def alignBlockMetaData(
+      blocks: Seq[BlockMetaData],
+      offset: Long): Seq[BlockMetaData] = {
+    if (offset == 0) {
+      return blocks
+    }
+    val outputBlocks = new mutable.ArrayBuffer[BlockMetaData](blocks.length)
+    blocks.foreach { block =>
+      val columns = block.getColumns.asScala
+      val outputColumns = new mutable.ArrayBuffer[ColumnChunkMetaData](columns.length)
+      columns.foreach { column =>
+        val newDictOffset = if (column.getDictionaryPageOffset > 0) {
+          column.getDictionaryPageOffset + offset
+        } else {
+          0
+        }
+        val columnSize = column.getTotalSize
+        //noinspection ScalaDeprecation
+        outputColumns += ColumnChunkMetaData.get(
+          column.getPath,
+          column.getPrimitiveType,
+          column.getCodec,
+          column.getEncodingStats,
+          column.getEncodings,
+          column.getStatistics,
+          column.getStartingPos + offset,
+          newDictOffset,
+          column.getValueCount,
+          columnSize,
+          column.getTotalUncompressedSize)
+      }
+      outputBlocks += GpuParquetUtils.newBlockMeta(block.getRowCount, outputColumns.toSeq)
+    }
+    outputBlocks.toSeq
+  }
+
+  def writeFooter(
+      out: OutputStream,
+      blocks: Seq[BlockMetaData],
+      schema: MessageType): Unit = {
+    val fileMeta = new FileMetaData(schema, Collections.emptyMap[String, String],
+      PARQUET_CREATOR)
+    val metadataConverter = new ParquetMetadataConverter
+    val footer = new ParquetMetadata(fileMeta, blocks.asJava)
+    val meta = metadataConverter.toParquetMetadata(PARQUET_VERSION, footer)
+    org.apache.parquet.format.Util.writeFileMetaData(meta, out)
   }
 }

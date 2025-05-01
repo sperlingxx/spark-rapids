@@ -1384,7 +1384,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     // This uses the column metadata from the original file, but that should
     // always be at least as big as the updated metadata in the output.
     val out = new CountingOutputStream(new NullOutputStream)
-    writeFooter(out, currentChunkedBlocks, schema)
+    GpuParquetUtils.writeFooter(out, currentChunkedBlocks, schema)
     out.getByteCount
   }
 
@@ -1421,18 +1421,6 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       0
     }
     headerSize + blocksSize + footerSize + extraMemory
-  }
-
-  protected def writeFooter(
-      out: OutputStream,
-      blocks: Seq[BlockMetaData],
-      schema: MessageType): Unit = {
-    val fileMeta = new FileMetaData(schema, Collections.emptyMap[String, String],
-      ParquetPartitionReader.PARQUET_CREATOR)
-    val metadataConverter = new ParquetMetadataConverter
-    val footer = new ParquetMetadata(fileMeta, blocks.asJava)
-    val meta = metadataConverter.toParquetMetadata(ParquetPartitionReader.PARQUET_VERSION, footer)
-    org.apache.parquet.format.Util.writeFileMetaData(meta, out)
   }
 
   /**
@@ -1885,7 +1873,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
           copyBlocksData(filePath, out, blocks, out.getPos, metrics)
         }
         val footerPos = out.getPos
-        writeFooter(out, outputBlocks, clippedSchema)
+        GpuParquetUtils.writeFooter(out, outputBlocks, clippedSchema)
         BytesUtils.writeIntLittleEndian(out, (out.getPos - footerPos).toInt)
         out.write(ParquetPartitionReader.PARQUET_MAGIC)
         // check we didn't go over memory
@@ -2240,7 +2228,7 @@ class MultiFileParquetPartitionReader(
     val finalSize = closeOnExcept(buffer) { _ =>
       withResource(buffer.slice(footerOffset, lenLeft)) { finalizehmb =>
         withResource(new HostMemoryOutputStream(finalizehmb)) { footerOut =>
-          writeFooter(footerOut, blocks, bContext.schema)
+          GpuParquetUtils.writeFooter(footerOut, blocks, bContext.schema)
           BytesUtils.writeIntLittleEndian(footerOut, footerOut.getPos.toInt)
           footerOut.write(ParquetPartitionReader.PARQUET_MAGIC)
           footerOffset + footerOut.getPos
@@ -2363,9 +2351,12 @@ class MultiFileCloudParquetPartitionReader(
       // zero-copy the data
       toCombineHmbs.map { hbWithMeta =>
         hbWithMeta.memBuffersAndSizes.map { hmbInfo =>
-          val columnDataSize = hmbInfo.blockMeta.map { meta =>
-            meta.getColumns.asScala.map(_.getTotalSize).sum
-          }.sum
+          // When footOffset is set, it means the buffer may not be dense.
+          val columnDataSize = hmbInfo.footerOffset.map(_ - 4).getOrElse {
+            hmbInfo.blockMeta.map { meta =>
+              meta.getColumns.asScala.map(_.getTotalSize).sum
+            }.sum
+          }
           if (columnDataSize > 0 && hmbInfo.hmbs.nonEmpty) {
             val bytesToSlice = if (buffers.isEmpty) {
               columnDataSize + PARQUET_MAGIC.size
@@ -2377,7 +2368,10 @@ class MultiFileCloudParquetPartitionReader(
             buffers += SpillableHostBuffer.sliceWithRetry(hmbInfo.hmbs.head, sliceOffset,
               bytesToSlice)
           }
-          val outputBlocks = computeBlockMetaData(hmbInfo.blockMeta, offset)
+          val outputBlocks: Seq[BlockMetaData] = {
+            val alignedOffset = offset - PARQUET_MAGIC.size
+            GpuParquetUtils.alignBlockMetaData(hmbInfo.blockMeta, alignedOffset)
+          }
           allOutputBlocks ++= outputBlocks
           offset += columnDataSize
           hmbInfo.hmbs.safeClose()
@@ -2395,7 +2389,7 @@ class MultiFileCloudParquetPartitionReader(
       val footerBuf = HostMemoryBuffer.allocate(actualFooterSize + 8)
       buffers += footerBuf
       withResource(new HostMemoryOutputStream(footerBuf)) { footerOut =>
-        writeFooter(footerOut, allOutputBlocks.toSeq, schemaToUse)
+        GpuParquetUtils.writeFooter(footerOut, allOutputBlocks.toSeq, schemaToUse)
         BytesUtils.writeIntLittleEndian(footerOut, footerOut.getPos.toInt)
         footerOut.write(ParquetPartitionReader.PARQUET_MAGIC)
         offset += footerOut.getPos
@@ -2631,26 +2625,26 @@ class MultiFileCloudParquetPartitionReader(
                 fileBlockMeta.dateRebaseMode, fileBlockMeta.timestampRebaseMode,
                 fileBlockMeta.hasInt96Timestamps, fileBlockMeta.schema, fileBlockMeta.readSchema,
                 numRows)
+            } else if (readHelper.isDefined) {
+              // Build the HMB on the top of the original file buffer. This method can be called
+              // only once since the file buffer will be referenced by the HMB.
+              val helper = readHelper.get
+              val memBufAndSize: Array[SingleHMBAndMeta] = {
+                val blocksToRead = blockChunkIter.toList
+                Array(helper.clipAndBuild(blocksToRead, fileBlockMeta.schema,
+                  toDataBlockBase))
+              }
+              HostMemoryBuffersWithMetaData(file,
+                memBufAndSize, helper.fileLength,
+                fileBlockMeta.dateRebaseMode,
+                fileBlockMeta.timestampRebaseMode, fileBlockMeta.hasInt96Timestamps,
+                fileBlockMeta.schema, fileBlockMeta.readSchema, None)
             } else {
               while (blockChunkIter.hasNext) {
                 val blocksToRead = populateCurrentBlockChunk(blockChunkIter,
                   maxReadBatchSizeRows, maxReadBatchSizeBytes, fileBlockMeta.readSchema)
-                val (dataBuffer, blockMeta) = readHelper.map { helper =>
-                  // Reuse the file buffer, only rewrite the footer
-                  // TODO: clip the unnecessary head by the PartitionedFile.start
-                  val out = new HostMemoryOutputStream(helper.fileBuffer)
-                  val footerPos = helper.footerOffset()
-                  out.seek(footerPos)
-                  writeFooter(out, blocksToRead, fileBlockMeta.schema)
-                  BytesUtils.writeIntLittleEndian(out, (out.getPos - footerPos).toInt)
-                  out.write(ParquetPartitionReader.PARQUET_MAGIC)
-                  val resultBuffer = helper.fileBuffer.slice(0, out.getPos)
-                  val scb = SpillableHostBuffer(resultBuffer,
-                    resultBuffer.getLength, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
-                  (scb, blocksToRead)
-                }.getOrElse {
-                  readPartFile(blocksToRead, fileBlockMeta.schema, fileBlockMeta.filePath)
-                }
+                val (dataBuffer, blockMeta) = readPartFile(blocksToRead,
+                  fileBlockMeta.schema, fileBlockMeta.filePath)
                 val numRows = blocksToRead.map(_.getRowCount).sum.toInt
                 hostBuffers += SingleHMBAndMeta(Array(dataBuffer), dataBuffer.length,
                   numRows, blockMeta)
