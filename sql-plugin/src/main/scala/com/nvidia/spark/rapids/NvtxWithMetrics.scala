@@ -38,10 +38,10 @@ class NvtxWithMetrics(name: String, color: NvtxColor, val metrics: GpuMetric*)
   private val start = System.nanoTime()
 
   override def close(): Unit = {
-    val time = System.nanoTime() - start
+    val end = System.nanoTime()
     metrics.toSeq.zip(needTracks).foreach { pair =>
       if (pair._2) {
-        pair._1.deactivateTimer(time)
+        pair._1.deactivateTimer(start, end)
       }
     }
     super.close()
@@ -53,10 +53,10 @@ class MetricRange(val metrics: GpuMetric*) extends AutoCloseable {
   private val start = System.nanoTime()
 
   override def close(): Unit = {
-    val time = System.nanoTime() - start
+    val end = System.nanoTime()
     metrics.toSeq.zip(needTracks).foreach { pair =>
       if (pair._2) {
-        pair._1.deactivateTimer(time)
+        pair._1.deactivateTimer(start, end)
       }
     }
   }

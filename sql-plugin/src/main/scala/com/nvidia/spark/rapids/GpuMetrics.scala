@@ -21,7 +21,7 @@ import scala.collection.immutable.TreeMap
 import ai.rapids.cudf.NvtxColor
 import com.nvidia.spark.rapids.Arm.withResource
 
-import org.apache.spark.SparkContext
+import org.apache.spark.{SparkContext, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
@@ -213,11 +213,27 @@ sealed abstract class GpuMetric extends Serializable {
     }
   }
 
-  final def deactivateTimer(duration: Long): Unit = {
+  final def deactivateTimer(start: Long, end: Long): Unit = {
     if (isTimerActive) {
       isTimerActive = false
-      companionGpuMetric.foreach(c =>
-        c.add(duration - (GpuTaskMetrics.get.getSemWaitTime() - semWaitTimeWhenActivated)))
+
+      val duration = end - start
+      companionGpuMetric.foreach { c =>
+        val semWaitAfter = GpuTaskMetrics.get.getSemWaitTime()
+        if (semWaitAfter == semWaitTimeWhenActivated) {
+          Option(TaskContext.get()).foreach { ctx =>
+            GpuSemaphore.getLastSemAcqAndRelTime(ctx) match {
+              case (Some(acqTime), Some(relTime)) if relTime < acqTime && acqTime < start =>
+                c.add(duration)
+              case (Some(acqTime), None) if acqTime < start =>
+                c.add(duration)
+              case _ =>
+            }
+          }
+        } else {
+          c.add(duration - (semWaitAfter - semWaitTimeWhenActivated))
+        }
+      }
       semWaitTimeWhenActivated = 0L
       add(duration)
     }
@@ -229,7 +245,7 @@ sealed abstract class GpuMetric extends Serializable {
       try {
         f
       } finally {
-        deactivateTimer(System.nanoTime() - start)
+        deactivateTimer(start, System.nanoTime())
       }
     } else {
       f

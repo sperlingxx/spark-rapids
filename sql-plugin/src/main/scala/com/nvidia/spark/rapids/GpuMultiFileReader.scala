@@ -91,8 +91,9 @@ trait HostMemoryBuffersWithMetaDataBase {
     _filterTime = filterTime
   }
 
-  def getBufferTime: Long = _bufferTime
   def getFilterTime: Long = _filterTime
+
+  def getBufferTime: Long = _bufferTime
 
   def getBufferTimePct: Double = {
     val totalTime = _filterTime + _bufferTime
@@ -619,14 +620,18 @@ abstract class MultiFileCloudPartitionReaderBase(
           // happen in the same background threads. This is as close to wall
           // clock as we can get right now without further work.
           val startTime = System.nanoTime()
-          val fileBufsAndMeta = getNextBuffersAndMeta()
+          val fileBufsAndMeta = metrics.get(BUFFER_TIME) match {
+            case Some(bufTime) =>
+              bufTime.ns {
+                getNextBuffersAndMeta()
+              }
+            case None =>
+              getNextBuffersAndMeta()
+          }
           val blockedTime = System.nanoTime() - startTime
-          metrics.get(FILTER_TIME).foreach {
-            _ += (blockedTime * fileBufsAndMeta.getFilterTimePct).toLong
-          }
-          metrics.get(BUFFER_TIME).foreach {
-            _ += (blockedTime * fileBufsAndMeta.getBufferTimePct).toLong
-          }
+          val filterTime = (blockedTime * fileBufsAndMeta.getFilterTimePct).toLong
+          metrics.get(FILTER_TIME).foreach(_.add(filterTime))
+          metrics.get(BUFFER_TIME).foreach(_.add(-filterTime))
 
           TrampolineUtil.incBytesRead(inputMetrics, fileBufsAndMeta.bytesRead)
           val inputFileToSet = fileBufsAndMeta.partitionedFile
