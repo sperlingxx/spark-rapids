@@ -171,7 +171,7 @@ case class GpuRapidsProcessDeltaMergeJoinExec(
   private lazy val boundNoopCopyOutput = noopCopyOutput.map(bindForGpu)
   private lazy val boundDeleteRowOutput = deleteRowOutput.map(bindForGpu)
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] = {
+  override lazy val opMetrics: Map[String, GpuMetric] = {
     import GpuMetric._
     Map(OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME))
   }
