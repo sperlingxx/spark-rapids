@@ -1202,8 +1202,8 @@ case class GpuSampleExec(
   override def doExecute(): RDD[InternalRow] =
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
-  override val outputRowsLevel: MetricsLevel = ESSENTIAL_LEVEL
-  override val outputBatchesLevel: MetricsLevel = MODERATE_LEVEL
+  override val outputRowsLevel: Option[MetricsLevel] = Some(ESSENTIAL_LEVEL)
+  override val outputBatchesLevel: Option[MetricsLevel] = Some(MODERATE_LEVEL)
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val opTime = gpuLongMetric(OP_TIME)

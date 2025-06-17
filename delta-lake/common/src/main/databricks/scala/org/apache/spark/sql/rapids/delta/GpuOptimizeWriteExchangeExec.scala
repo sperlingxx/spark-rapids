@@ -53,7 +53,7 @@ import org.apache.spark.util.ThreadUtils
  */
 case class GpuOptimizeWriteExchangeExec(
     partitioning: GpuPartitioning,
-    override val child: SparkPlan) extends Exchange with GpuExec {
+    override val child: SparkPlan) extends Exchange with NonColumnarOutputExec {
   import GpuMetric._
 
   // Use 150% of target file size hint config considering parquet compression.
@@ -72,23 +72,24 @@ case class GpuOptimizeWriteExchangeExec(
   private[sql] lazy val readMetrics =
     SQLShuffleReadMetricsReporter.createShuffleReadMetrics(sparkContext)
 
-  override lazy val additionalMetrics : Map[String, GpuMetric] = {
-    createAdditionalExchangeMetrics(this) ++
-      GpuMetric.wrap(readMetrics) ++
-      GpuMetric.wrap(writeMetrics)
-  }
+  override lazy val opMetrics : Map[String, GpuMetric] = {
+    val bf = Map.newBuilder[String, GpuMetric]
+    // ShuffleExchangeExec overrides base metrics, in order to track the size metrics of
+    // the shuffle write stage.
+    bf += NUM_OUTPUT_ROWS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_OUTPUT_ROWS)
+    bf += NUM_OUTPUT_BATCHES -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_OUTPUT_BATCHES)
 
-  override lazy val allMetrics: Map[String, GpuMetric] = {
-    Map(
-      PARTITION_SIZE -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_PARTITION_SIZE),
-      NUM_PARTITIONS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_PARTITIONS),
-      NUM_OUTPUT_ROWS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_OUTPUT_ROWS),
-      NUM_OUTPUT_BATCHES -> createMetric(MODERATE_LEVEL, DESCRIPTION_NUM_OUTPUT_BATCHES)
-    ) ++ additionalMetrics
+    bf += PARTITION_SIZE -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_PARTITION_SIZE)
+    bf += NUM_PARTITIONS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_PARTITIONS)
+    bf += COPY_TO_HOST_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_COPY_TO_HOST_TIME)
+    bf ++= createAdditionalExchangeMetrics(this)
+    bf ++= GpuMetric.wrap(readMetrics)
+    bf ++= GpuMetric.wrap(writeMetrics)
+    bf.result()
   }
 
   private lazy val serializer: Serializer =
-    new GpuColumnarBatchSerializer(allMetrics,
+    new GpuColumnarBatchSerializer(opMetrics,
       child.output.map(_.dataType).toArray,
       RapidsConf.SHUFFLE_KUDO_SERIALIZER_ENABLED.get(child.conf),
       RapidsConf.SHUFFLE_KUDO_SERIALIZER_MEASURE_BUFFER_COPY_ENABLED.get(child.conf))
@@ -113,7 +114,7 @@ case class GpuOptimizeWriteExchangeExec(
       serializer,
       useGPUShuffle=partitioning.usesGPUShuffle,
       useMultiThreadedShuffle=partitioning.usesMultiThreadedShuffle,
-      metrics=allMetrics,
+      metrics=opMetrics,
       writeMetrics=writeMetrics,
       additionalMetrics=additionalMetrics)
     metrics("numPartitions").set(dep.partitioner.numPartitions)
