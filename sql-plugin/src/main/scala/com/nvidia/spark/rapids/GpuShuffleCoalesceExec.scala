@@ -61,7 +61,7 @@ case class GpuShuffleCoalesceExec(child: SparkPlan, targetBatchByteSize: Long)
     CONCAT_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_CONCAT_TIME),
   )
 
-  override protected val outputBatchesLevel = MODERATE_LEVEL
+  override protected val outputBatchesLevel: Option[MetricsLevel] = Some(MODERATE_LEVEL)
 
   override def output: Seq[Attribute] = child.output
 

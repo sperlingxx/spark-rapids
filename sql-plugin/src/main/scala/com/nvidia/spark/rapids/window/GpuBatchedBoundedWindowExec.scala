@@ -37,8 +37,6 @@ class GpuBatchedBoundedWindowIterator(
   val outputTypes: Array[DataType],
   minPreceding: Int,
   maxFollowing: Int,
-  numOutputBatches: GpuMetric,
-  numOutputRows: GpuMetric,
   opTime: GpuMetric) extends Iterator[ColumnarBatch] with BasicWindowCalc with Logging {
 
   override def isRunningBatched: Boolean = false  // Not "Running Window" optimized.
