@@ -335,7 +335,7 @@ object CudfRowTransitions {
 case class GpuColumnarToRowExec(
     child: SparkPlan,
     exportColumnarRdd: Boolean = false)
-    extends ShimUnaryExecNode with ColumnarToRowTransition with GpuExec {
+    extends ShimUnaryExecNode with ColumnarToRowTransition with NonColumnarOutputExec {
   import GpuMetric._
   // We need to do this so the assertions don't fail
   override def supportsColumnar = false
@@ -346,20 +346,17 @@ case class GpuColumnarToRowExec(
 
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
 
-  // Override the original metrics to remove NUM_OUTPUT_BATCHES, which makes no sense.
-  override lazy val allMetrics: Map[String, GpuMetric] = Map(
-    NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME),
     STREAM_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_STREAM_TIME),
     NUM_INPUT_BATCHES -> createMetric(DEBUG_LEVEL, DESCRIPTION_NUM_INPUT_BATCHES))
 
   override def doExecute(): RDD[InternalRow] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val numInputBatches = gpuLongMetric(NUM_INPUT_BATCHES)
     val opTime = gpuLongMetric(OP_TIME)
     val streamTime = gpuLongMetric(STREAM_TIME)
 
-    val f = GpuColumnarToRowExec.makeIteratorFunc(child.output, numOutputRows, numInputBatches,
+    val f = GpuColumnarToRowExec.makeIteratorFunc(child.output, NoopMetric, numInputBatches,
       opTime, streamTime)
 
     val cdata = child.executeColumnar()

@@ -28,9 +28,9 @@ trait GpuBatchScanExecMetrics extends GpuExec {
 
   override def supportsColumnar = true
 
-  override val outputRowsLevel: MetricsLevel = ESSENTIAL_LEVEL
-  override val outputBatchesLevel: MetricsLevel = MODERATE_LEVEL
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  override val outputRowsLevel: Option[MetricsLevel] = Some(ESSENTIAL_LEVEL)
+  override val outputBatchesLevel: Option[MetricsLevel] = Some(MODERATE_LEVEL)
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     GPU_DECODE_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_GPU_DECODE_TIME),
     BUFFER_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_BUFFER_TIME),
     FILTER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_FILTER_TIME),

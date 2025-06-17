@@ -72,7 +72,7 @@ abstract class GpuBatchScanExecBase(
   @transient lazy val batch: Batch = scan.toBatch
 
   override lazy val inputRDD: RDD[InternalRow] = {
-    scan.metrics = allMetrics
+    scan.metrics = opMetrics
     if (filteredPartitions.isEmpty && outputPartitioning == SinglePartition) {
       // return an empty RDD with 1 partition if dynamic filtering removed the only split
       sparkContext.parallelize(Array.empty[InternalRow], 1)

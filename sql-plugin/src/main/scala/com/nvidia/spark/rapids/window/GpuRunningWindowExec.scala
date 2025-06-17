@@ -45,8 +45,6 @@ class GpuRunningWindowIterator(
     override val boundPartitionSpec: Seq[GpuExpression],
     override val boundOrderSpec: Seq[SortOrder],
     val outputTypes: Array[DataType],
-    numOutputBatches: GpuMetric,
-    numOutputRows: GpuMetric,
     opTime: GpuMetric) extends GpuColumnarBatchIterator(true) with BasicWindowCalc {
   import GpuBatchedWindowIteratorUtils._
 
@@ -203,10 +201,7 @@ class GpuRunningWindowIterator(
       // maybeSplitIter is not empty here
     }
     withResource(new NvtxWithMetrics("RunningWindow", NvtxColor.CYAN, opTime)) { _ =>
-      val ret = maybeSplitIter.next()
-      numOutputBatches += 1
-      numOutputRows += ret.numRows()
-      ret
+      maybeSplitIter.next()
     }
   }
 }
@@ -250,8 +245,6 @@ case class GpuRunningWindowExec(
   }
 
   override protected def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputBatches = gpuLongMetric(GpuMetric.NUM_OUTPUT_BATCHES)
-    val numOutputRows = gpuLongMetric(GpuMetric.NUM_OUTPUT_ROWS)
     val opTime = gpuLongMetric(GpuMetric.OP_TIME)
 
     val boundWindowOps = GpuBindReferences.bindGpuReferences(windowOps, child.output)
@@ -260,7 +253,7 @@ case class GpuRunningWindowExec(
 
     child.executeColumnar().mapPartitions { iter =>
       new GpuRunningWindowIterator(iter, boundWindowOps, boundPartitionSpec, boundOrderSpec,
-        output.map(_.dataType).toArray, numOutputBatches, numOutputRows, opTime)
+        output.map(_.dataType).toArray, opTime)
     }
   }
 }

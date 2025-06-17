@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -210,8 +210,6 @@ class GpuBatchedBoundedWindowIterator(
         }
       }
     }
-    numOutputBatches += 1
-    numOutputRows += outputBatch.numRows()
     outputBatch
   }
 }
@@ -239,8 +237,6 @@ class GpuBatchedBoundedWindowExec(
   override def outputBatching: CoalesceGoal = null
 
   override protected def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputBatches = gpuLongMetric(GpuMetric.NUM_OUTPUT_BATCHES)
-    val numOutputRows = gpuLongMetric(GpuMetric.NUM_OUTPUT_ROWS)
     val opTime = gpuLongMetric(GpuMetric.OP_TIME)
 
     val boundWindowOps = GpuBindReferences.bindGpuReferences(windowOps, child.output)
@@ -250,7 +246,7 @@ class GpuBatchedBoundedWindowExec(
     child.executeColumnar().mapPartitions { iter =>
       new GpuBatchedBoundedWindowIterator(iter, boundWindowOps, boundPartitionSpec,
         boundOrderSpec, output.map(_.dataType).toArray, minPreceding, maxFollowing,
-        numOutputBatches, numOutputRows, opTime)
+        opTime)
     }
   }
 }

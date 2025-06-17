@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import java.io.{IOException, ObjectInputStream, ObjectOutputStream}
 import scala.collection.mutable
 
 import ai.rapids.cudf.{JCudfSerialization, NvtxColor, NvtxRange}
-import com.nvidia.spark.rapids.{GpuBindReferences, GpuBuildLeft, GpuColumnVector, GpuExec, GpuExpression, GpuMetric, GpuSemaphore, LazySpillableColumnarBatch, MetricsLevel}
+import com.nvidia.spark.rapids.{GpuBindReferences, GpuBuildLeft, GpuColumnVector, GpuExec, GpuExpression, GpuMetric, GpuSemaphore, LazySpillableColumnarBatch, MetricsLevel, NoopMetric}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.ScalableTaskCompletion.onTaskCompletion
@@ -122,8 +122,6 @@ class GpuCartesianRDD(
     targetSize: Long,
     opTime: GpuMetric,
     joinTime: GpuMetric,
-    numOutputRows: GpuMetric,
-    numOutputBatches: GpuMetric,
     var rdd1: RDD[GpuSerializableBatch],
     var rdd2: RDD[GpuSerializableBatch])
     extends RDD[ColumnarBatch](sc, Nil) with Serializable {
@@ -189,8 +187,6 @@ class GpuCartesianRDD(
       GpuBroadcastNestedLoopJoinExecBase.nestedLoopJoin(
         Cross, GpuBuildLeft, numFirstTableColumns, batch, streamIterator, streamAttributes,
         targetSize, boundCondition,
-        numOutputRows = numOutputRows,
-        numOutputBatches = numOutputBatches,
         opTime = opTime,
         joinTime = joinTime)
     }
@@ -230,9 +226,9 @@ case class GpuCartesianProductExec(
      """.stripMargin
   }
 
-  protected override val outputRowsLevel: MetricsLevel = ESSENTIAL_LEVEL
-  protected override val outputBatchesLevel: MetricsLevel = MODERATE_LEVEL
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  protected override val outputRowsLevel: Option[MetricsLevel] = Some(ESSENTIAL_LEVEL)
+  protected override val outputBatchesLevel: Option[MetricsLevel] = Some(MODERATE_LEVEL)
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME),
     JOIN_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_JOIN_TIME))
 
@@ -240,8 +236,6 @@ case class GpuCartesianProductExec(
     throw new IllegalStateException("This should only be called from columnar")
 
   protected override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
     val joinTime = gpuLongMetric(JOIN_TIME)
     val opTime = gpuLongMetric(OP_TIME)
 
@@ -265,9 +259,7 @@ case class GpuCartesianProductExec(
       //  just for this use case is not worth it without an explicit use case.
       GpuBroadcastNestedLoopJoinExecBase.divideIntoBatches(
         l.cartesian(r).map(p => p._1 * p._2),
-        targetSizeBytes,
-        numOutputRows,
-        numOutputBatches)
+        targetSizeBytes)
     } else {
       val numFirstTableColumns = left.output.size
 
@@ -278,8 +270,6 @@ case class GpuCartesianProductExec(
         targetSizeBytes,
         opTime,
         joinTime,
-        numOutputRows,
-        numOutputBatches,
         left.executeColumnar().map(cb => new GpuSerializableBatch(cb)),
         right.executeColumnar().map(cb => new GpuSerializableBatch(cb)))
     }
