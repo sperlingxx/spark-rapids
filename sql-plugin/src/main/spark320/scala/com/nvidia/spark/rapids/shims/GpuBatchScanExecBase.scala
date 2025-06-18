@@ -89,10 +89,6 @@ abstract class GpuBatchScanExecBase(
   }
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = longMetric("numOutputRows")
-    inputRDD.asInstanceOf[RDD[ColumnarBatch]].map { b =>
-      numOutputRows += b.numRows()
-      b
-    }
+    inputRDD.asInstanceOf[RDD[ColumnarBatch]]
   }
 }

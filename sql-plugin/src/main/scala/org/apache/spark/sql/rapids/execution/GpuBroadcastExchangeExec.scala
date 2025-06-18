@@ -356,10 +356,10 @@ abstract class GpuBroadcastExchangeExecBase(
     child: SparkPlan) extends ShimBroadcastExchangeLike with ShimUnaryExecNode
   with NonColumnarOutputExec {
 
-  override val outputRowsLevel: Option[MetricsLevel] = Some(ESSENTIAL_LEVEL)
-  override val outputBatchesLevel: Option[MetricsLevel] = Some(MODERATE_LEVEL)
   override lazy val opMetrics: Map[String, GpuMetric] = Map(
     // override base metrics
+    GpuMetric.NUM_OUTPUT_BATCHES ->
+      createSizeMetric(MODERATE_LEVEL, GpuMetric.DESCRIPTION_NUM_OUTPUT_BATCHES),
     GpuMetric.NUM_OUTPUT_ROWS ->
       createSizeMetric(ESSENTIAL_LEVEL, GpuMetric.DESCRIPTION_NUM_OUTPUT_ROWS),
     GpuMetric.OUTPUT_DATA_SIZE ->

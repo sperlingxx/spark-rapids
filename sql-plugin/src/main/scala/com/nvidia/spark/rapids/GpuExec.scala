@@ -208,8 +208,9 @@ trait GpuExec extends SparkPlan {
 
   final override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     this.dumpLoreMetaInfo()
+    val localBaseMetrics = baseMetrics
     val rdd = internalDoExecuteColumnar().mapPartitions { iter =>
-      GpuMetricsIterator(iter, baseMetrics)
+      GpuMetricsIterator(iter, localBaseMetrics)
     }
     val orig = this.dumpLoreRDD(rdd)
     val metrics = getTaskMetrics
