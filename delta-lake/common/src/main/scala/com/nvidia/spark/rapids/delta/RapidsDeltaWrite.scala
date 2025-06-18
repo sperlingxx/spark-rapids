@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids.delta
 
-import com.nvidia.spark.rapids.{BaseExprMeta, DataFromReplacementRule, DataWritingCommandMeta, GpuExec, GpuMetric, GpuOverrides, PartMeta, RapidsConf, RapidsMeta, ScanMeta, SparkPlanMeta}
+import com.nvidia.spark.rapids.{BaseExprMeta, DataFromReplacementRule, DataWritingCommandMeta, GpuExec, GpuMetric, GpuOverrides, NonColumnarOutputExec, PartMeta, RapidsConf, RapidsMeta, ScanMeta, SparkPlanMeta}
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
