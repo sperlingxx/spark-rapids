@@ -359,8 +359,6 @@ class GpuGenerateSuite
             generator = failingGenerate,
             generatorOffset,
             outer,
-            NoopMetric,
-            NoopMetric,
             NoopMetric)
 
           failingGenerate.doForceSplitAndRetry(numOOMs)

@@ -353,12 +353,18 @@ class GpuBroadcastMeta(
 
 abstract class GpuBroadcastExchangeExecBase(
     mode: BroadcastMode,
-    child: SparkPlan) extends ShimBroadcastExchangeLike with ShimUnaryExecNode with GpuExec {
+    child: SparkPlan) extends ShimBroadcastExchangeLike with ShimUnaryExecNode
+  with NonColumnarOutputExec {
 
   override val outputRowsLevel: Option[MetricsLevel] = Some(ESSENTIAL_LEVEL)
   override val outputBatchesLevel: Option[MetricsLevel] = Some(MODERATE_LEVEL)
-  override lazy val opMetrics = Map(
-    "dataSize" -> createSizeMetric(ESSENTIAL_LEVEL, "data size"),
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
+    // override base metrics
+    GpuMetric.NUM_OUTPUT_ROWS ->
+      createSizeMetric(ESSENTIAL_LEVEL, GpuMetric.DESCRIPTION_NUM_OUTPUT_ROWS),
+    GpuMetric.OUTPUT_DATA_SIZE ->
+      createSizeMetric(ESSENTIAL_LEVEL, GpuMetric.DESCRIPTION_OUTPUT_DATA_SIZE),
+    // additional metrics
     COLLECT_TIME -> createNanoTimingMetric(ESSENTIAL_LEVEL, DESCRIPTION_COLLECT_TIME),
     BUILD_TIME -> createNanoTimingMetric(ESSENTIAL_LEVEL, DESCRIPTION_BUILD_TIME),
     "broadcastTime" -> createNanoTimingMetric(ESSENTIAL_LEVEL, "time to broadcast"))
@@ -380,7 +386,7 @@ abstract class GpuBroadcastExchangeExecBase(
   lazy val relationFuture: Future[Broadcast[Any]] = {
     // relationFuture is used in "doExecute". Therefore we can get the execution id correctly here.
     val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
-    val dataSize = gpuLongMetric("dataSize")
+    val dataSize = gpuLongMetric(GpuMetric.OUTPUT_DATA_SIZE)
     val collectTime = gpuLongMetric(COLLECT_TIME)
     val buildTime = gpuLongMetric(BUILD_TIME)
     val broadcastTime = gpuLongMetric("broadcastTime")
@@ -517,7 +523,7 @@ abstract class GpuBroadcastExchangeExecBase(
 
   override def runtimeStatistics: Statistics = {
     Statistics(
-      sizeInBytes = metrics("dataSize").value,
+      sizeInBytes = metrics(GpuMetric.OUTPUT_DATA_SIZE).value,
       rowCount = Some(metrics(GpuMetric.NUM_OUTPUT_ROWS).value))
   }
 
