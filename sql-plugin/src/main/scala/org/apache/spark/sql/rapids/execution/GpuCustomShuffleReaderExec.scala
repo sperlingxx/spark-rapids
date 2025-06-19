@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  */
 package org.apache.spark.sql.rapids.execution
 
-import com.nvidia.spark.rapids.{CoalesceGoal, GpuExec, GpuMetric}
+import com.nvidia.spark.rapids.{CoalesceGoal, GpuExec, GpuMetric, MetricsLevel}
 import com.nvidia.spark.rapids.shims.ShimUnaryExecNode
 
 import org.apache.spark.rdd.RDD
@@ -40,13 +40,13 @@ case class GpuCustomShuffleReaderExec(
   import GpuMetric._
 
   /**
-   * We intentionally override metrics in this case rather than overriding additionalMetrics so
-   * that NUM_OUTPUT_ROWS and NUM_OUTPUT_BATCHES are removed, since this operator does not
-   * report any data for those metrics.
-   *
-   * The Spark version of this operator does not output any metrics.
+   * Disable all base metrics, since the CPU counterpart does not output any metrics
    */
-  override lazy val allMetrics: Map[String, GpuMetric] = Map(
+  override protected val outputRowsLevel: Option[MetricsLevel] = None
+  override protected val outputBatchesLevel: Option[MetricsLevel] = None
+  override protected val outputDataSizeLevel: Option[MetricsLevel] = None
+
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     PARTITION_SIZE -> createSizeMetric(ESSENTIAL_LEVEL, DESCRIPTION_PARTITION_SIZE),
     NUM_PARTITIONS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_PARTITIONS)
   )

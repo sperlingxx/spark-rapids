@@ -204,7 +204,7 @@ case class GpuBroadcastNestedLoopJoinExec(
       buildTime: GpuMetric,
       buildDataSize: GpuMetric): ColumnarBatch = {
     val targetSize = RapidsConf.GPU_BATCH_SIZE_BYTES.get(conf)
-    val metricsMap = allMetrics
+    val metricsMap = opMetrics
     withResource(new NvtxWithMetrics("build join table", NvtxColor.GREEN, buildTime)) { _ =>
       val builtBatch = GpuExecutorBroadcastHelper.getExecutorBroadcastBatch(rdd, getBroadcastPlan
         (buildPlan).schema, getBroadcastPlan(buildPlan).output, metricsMap, targetSize)

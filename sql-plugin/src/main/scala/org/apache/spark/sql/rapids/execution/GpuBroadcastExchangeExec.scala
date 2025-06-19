@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -353,12 +353,18 @@ class GpuBroadcastMeta(
 
 abstract class GpuBroadcastExchangeExecBase(
     mode: BroadcastMode,
-    child: SparkPlan) extends ShimBroadcastExchangeLike with ShimUnaryExecNode with GpuExec {
+    child: SparkPlan) extends ShimBroadcastExchangeLike with ShimUnaryExecNode
+  with GpuExec {
 
-  override val outputRowsLevel: MetricsLevel = ESSENTIAL_LEVEL
-  override val outputBatchesLevel: MetricsLevel = MODERATE_LEVEL
-  override lazy val additionalMetrics = Map(
-    "dataSize" -> createSizeMetric(ESSENTIAL_LEVEL, "data size"),
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
+    // override base metrics
+    GpuMetric.NUM_OUTPUT_BATCHES ->
+      createSizeMetric(MODERATE_LEVEL, GpuMetric.DESCRIPTION_NUM_OUTPUT_BATCHES),
+    GpuMetric.NUM_OUTPUT_ROWS ->
+      createSizeMetric(ESSENTIAL_LEVEL, GpuMetric.DESCRIPTION_NUM_OUTPUT_ROWS),
+    GpuMetric.OUTPUT_DATA_SIZE ->
+      createSizeMetric(ESSENTIAL_LEVEL, GpuMetric.DESCRIPTION_OUTPUT_DATA_SIZE),
+    // additional metrics
     COLLECT_TIME -> createNanoTimingMetric(ESSENTIAL_LEVEL, DESCRIPTION_COLLECT_TIME),
     BUILD_TIME -> createNanoTimingMetric(ESSENTIAL_LEVEL, DESCRIPTION_BUILD_TIME),
     "broadcastTime" -> createNanoTimingMetric(ESSENTIAL_LEVEL, "time to broadcast"))
@@ -380,9 +386,7 @@ abstract class GpuBroadcastExchangeExecBase(
   lazy val relationFuture: Future[Broadcast[Any]] = {
     // relationFuture is used in "doExecute". Therefore we can get the execution id correctly here.
     val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val dataSize = gpuLongMetric("dataSize")
+    val dataSize = gpuLongMetric(GpuMetric.OUTPUT_DATA_SIZE)
     val collectTime = gpuLongMetric(COLLECT_TIME)
     val buildTime = gpuLongMetric(BUILD_TIME)
     val broadcastTime = gpuLongMetric("broadcastTime")
@@ -414,7 +418,7 @@ abstract class GpuBroadcastExchangeExecBase(
             }
             emptyRelation.getOrElse {
               GpuBroadcastExchangeExecBase.makeBroadcastBatch(
-                collected, output, numOutputBatches, numOutputRows, dataSize)
+                collected, output, dataSize)
             }
           }
         }
@@ -519,7 +523,7 @@ abstract class GpuBroadcastExchangeExecBase(
 
   override def runtimeStatistics: Statistics = {
     Statistics(
-      sizeInBytes = metrics("dataSize").value,
+      sizeInBytes = metrics(GpuMetric.OUTPUT_DATA_SIZE).value,
       rowCount = Some(metrics(GpuMetric.NUM_OUTPUT_ROWS).value))
   }
 
@@ -564,8 +568,6 @@ object GpuBroadcastExchangeExecBase {
   def makeBroadcastBatch(
       buffers: Array[SerializeBatchDeserializeHostBuffer],
       output: Seq[Attribute],
-      numOutputBatches: GpuMetric,
-      numOutputRows: GpuMetric,
       dataSize: GpuMetric): SerializeConcatHostBuffersDeserializeBatch = {
     val rowsOnly = buffers.isEmpty || buffers.head.header.getNumColumns == 0
     var numRows = 0
@@ -594,8 +596,6 @@ object GpuBroadcastExchangeExecBase {
       dataLen = hostConcatResult.getTableHeader.getDataLen
       hostConcatResult
     }
-    numOutputBatches += 1
-    numOutputRows += numRows
     dataSize += dataLen
 
     // create the batch we will broadcast out

@@ -109,7 +109,7 @@ object GpuRunnableCommand {
 
 case class GpuRunnableCommandExec(cmd: GpuRunnableCommand, child: SparkPlan)
     extends ShimUnaryExecNode with GpuExec {
-  override lazy val allMetrics: Map[String, GpuMetric] = GpuMetric.wrap(cmd.metrics)
+  override lazy val opMetrics: Map[String, GpuMetric] = GpuMetric.wrap(cmd.metrics)
 
   private lazy val sideEffectResult: Seq[ColumnarBatch] =
     cmd.runColumnar(sparkSession, child)

@@ -125,19 +125,38 @@ trait GpuExec extends SparkPlan {
 
   override def supportsColumnar = true
 
-  protected val outputRowsLevel: MetricsLevel = DEBUG_LEVEL
-  protected val outputBatchesLevel: MetricsLevel = DEBUG_LEVEL
+  private lazy val allMetrics: Map[String, GpuMetric] = baseMetrics ++ opMetrics
 
-  lazy val allMetrics: Map[String, GpuMetric] = Map(
-    NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
-    NUM_OUTPUT_BATCHES -> createMetric(outputBatchesLevel, DESCRIPTION_NUM_OUTPUT_BATCHES)) ++
-      additionalMetrics
+  // Base metrics are protected from child classes, to avoid duplicated updates which may be done
+  // by both base class and child class mistakenly. In the other hand, child class can also
+  // discard some of the base metrics via setting the corresponding MetricsLevel to None.
+  private lazy val baseMetrics: Map[String, GpuMetric] = {
+    val b = Map.newBuilder[String, GpuMetric]
+    outputRowsLevel.foreach { level =>
+      b += NUM_OUTPUT_ROWS -> createMetric(level, DESCRIPTION_NUM_OUTPUT_ROWS)
+    }
+    outputBatchesLevel.foreach { level =>
+      b += NUM_OUTPUT_BATCHES -> createMetric(level, DESCRIPTION_NUM_OUTPUT_BATCHES)
+    }
+    outputDataSizeLevel.foreach { level =>
+      b += OUTPUT_DATA_SIZE -> createSizeMetric(level, DESCRIPTION_OUTPUT_DATA_SIZE)
+    }
+    b.result()
+  }
 
-  def gpuLongMetric(name: String): GpuMetric = allMetrics(name)
+  protected val outputRowsLevel: Option[MetricsLevel] = None
+  protected val outputBatchesLevel: Option[MetricsLevel] = None
+  protected val outputDataSizeLevel: Option[MetricsLevel] = None
+
+  final def gpuLongMetric(name: String): GpuMetric = {
+    require(!baseMetrics.contains(name),
+      s"The update of Metric $name can only be done in GpuExec")
+    allMetrics(name)
+  }
 
   final override lazy val metrics: Map[String, SQLMetric] = unwrap(allMetrics)
 
-  lazy val additionalMetrics: Map[String, GpuMetric] = Map.empty
+  lazy val opMetrics: Map[String, GpuMetric] = Map.empty
 
   /**
    * Returns true if there is something in the exec that cannot work when batches between
@@ -189,7 +208,11 @@ trait GpuExec extends SparkPlan {
 
   final override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     this.dumpLoreMetaInfo()
-    val orig = this.dumpLoreRDD(internalDoExecuteColumnar())
+    val localBaseMetrics = baseMetrics
+    val rdd = internalDoExecuteColumnar().mapPartitions { iter =>
+      GpuMetricsIterator(iter, localBaseMetrics)
+    }
+    val orig = this.dumpLoreRDD(rdd)
     val metrics = getTaskMetrics
     metrics.map { gpuMetrics =>
       // This is ugly, but it reduces the need to change all exec nodes, so we are doing it here
@@ -225,4 +248,46 @@ trait GpuExec extends SparkPlan {
   }
 
   protected def internalDoExecuteColumnar(): RDD[ColumnarBatch]
+}
+
+// An iterator wrapper that tracks the most common metrics for the GPU operation.
+// NOTE: Metrics tracking can be disabled by changing the metrics level of specific metric.
+private class GpuMetricsIterator(
+    iter: Iterator[ColumnarBatch],
+    outputRows: GpuMetric,
+    outputBatches: GpuMetric,
+    outputDataSize: GpuMetric) extends Iterator[ColumnarBatch] {
+
+  override def hasNext: Boolean = iter.hasNext
+
+  override def next(): ColumnarBatch = {
+    val outputBatch = iter.next()
+    outputRows += outputBatch.numRows()
+    outputBatches += 1
+    // compute total device memory might be expensive, so only do it if needed
+    outputDataSize match {
+      case NoopMetric => // do nothing
+      case m => m += GpuColumnVector.getTotalDeviceMemoryUsed(outputBatch)
+    }
+    outputBatch
+  }
+}
+
+object GpuMetricsIterator {
+  def apply(
+      iter: Iterator[ColumnarBatch],
+      baseMetrics: Map[String, GpuMetric]): Iterator[ColumnarBatch] = {
+    val outputRows = baseMetrics.getOrElse(GpuMetric.NUM_OUTPUT_ROWS, NoopMetric)
+    val outputBatches = baseMetrics.getOrElse(GpuMetric.NUM_OUTPUT_BATCHES, NoopMetric)
+    val outputDataSize = baseMetrics.getOrElse(GpuMetric.OUTPUT_DATA_SIZE, NoopMetric)
+    // Minimize the overhead: if no metrics are enabled, just return the original iterators.
+    if (Seq(outputRows, outputBatches, outputDataSize).forall {
+      case NoopMetric => true
+      case _ => false
+    }) {
+      iter
+    } else {
+      new GpuMetricsIterator(iter, outputRows, outputBatches, outputDataSize)
+    }
+  }
 }
