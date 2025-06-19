@@ -475,7 +475,7 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
       assert(coalesce.goal.asInstanceOf[CoalesceSizeGoal].targetSizeBytes == 1)
 
       // assert the metrics start out at zero
-      assert(coalesce.additionalMetrics("numInputBatches").value == 0)
+      assert(coalesce.opMetrics("numInputBatches").value == 0)
       assert(coalesce.longMetric(GpuMetric.NUM_OUTPUT_BATCHES).value == 0)
 
       // execute the plan

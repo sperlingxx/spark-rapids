@@ -219,7 +219,7 @@ trait GpuProjectExecLike extends ShimUnaryExecNode with GpuExec {
 
   def projectList: Seq[Expression]
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME))
 
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
@@ -667,7 +667,7 @@ case class GpuProjectExec(
     super.outputBatching
   }
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     KEY_NUM_PRE_SPLIT -> createMetric(DEBUG_LEVEL, "num pre-splits"),
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME))
 
@@ -1124,7 +1124,7 @@ case class GpuFilterExec(
   override def otherCopyArgs: Seq[AnyRef] =
     Seq[AnyRef](coalesceAfter.asInstanceOf[java.lang.Boolean])
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME))
 
   // Split out all the IsNotNulls from condition.
@@ -1197,7 +1197,7 @@ case class GpuSampleExec(
     withReplacement: Boolean,
     seed: Long, child: SparkPlan) extends ShimUnaryExecNode with GpuExec {
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME))
 
   override def output: Seq[Attribute] = {
@@ -1273,7 +1273,7 @@ case class GpuFastSampleExec(
     seed: Long,
     child: SparkPlan) extends ShimUnaryExecNode with GpuExec {
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME))
 
   override def output: Seq[Attribute] = {
@@ -1471,7 +1471,7 @@ case class GpuRangeExec(
   override protected val outputRowsLevel: MetricsLevel = ESSENTIAL_LEVEL
   override protected val outputBatchesLevel: MetricsLevel = MODERATE_LEVEL
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME)
   )
 
@@ -1577,7 +1577,11 @@ case class GpuCoalesceExec(numPartitions: Int, child: SparkPlan)
     extends ShimUnaryExecNode with GpuExec {
 
   // This operator does not record any metrics
-  override lazy val allMetrics: Map[String, GpuMetric] = Map.empty
+  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
+
+  override lazy val opMetrics: Map[String, GpuMetric] = Map.empty
 
   override def output: Seq[Attribute] = child.output
 

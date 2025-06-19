@@ -347,14 +347,17 @@ case class GpuColumnarToRowExec(
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
 
   // Override the original metrics to remove NUM_OUTPUT_BATCHES, which makes no sense.
-  override lazy val allMetrics: Map[String, GpuMetric] = Map(
-    NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
+  override protected val outputRowsLevel: MetricsLevel = MODERATE_LEVEL
+  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
+
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME),
     STREAM_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_STREAM_TIME),
     NUM_INPUT_BATCHES -> createMetric(DEBUG_LEVEL, DESCRIPTION_NUM_INPUT_BATCHES))
 
   override def doExecute(): RDD[InternalRow] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val numOutputRows = NoopMetric
     val numInputBatches = gpuLongMetric(NUM_INPUT_BATCHES)
     val opTime = gpuLongMetric(OP_TIME)
     val streamTime = gpuLongMetric(STREAM_TIME)

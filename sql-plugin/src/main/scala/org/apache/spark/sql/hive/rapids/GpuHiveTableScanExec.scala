@@ -169,7 +169,7 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
   override protected def doExecute(): RDD[InternalRow] =
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     "numFiles" -> createMetric(ESSENTIAL_LEVEL, "number of files read"),
     "metadataTime" -> createTimingMetric(ESSENTIAL_LEVEL, "metadata time"),
     "filesSize" -> createSizeMetric(ESSENTIAL_LEVEL, "size of files read"),

@@ -15,7 +15,7 @@
  */
 package org.apache.spark.sql.rapids.execution
 
-import com.nvidia.spark.rapids.{CoalesceGoal, GpuExec, GpuMetric}
+import com.nvidia.spark.rapids.{CoalesceGoal, GpuExec, GpuMetric, MetricsLevel}
 import com.nvidia.spark.rapids.shims.ShimUnaryExecNode
 
 import org.apache.spark.rdd.RDD
@@ -46,7 +46,10 @@ case class GpuCustomShuffleReaderExec(
    *
    * The Spark version of this operator does not output any metrics.
    */
-  override lazy val allMetrics: Map[String, GpuMetric] = Map(
+  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     PARTITION_SIZE -> createSizeMetric(ESSENTIAL_LEVEL, DESCRIPTION_PARTITION_SIZE),
     NUM_PARTITIONS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_PARTITIONS)
   )

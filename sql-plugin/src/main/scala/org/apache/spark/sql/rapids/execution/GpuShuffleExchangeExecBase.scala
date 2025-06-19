@@ -201,20 +201,20 @@ abstract class GpuShuffleExchangeExecBase(
     SQLShuffleWriteMetricsReporter.createShuffleWriteMetrics(sparkContext)
   lazy val readMetrics =
     SQLShuffleReadMetricsReporter.createShuffleReadMetrics(sparkContext)
-  override lazy val additionalMetrics : Map[String, GpuMetric] = {
-    createAdditionalExchangeMetrics(this) ++
-      GpuMetric.wrap(readMetrics) ++
-      GpuMetric.wrap(writeMetrics)
-  }
 
   // Spark doesn't report totalTime for this operator so we override metrics
-  override lazy val allMetrics: Map[String, GpuMetric] = Map(
+  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
+
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     PARTITION_SIZE -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_PARTITION_SIZE),
     NUM_PARTITIONS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_PARTITIONS),
     NUM_OUTPUT_ROWS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_OUTPUT_ROWS),
     NUM_OUTPUT_BATCHES -> createMetric(MODERATE_LEVEL, DESCRIPTION_NUM_OUTPUT_BATCHES),
     COPY_TO_HOST_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_COPY_TO_HOST_TIME)
-  ) ++ additionalMetrics
+  ) ++ createAdditionalExchangeMetrics(this) ++
+    GpuMetric.wrap(readMetrics) ++ GpuMetric.wrap(writeMetrics)
 
   override def nodeName: String = "GpuColumnarExchange"
 
@@ -248,7 +248,7 @@ abstract class GpuShuffleExchangeExecBase(
       useMultiThreadedShuffle,
       allMetrics,
       writeMetrics,
-      additionalMetrics)
+      opMetrics)
   }
 
   /**

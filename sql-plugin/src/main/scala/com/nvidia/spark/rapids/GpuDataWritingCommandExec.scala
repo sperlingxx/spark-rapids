@@ -16,17 +16,17 @@
 
 package com.nvidia.spark.rapids
 
-import java.net.URI
+import com.nvidia.spark.rapids.GpuMetric.NOOP_LEVEL
 
+import java.net.URI
 import com.nvidia.spark.rapids.shims.{ShimUnaryCommand, ShimUnaryExecNode}
 import org.apache.hadoop.conf.Configuration
-
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Row, SaveMode}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.execution.{SparkPlan, SQLExecution}
+import org.apache.spark.sql.execution.{SQLExecution, SparkPlan}
 import org.apache.spark.sql.execution.command.DataWritingCommand
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
@@ -111,7 +111,10 @@ object GpuDataWritingCommand {
 
 case class GpuDataWritingCommandExec(cmd: GpuDataWritingCommand, child: SparkPlan)
     extends ShimUnaryExecNode with GpuExec {
-  override lazy val allMetrics: Map[String, GpuMetric] = GpuMetric.wrap(cmd.metrics)
+  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
+  override lazy val opMetrics: Map[String, GpuMetric] = GpuMetric.wrap(cmd.metrics)
 
   private lazy val sideEffectResult: Seq[ColumnarBatch] =
     cmd.runColumnar(sparkSession, child)

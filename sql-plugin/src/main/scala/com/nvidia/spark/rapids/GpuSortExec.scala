@@ -118,7 +118,7 @@ case class GpuSortExec(
   override def doExecute(): RDD[InternalRow] =
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] =
+  override lazy val opMetrics: Map[String, GpuMetric] =
     Map(
       OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME),
       SORT_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_SORT_TIME))

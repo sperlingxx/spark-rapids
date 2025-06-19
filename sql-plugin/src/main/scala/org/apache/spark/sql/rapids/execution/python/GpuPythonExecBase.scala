@@ -34,9 +34,7 @@ trait GpuPythonExecBase extends GpuExec {
   override final protected def doExecute(): RDD[InternalRow] =
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
-  override lazy val allMetrics: Map[String, GpuMetric] = Map(
-    NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
-    NUM_OUTPUT_BATCHES -> createMetric(outputBatchesLevel, DESCRIPTION_NUM_OUTPUT_BATCHES),
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     NUM_INPUT_ROWS -> createMetric(DEBUG_LEVEL, DESCRIPTION_NUM_INPUT_ROWS),
     NUM_INPUT_BATCHES -> createMetric(DEBUG_LEVEL, DESCRIPTION_NUM_INPUT_BATCHES)
   )
@@ -52,8 +50,8 @@ trait GpuPythonExecBase extends GpuExec {
   protected def commonGpuMetrics(): (GpuMetric, GpuMetric, GpuMetric, GpuMetric) = (
     gpuLongMetric(NUM_INPUT_ROWS),
     gpuLongMetric(NUM_INPUT_BATCHES),
-    gpuLongMetric(NUM_OUTPUT_ROWS),
-    gpuLongMetric(NUM_OUTPUT_BATCHES))
+    NoopMetric,
+    NoopMetric)
 
 }
 

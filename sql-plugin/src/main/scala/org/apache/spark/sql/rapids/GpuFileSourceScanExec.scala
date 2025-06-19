@@ -388,9 +388,7 @@ case class GpuFileSourceScanExec(
     }
   }
 
-  override lazy val allMetrics = Map(
-    NUM_OUTPUT_ROWS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_OUTPUT_ROWS),
-    NUM_OUTPUT_BATCHES -> createMetric(MODERATE_LEVEL, DESCRIPTION_NUM_OUTPUT_BATCHES),
+  override lazy val opMetrics: Map[String, GpuMetric] = Map(
     "numFiles" -> createMetric(ESSENTIAL_LEVEL, "number of files read"),
     "metadataTime" -> createTimingMetric(ESSENTIAL_LEVEL, "metadata time"),
     "filesSize" -> createSizeMetric(ESSENTIAL_LEVEL, "size of files read"),
@@ -440,7 +438,7 @@ case class GpuFileSourceScanExec(
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
   override protected def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val numOutputRows = NoopMetric
     val scanTime = gpuLongMetric(SCAN_TIME)
     inputRDD.asInstanceOf[RDD[ColumnarBatch]].mapPartitionsInternal { batches =>
       new Iterator[ColumnarBatch] {

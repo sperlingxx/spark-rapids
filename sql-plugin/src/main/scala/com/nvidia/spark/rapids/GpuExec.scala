@@ -125,21 +125,21 @@ trait GpuExec extends SparkPlan {
 
   override def supportsColumnar = true
 
-  protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
-  protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
-  protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
+  protected val outputRowsLevel: MetricsLevel = DEBUG_LEVEL
+  protected val outputBatchesLevel: MetricsLevel = DEBUG_LEVEL
+  protected val outputDataSizeLevel: MetricsLevel = DEBUG_LEVEL
 
-  lazy val allMetrics: Map[String, GpuMetric] = Map(
+  final lazy val allMetrics: Map[String, GpuMetric] = Map(
     NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
     NUM_OUTPUT_BATCHES -> createMetric(outputBatchesLevel, DESCRIPTION_NUM_OUTPUT_BATCHES),
     OUTPUT_DATA_SIZE -> createMetric(outputDataSizeLevel, DESCRIPTION_OUTPUT_DATA_SIZE)) ++
-      additionalMetrics
+      opMetrics
 
   def gpuLongMetric(name: String): GpuMetric = allMetrics(name)
 
   final override lazy val metrics: Map[String, SQLMetric] = unwrap(allMetrics)
 
-  lazy val additionalMetrics: Map[String, GpuMetric] = Map.empty
+  lazy val opMetrics: Map[String, GpuMetric] = Map.empty
 
   /**
    * Returns true if there is something in the exec that cannot work when batches between
@@ -191,9 +191,24 @@ trait GpuExec extends SparkPlan {
 
   final override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     this.dumpLoreMetaInfo()
-    val localMetrics = allMetrics
+    val baseMetrics = Map.newBuilder[String, GpuMetric]
+    outputRowsLevel match {
+      case NOOP_LEVEL =>
+      case _ if allMetrics.contains(NUM_OUTPUT_ROWS) =>
+        baseMetrics += allMetrics(NUM_OUTPUT_ROWS)
+    }
+    outputBatchesLevel match {
+      case NOOP_LEVEL =>
+      case _ if allMetrics.contains(NUM_OUTPUT_BATCHES) =>
+        baseMetrics += allMetrics(NUM_OUTPUT_BATCHES)
+    }
+    outputDataSizeLevel match {
+      case NOOP_LEVEL =>
+      case _ if allMetrics.contains(OUTPUT_DATA_SIZE) =>
+        baseMetrics += allMetrics(OUTPUT_DATA_SIZE)
+    }
     val rdd = internalDoExecuteColumnar().mapPartitions { iter =>
-      GpuMetricsIterator(iter, localMetrics)
+      GpuMetricsIterator(iter, baseMetrics.result())
     }
     val orig = this.dumpLoreRDD(rdd)
     val metrics = getTaskMetrics

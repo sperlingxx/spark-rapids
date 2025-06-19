@@ -20,7 +20,7 @@ import java.util.concurrent.TimeUnit.NANOSECONDS
 
 import scala.collection.mutable
 
-import com.nvidia.spark.rapids.{GpuExec, GpuMetric, RapidsConf, TargetSize}
+import com.nvidia.spark.rapids.{GpuExec, GpuMetric, MetricsLevel, RapidsConf, TargetSize}
 import com.nvidia.spark.rapids.hybrid.NativeBackendApis
 
 import org.apache.spark.rdd.RDD
@@ -135,7 +135,11 @@ case class HybridFileSourceScanExec(originPlan: FileSourceScanExec
     }
   }
 
-  override lazy val allMetrics: Map[String, GpuMetric] = {
+  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
+  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
+
+  override lazy val opMetrics: Map[String, GpuMetric] = {
     val mapBuilder = Map.newBuilder[String, GpuMetric]
     mapBuilder += SCAN_TIME -> createNanoTimingMetric(ESSENTIAL_LEVEL, "TotalTime")
     // Add common embedded metrics
