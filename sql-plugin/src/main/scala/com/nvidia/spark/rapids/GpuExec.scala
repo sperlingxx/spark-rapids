@@ -125,11 +125,11 @@ trait GpuExec extends SparkPlan {
 
   override def supportsColumnar = true
 
-  protected val outputRowsLevel: MetricsLevel = DEBUG_LEVEL
-  protected val outputBatchesLevel: MetricsLevel = DEBUG_LEVEL
-  protected val outputDataSizeLevel: MetricsLevel = DEBUG_LEVEL
+  protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
+  protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
+  protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
 
-  private lazy val allMetrics: Map[String, GpuMetric] = Map(
+  final lazy val allMetrics: Map[String, GpuMetric] = Map(
     NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
     NUM_OUTPUT_BATCHES -> createMetric(outputBatchesLevel, DESCRIPTION_NUM_OUTPUT_BATCHES),
     OUTPUT_DATA_SIZE -> createMetric(outputDataSizeLevel, DESCRIPTION_OUTPUT_DATA_SIZE)) ++

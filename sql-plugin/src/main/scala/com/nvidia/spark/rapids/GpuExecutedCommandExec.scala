@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@
 
 package com.nvidia.spark.rapids
 
-import com.nvidia.spark.rapids.GpuMetric.NOOP_LEVEL
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
@@ -37,9 +36,6 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 case class GpuExecutedCommandExec(cmd: RunnableCommand) extends LeafExecNode with GpuExec {
   override def supportsColumnar: Boolean = false
 
-  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
-  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
-  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
   override lazy val opMetrics: Map[String, GpuMetric] = GpuMetric.wrap(cmd.metrics)
 
   /**

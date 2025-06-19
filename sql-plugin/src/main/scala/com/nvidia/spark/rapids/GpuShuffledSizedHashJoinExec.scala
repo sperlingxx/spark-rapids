@@ -413,7 +413,7 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
     val isRightHost = isHostBatchProducer(right)
     val localCondition = condition
     val localGpuBatchSizeBytes = gpuBatchSizeBytes
-    val localMetrics = allMetrics.withDefaultValue(NoopMetric)
+    val localMetrics = opMetrics.withDefaultValue(NoopMetric)
     val localReadOption = readOption
     left.executeColumnar().zipPartitions(right.executeColumnar()) { case (leftIter, rightIter) =>
       val joinInfo = (isLeftHost, isRightHost) match {

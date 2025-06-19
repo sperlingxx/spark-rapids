@@ -672,8 +672,8 @@ case class GpuProjectExec(
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME))
 
   override def internalDoExecuteColumnar() : RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
     val numPreSplit = gpuLongMetric(KEY_NUM_PRE_SPLIT)
     val boundProjectList = GpuBindReferences.bindGpuReferencesTiered(projectList, child.output,
@@ -727,8 +727,8 @@ case class GpuProjectAstExec(
 
   def buildRetryableAstIterator(
       input: Iterator[ColumnarBatch]): GpuColumnarBatchIterator = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
     val boundProjectList = GpuBindReferences.bindGpuReferences(projectList, child.output)
     val outputTypes = output.map(_.dataType).toArray
@@ -1157,8 +1157,8 @@ case class GpuFilterExec(
   override val outputBatchesLevel: MetricsLevel = MODERATE_LEVEL
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
     val rdd = child.executeColumnar()
     val boundCondition = GpuBindReferences.bindGpuReferencesTiered(Seq(condition), child.output,
@@ -1219,8 +1219,8 @@ case class GpuSampleExec(
   override val outputBatchesLevel: MetricsLevel = MODERATE_LEVEL
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
 
     val rdd = child.executeColumnar()
@@ -1296,8 +1296,8 @@ case class GpuFastSampleExec(
   override val outputBatchesLevel: MetricsLevel = MODERATE_LEVEL
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
     val rdd = child.executeColumnar()
 
@@ -1499,8 +1499,8 @@ case class GpuRangeExec(
   override def outputBatching: CoalesceGoal = TargetSize(targetSizeBytes)
 
   protected override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
     val maxRowCountPerBatch = Math.min(targetSizeBytes/8, Int.MaxValue)
 
@@ -1562,8 +1562,8 @@ case class GpuUnionExec(children: Seq[SparkPlan]) extends ShimSparkPlan with Gpu
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
 
     sparkContext.union(children.map(_.executeColumnar())).map { batch =>
       numOutputBatches += 1
@@ -1577,10 +1577,6 @@ case class GpuCoalesceExec(numPartitions: Int, child: SparkPlan)
     extends ShimUnaryExecNode with GpuExec {
 
   // This operator does not record any metrics
-  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
-  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
-  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
-
   override lazy val opMetrics: Map[String, GpuMetric] = Map.empty
 
   override def output: Seq[Attribute] = child.output

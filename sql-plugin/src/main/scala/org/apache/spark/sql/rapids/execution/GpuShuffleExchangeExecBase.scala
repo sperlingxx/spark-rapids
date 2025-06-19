@@ -203,10 +203,6 @@ abstract class GpuShuffleExchangeExecBase(
     SQLShuffleReadMetricsReporter.createShuffleReadMetrics(sparkContext)
 
   // Spark doesn't report totalTime for this operator so we override metrics
-  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
-  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
-  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
-
   override lazy val opMetrics: Map[String, GpuMetric] = Map(
     PARTITION_SIZE -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_PARTITION_SIZE),
     NUM_PARTITIONS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_PARTITIONS),
@@ -227,7 +223,7 @@ abstract class GpuShuffleExchangeExecBase(
   // This value must be lazy because the child's output may not have been resolved
   // yet in all cases.
   private lazy val serializer: Serializer = new GpuColumnarBatchSerializer(
-    allMetrics, sparkTypes, useKudo, kudoBufferCopyMeasurementEnabled)
+    opMetrics, sparkTypes, useKudo, kudoBufferCopyMeasurementEnabled)
 
   @transient lazy val inputBatchRDD: RDD[ColumnarBatch] = child.executeColumnar()
 
@@ -246,7 +242,7 @@ abstract class GpuShuffleExchangeExecBase(
       serializer,
       useGPUShuffle,
       useMultiThreadedShuffle,
-      allMetrics,
+      opMetrics,
       writeMetrics,
       opMetrics)
   }

@@ -23,7 +23,7 @@ import scala.collection.immutable.HashSet
 import scala.collection.mutable
 
 import ai.rapids.cudf.{CaptureGroups, ColumnVector, DType, NvtxColor, RegexProgram, Scalar, Schema, Table}
-import com.nvidia.spark.rapids.{ColumnarPartitionReaderWithPartitionValues, CSVPartitionReaderBase, DateUtils, GpuColumnVector, GpuExec, GpuMetric, HostStringColBufferer, HostStringColBuffererFactory, NvtxWithMetrics, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
+import com.nvidia.spark.rapids.{ColumnarPartitionReaderWithPartitionValues, CSVPartitionReaderBase, DateUtils, GpuColumnVector, GpuExec, GpuMetric, HostStringColBufferer, HostStringColBuffererFactory, NoopMetric, NvtxWithMetrics, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits.AutoCloseableProducingSeq
@@ -170,6 +170,10 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
   override lazy val opMetrics: Map[String, GpuMetric] = Map(
+    // override basic metrics
+    NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
+    NUM_OUTPUT_BATCHES -> createMetric(outputBatchesLevel, DESCRIPTION_NUM_OUTPUT_BATCHES),
+    // additional metrics
     "numFiles" -> createMetric(ESSENTIAL_LEVEL, "number of files read"),
     "metadataTime" -> createTimingMetric(ESSENTIAL_LEVEL, "metadata time"),
     "filesSize" -> createSizeMetric(ESSENTIAL_LEVEL, "size of files read"),
@@ -212,7 +216,7 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
       maxReaderBatchSizeRows = rapidsConf.maxReadBatchSizeRows,
       maxReaderBatchSizeBytes = rapidsConf.maxReadBatchSizeBytes,
       maxGpuColumnSizeBytes = rapidsConf.maxGpuColumnSizeBytes,
-      metrics = allMetrics,
+      metrics = opMetrics,
       params = options
     )
 
@@ -359,7 +363,7 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
   }
 
   override protected def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val numOutputRows = NoopMetric
     val scanTime = gpuLongMetric(SCAN_TIME)
     inputRDD.mapPartitionsInternal { batches =>
       new Iterator[ColumnarBatch] {

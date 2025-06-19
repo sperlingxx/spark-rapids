@@ -20,7 +20,7 @@ import java.util.concurrent.TimeUnit.NANOSECONDS
 
 import scala.collection.mutable
 
-import com.nvidia.spark.rapids.{GpuExec, GpuMetric, MetricsLevel, RapidsConf, TargetSize}
+import com.nvidia.spark.rapids.{GpuExec, GpuMetric, RapidsConf, TargetSize}
 import com.nvidia.spark.rapids.hybrid.NativeBackendApis
 
 import org.apache.spark.rdd.RDD
@@ -91,9 +91,9 @@ case class HybridFileSourceScanExec(originPlan: FileSourceScanExec
     // Narrow down all used metrics on the Executor side, in case transferring unnecessary metrics
     val embeddedMetrics = {
       val mapBuilder = mutable.Map.empty[String, GpuMetric]
-      hybridCommonMetrics.keys.foreach(key => mapBuilder += key -> allMetrics(key))
-      nativeMetrics.keys.foreach(key => mapBuilder += key -> allMetrics(key))
-      preloadMetrics.keys.foreach(key => mapBuilder += key -> allMetrics(key))
+      hybridCommonMetrics.keys.foreach(key => mapBuilder += key -> opMetrics(key))
+      nativeMetrics.keys.foreach(key => mapBuilder += key -> opMetrics(key))
+      preloadMetrics.keys.foreach(key => mapBuilder += key -> opMetrics(key))
       mapBuilder.toMap
     }
 
@@ -134,10 +134,6 @@ case class HybridFileSourceScanExec(originPlan: FileSourceScanExec
       Map.empty
     }
   }
-
-  override protected val outputRowsLevel: MetricsLevel = NOOP_LEVEL
-  override protected val outputBatchesLevel: MetricsLevel = NOOP_LEVEL
-  override protected val outputDataSizeLevel: MetricsLevel = NOOP_LEVEL
 
   override lazy val opMetrics: Map[String, GpuMetric] = {
     val mapBuilder = Map.newBuilder[String, GpuMetric]

@@ -55,13 +55,15 @@ case class GpuShuffleCoalesceExec(child: SparkPlan, targetBatchByteSize: Long)
   import GpuMetric._
 
   override lazy val opMetrics: Map[String, GpuMetric] = Map(
+    // overrides basic metrics
+    NUM_OUTPUT_ROWS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_OUTPUT_ROWS),
+    NUM_OUTPUT_BATCHES -> createMetric(MODERATE_LEVEL, DESCRIPTION_NUM_OUTPUT_BATCHES),
+    // additional metrics
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME),
     NUM_INPUT_ROWS -> createMetric(DEBUG_LEVEL, DESCRIPTION_NUM_INPUT_ROWS),
     NUM_INPUT_BATCHES -> createMetric(DEBUG_LEVEL, DESCRIPTION_NUM_INPUT_BATCHES),
     CONCAT_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_CONCAT_TIME),
   )
-
-  override protected val outputBatchesLevel = MODERATE_LEVEL
 
   override def output: Seq[Attribute] = child.output
 
@@ -72,7 +74,7 @@ case class GpuShuffleCoalesceExec(child: SparkPlan, targetBatchByteSize: Long)
   }
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val metricsMap = allMetrics
+    val metricsMap = opMetrics
     val targetSize = targetBatchByteSize
     val dataTypes = GpuColumnVector.extractTypes(schema)
     val readOption = CoalesceReadOption(conf)

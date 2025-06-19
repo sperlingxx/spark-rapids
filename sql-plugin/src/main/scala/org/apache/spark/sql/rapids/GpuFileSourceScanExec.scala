@@ -342,7 +342,7 @@ case class GpuFileSourceScanExec(
           options = relation.options,
           hadoopConf =
             relation.sparkSession.sessionState.newHadoopConfWithOptions(relation.options),
-          metrics = allMetrics)
+          metrics = opMetrics)
         Some(reader)
       } else {
         None
@@ -389,6 +389,10 @@ case class GpuFileSourceScanExec(
   }
 
   override lazy val opMetrics: Map[String, GpuMetric] = Map(
+    // override basic metrics
+    NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
+    NUM_OUTPUT_BATCHES -> createMetric(outputBatchesLevel, DESCRIPTION_NUM_OUTPUT_BATCHES),
+    // additional metrics
     "numFiles" -> createMetric(ESSENTIAL_LEVEL, "number of files read"),
     "metadataTime" -> createTimingMetric(ESSENTIAL_LEVEL, "metadata time"),
     "filesSize" -> createSizeMetric(ESSENTIAL_LEVEL, "size of files read"),
