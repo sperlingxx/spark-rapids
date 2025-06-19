@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -850,8 +850,8 @@ case class GpuGenerateExec(
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
 
     generator.fixedLenLazyExpressions match {

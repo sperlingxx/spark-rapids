@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -920,8 +920,8 @@ case class GpuCoalesceBatches(child: SparkPlan, goal: CoalesceGoal)
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val numInputRows = gpuLongMetric(NUM_INPUT_ROWS)
     val numInputBatches = gpuLongMetric(NUM_INPUT_BATCHES)
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val concatTime = gpuLongMetric(CONCAT_TIME)
     val opTime = gpuLongMetric(OP_TIME)
 

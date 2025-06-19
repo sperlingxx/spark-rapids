@@ -129,13 +129,13 @@ trait GpuExec extends SparkPlan {
   protected val outputBatchesLevel: MetricsLevel = DEBUG_LEVEL
   protected val outputDataSizeLevel: MetricsLevel = DEBUG_LEVEL
 
-  final lazy val allMetrics: Map[String, GpuMetric] = Map(
+  private lazy val allMetrics: Map[String, GpuMetric] = Map(
     NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
     NUM_OUTPUT_BATCHES -> createMetric(outputBatchesLevel, DESCRIPTION_NUM_OUTPUT_BATCHES),
     OUTPUT_DATA_SIZE -> createMetric(outputDataSizeLevel, DESCRIPTION_OUTPUT_DATA_SIZE)) ++
       opMetrics
 
-  def gpuLongMetric(name: String): GpuMetric = allMetrics(name)
+  def gpuLongMetric(name: String): GpuMetric = opMetrics(name)
 
   final override lazy val metrics: Map[String, SQLMetric] = unwrap(allMetrics)
 
@@ -191,24 +191,25 @@ trait GpuExec extends SparkPlan {
 
   final override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     this.dumpLoreMetaInfo()
-    val baseMetrics = Map.newBuilder[String, GpuMetric]
+    val builder = Map.newBuilder[String, GpuMetric]
     outputRowsLevel match {
       case NOOP_LEVEL =>
       case _ if allMetrics.contains(NUM_OUTPUT_ROWS) =>
-        baseMetrics += allMetrics(NUM_OUTPUT_ROWS)
+        builder += NUM_OUTPUT_ROWS -> allMetrics(NUM_OUTPUT_ROWS)
     }
     outputBatchesLevel match {
       case NOOP_LEVEL =>
       case _ if allMetrics.contains(NUM_OUTPUT_BATCHES) =>
-        baseMetrics += allMetrics(NUM_OUTPUT_BATCHES)
+        builder += NUM_OUTPUT_BATCHES -> allMetrics(NUM_OUTPUT_BATCHES)
     }
     outputDataSizeLevel match {
       case NOOP_LEVEL =>
       case _ if allMetrics.contains(OUTPUT_DATA_SIZE) =>
-        baseMetrics += allMetrics(OUTPUT_DATA_SIZE)
+        builder += OUTPUT_DATA_SIZE -> allMetrics(OUTPUT_DATA_SIZE)
     }
+    val baseMetrics = builder.result()
     val rdd = internalDoExecuteColumnar().mapPartitions { iter =>
-      GpuMetricsIterator(iter, baseMetrics.result())
+      GpuMetricsIterator(iter, baseMetrics)
     }
     val orig = this.dumpLoreRDD(rdd)
     val metrics = getTaskMetrics

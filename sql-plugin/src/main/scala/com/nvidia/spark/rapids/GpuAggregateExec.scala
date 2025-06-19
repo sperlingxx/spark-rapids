@@ -1911,8 +1911,8 @@ case class GpuHashAggregateExec(
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val aggMetrics = GpuHashAggregateMetrics(
-      numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS),
-      numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES),
+      numOutputRows = NoopMetric,
+      numOutputBatches = NoopMetric,
       numTasksRepartitioned = gpuLongMetric(NUM_TASKS_REPARTITIONED),
       numTasksSkippedAgg = gpuLongMetric(NUM_TASKS_SKIPPED_AGG),
       opTime = gpuLongMetric(OP_TIME),

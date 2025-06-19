@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids.delta
 
-import com.nvidia.spark.rapids.{BaseExprMeta, DataFromReplacementRule, DataWritingCommandMeta, GpuExec, GpuMetric, GpuOverrides, PartMeta, RapidsConf, RapidsMeta, ScanMeta, SparkPlanMeta}
+import com.nvidia.spark.rapids._
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -108,7 +108,11 @@ case class GpuRapidsDeltaWriteExec(child: SparkPlan) extends V2CommandExec
   lazy val basicMetrics: Map[String, GpuMetric] = GpuWriteJobStatsTracker.basicMetrics
   lazy val taskMetrics: Map[String, GpuMetric] = GpuWriteJobStatsTracker.taskMetrics
 
-  override lazy val allMetrics: Map[String, GpuMetric] =
+  override val outputRowsLevel: MetricsLevel = GpuMetric.NOOP_LEVEL
+  override val outputBatchesLevel: MetricsLevel = GpuMetric.NOOP_LEVEL
+  override val outputDataSizeLevel: MetricsLevel = GpuMetric.NOOP_LEVEL
+
+  override lazy val opMetrics: Map[String, GpuMetric] =
     basicMetrics ++ taskMetrics
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
