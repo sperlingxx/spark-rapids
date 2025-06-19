@@ -153,8 +153,8 @@ trait GpuBaseLimitExec extends LimitExec with GpuExec with ShimUnaryExecNode {
 
   protected def sliceRDD(rdd: RDD[ColumnarBatch], limit: Int, offset: Int): RDD[ColumnarBatch] = {
     val opTime = gpuLongMetric(OP_TIME)
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     rdd.mapPartitions { iter =>
       new GpuBaseLimitIterator(iter, limit, offset, opTime, numOutputBatches, numOutputRows)
     }
@@ -378,8 +378,8 @@ case class GpuTopN(
     val opTime = gpuLongMetric(OP_TIME)
     val inputBatches = gpuLongMetric(NUM_INPUT_BATCHES)
     val inputRows = gpuLongMetric(NUM_INPUT_ROWS)
-    val outputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
-    val outputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val outputBatches = NoopMetric
+    val outputRows = NoopMetric
     val sortTime = gpuLongMetric(SORT_TIME)
     val concatTime = gpuLongMetric(CONCAT_TIME)
     val localLimit = limit

@@ -130,8 +130,8 @@ case class GpuSortExec(
 
     val sortTime = gpuLongMetric(SORT_TIME)
     val opTime = gpuLongMetric(OP_TIME)
-    val outputBatch = gpuLongMetric(NUM_OUTPUT_BATCHES)
-    val outputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val outputBatch = NoopMetric
+    val outputRows = NoopMetric
     val outOfCore = sortType == OutOfCoreSort
     val singleBatch = sortType == FullSortSingleBatch
     child.executeColumnar().mapPartitions { cbIter =>

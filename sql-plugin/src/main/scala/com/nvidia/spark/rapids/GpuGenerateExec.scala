@@ -850,8 +850,8 @@ case class GpuGenerateExec(
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
 
     generator.fixedLenLazyExpressions match {

@@ -605,8 +605,8 @@ abstract class GpuBroadcastNestedLoopJoinExecBase(
     if (output.isEmpty) {
       doUnconditionalJoinRowCount(relation)
     } else {
-      val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-      val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+      val numOutputRows = NoopMetric
+      val numOutputBatches = NoopMetric
       val buildTime = gpuLongMetric(BUILD_TIME)
       val opTime = gpuLongMetric(OP_TIME)
       val buildDataSize = gpuLongMetric(BUILD_DATA_SIZE)
@@ -757,8 +757,8 @@ abstract class GpuBroadcastNestedLoopJoinExecBase(
         ret
       }
 
-      val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-      val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+      val numOutputRows = NoopMetric
+      val numOutputBatches = NoopMetric
       val counts = streamed.executeColumnar().map(getRowCountAndClose)
       GpuBroadcastNestedLoopJoinExecBase.divideIntoBatches(
         counts.map(s => s * buildCount),
@@ -775,8 +775,8 @@ abstract class GpuBroadcastNestedLoopJoinExecBase(
     val buildTime = gpuLongMetric(BUILD_TIME)
     val buildDataSize = gpuLongMetric(BUILD_DATA_SIZE)
     val streamAttributes = streamed.output
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val numOutputRows = NoopMetric
+    val numOutputBatches = NoopMetric
     val opTime = gpuLongMetric(OP_TIME)
     val joinTime = gpuLongMetric(JOIN_TIME)
     val nestedLoopJoinType = joinType

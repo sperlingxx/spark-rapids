@@ -354,7 +354,7 @@ case class GpuColumnarToRowExec(
     NUM_INPUT_BATCHES -> createMetric(DEBUG_LEVEL, DESCRIPTION_NUM_INPUT_BATCHES))
 
   override def doExecute(): RDD[InternalRow] = {
-    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val numOutputRows = NoopMetric
     val numInputBatches = gpuLongMetric(NUM_INPUT_BATCHES)
     val opTime = gpuLongMetric(OP_TIME)
     val streamTime = gpuLongMetric(STREAM_TIME)

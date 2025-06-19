@@ -191,7 +191,23 @@ trait GpuExec extends SparkPlan {
 
   final override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     this.dumpLoreMetaInfo()
-    val localMetrics = allMetrics
+    val builder = Map.newBuilder[String, GpuMetric]
+      outputRowsLevel match {
+      case NOOP_LEVEL =>
+      case _ if allMetrics.contains(NUM_OUTPUT_ROWS) =>
+        builder += NUM_OUTPUT_ROWS -> allMetrics(NUM_OUTPUT_ROWS)
+    }
+    outputBatchesLevel match {
+      case NOOP_LEVEL =>
+      case _ if allMetrics.contains(NUM_OUTPUT_BATCHES) =>
+        builder += NUM_OUTPUT_BATCHES -> allMetrics(NUM_OUTPUT_BATCHES)
+    }
+    outputDataSizeLevel match {
+      case NOOP_LEVEL =>
+      case _ if allMetrics.contains(OUTPUT_DATA_SIZE) =>
+        builder += OUTPUT_DATA_SIZE -> allMetrics(OUTPUT_DATA_SIZE)
+    }
+    val localMetrics = builder.result()
     val rdd = internalDoExecuteColumnar().mapPartitions { iter =>
       GpuMetricsIterator(iter, localMetrics)
     }

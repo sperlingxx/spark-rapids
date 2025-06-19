@@ -52,8 +52,8 @@ trait GpuPythonExecBase extends GpuExec {
   protected def commonGpuMetrics(): (GpuMetric, GpuMetric, GpuMetric, GpuMetric) = (
     gpuLongMetric(NUM_INPUT_ROWS),
     gpuLongMetric(NUM_INPUT_BATCHES),
-    gpuLongMetric(NUM_OUTPUT_ROWS),
-    gpuLongMetric(NUM_OUTPUT_BATCHES))
+    NoopMetric,
+    NoopMetric)
 
 }
 
