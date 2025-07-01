@@ -16,6 +16,7 @@
 
 package com.nvidia.spark.rapids
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{SparkSession, SparkSessionExtensions}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -24,14 +25,20 @@ import org.apache.spark.sql.execution.{ColumnarRule, SparkPlan, SparkStrategy}
 /**
  * Extension point to enable GPU SQL processing.
  */
-class SQLExecPlugin extends (SparkSessionExtensions => Unit) {
+class SQLExecPlugin extends (SparkSessionExtensions => Unit) with Logging {
   private val strategyRules: SparkStrategy = ShimLoader.newStrategyRules()
+
+  private val postHocResolutionOverrides: SparkSession => Rule[LogicalPlan] = {
+    logWarning("initialize SQLExecPlugin")
+    (ss: SparkSession) => ShimLoader.newGpuPostHocResolutionOverrides(ss)
+  }
 
   override def apply(extensions: SparkSessionExtensions): Unit = {
     extensions.injectColumnar(columnarOverrides)
     extensions.injectQueryStagePrepRule(queryStagePrepOverrides)
     extensions.injectPlannerStrategy(_ => strategyRules)
     extensions.injectPostHocResolutionRule(postHocResolutionOverrides)
+    logWarning("SQLExecPlugin has been applied")
   }
 
   private def columnarOverrides(sparkSession: SparkSession): ColumnarRule = {
@@ -40,9 +47,5 @@ class SQLExecPlugin extends (SparkSessionExtensions => Unit) {
 
   private def queryStagePrepOverrides(sparkSession: SparkSession): Rule[SparkPlan] = {
     ShimLoader.newGpuQueryStagePrepOverrides()
-  }
-
-  private def postHocResolutionOverrides(sparkSession: SparkSession): Rule[LogicalPlan] = {
-    ShimLoader.newGpuPostHocResolutionOverrides(sparkSession)
   }
 }

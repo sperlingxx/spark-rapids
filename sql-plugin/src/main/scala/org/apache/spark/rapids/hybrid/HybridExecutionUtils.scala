@@ -446,6 +446,7 @@ object HybridExecOverrides extends Logging {
    * NOTE: Invalid hints will be removed by the following rule: `ResolveHints.RemoveAllHints`
    */
   def resolveHybridScanHint(plan: LogicalPlan): LogicalPlan = {
+    logInfo(s"Resolving HybridScanHint in plan: ${plan.treeString}")
     plan.resolveOperatorsWithPruning(_.containsPattern(TreePattern.UNRESOLVED_HINT)) {
       case UnresolvedHint(n, Nil, child) if n.toUpperCase(Locale.ROOT).equals(HYBRID_SCAN_HINT) =>
         child.transformUp {

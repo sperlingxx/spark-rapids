@@ -16,6 +16,7 @@
 
 package com.nvidia.spark.rapids
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.rapids.hybrid.HybridExecOverrides
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
@@ -26,9 +27,13 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * phase by `SparkSessionExtensions.injectPostHocResolutionRule`. As its name suggests, it will
  * be applied after the logical plan has been resolved.
  */
-case class GpuPostHocResolutionOverrides(spark: SparkSession) extends Rule[LogicalPlan] {
+case class GpuPostHocResolutionOverrides(spark: SparkSession) extends Rule[LogicalPlan]
+  with Logging {
 
   @transient private val rapidsConf = new RapidsConf(spark.sessionState.conf)
+
+  logWarning(s"GpuPostHocResolutionOverrides has been initialized with " +
+    s"loadHybridBackend=${rapidsConf.loadHybridBackend}")
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     // If the hybrid backend is enabled, we need to resolve potential hybrid scan hints

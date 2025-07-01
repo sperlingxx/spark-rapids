@@ -4847,6 +4847,11 @@ case class GpuOverrides() extends Rule[SparkPlan] with Logging {
 
   def applyWithContext(sparkPlan: SparkPlan, context: Option[String]): SparkPlan =
       GpuOverrideUtil.tryOverride { plan =>
+    // diagnosis message
+    val postHocResRules = sparkPlan.session.sessionState.analyzer.postHocResolutionRules
+    logWarning(s"${
+      postHocResRules.map(_.ruleName).mkString("Post-hoc resolution rules: [", ", ", "]")}")
+
     val conf = new RapidsConf(plan.conf)
     if (conf.isSqlEnabled && conf.isSqlExecuteOnGPU) {
       GpuOverrides.logDuration(conf.shouldExplain,
