@@ -21,7 +21,7 @@ import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
 import java.nio.charset.StandardCharsets
-import java.util.{Collections, Locale}
+import java.util.{Arrays => jArrays, Collections, Locale}
 import java.util.concurrent._
 
 import scala.annotation.tailrec
@@ -38,11 +38,11 @@ import com.nvidia.spark.rapids.RapidsConf.ParquetFooterReaderType
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
 import com.nvidia.spark.rapids.filecache.FileCache
+import com.nvidia.spark.rapids.io.async.{AsyncTask, TaskResource, UnboundedAsyncTask}
 import com.nvidia.spark.rapids.jni.{DateTimeRebase, ParquetFooter, RmmSpark}
 import com.nvidia.spark.rapids.parquet.ParquetPartitionReader.{CopyRange, LocalCopy, PARQUET_MAGIC}
 import com.nvidia.spark.rapids.shims.{ColumnDefaultValuesShims, GpuParquetCrypto, GpuTypeShims, ShimFilePartitionReaderFactory, SparkShimImpl}
 import com.nvidia.spark.rapids.shims.parquet.{ParquetLegacyNanoAsLongShims, ParquetSchemaClipShims, ParquetStringPredShims}
-import java.util
 import org.apache.commons.io.output.{CountingOutputStream, NullOutputStream}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FSDataInputStream, Path}
@@ -598,15 +598,15 @@ private case class GpuParquetFileFilterHandler(
 
 
   private def verifyParquetMagic(filePath: Path, magic: Array[Byte]): Unit = {
-    if (!util.Arrays.equals(MAGIC, magic)) {
-      if (util.Arrays.equals(PARQUET_MAGIC_ENCRYPTED, magic)) {
+    if (!jArrays.equals(MAGIC, magic)) {
+      if (jArrays.equals(PARQUET_MAGIC_ENCRYPTED, magic)) {
         throw new RuntimeException("The GPU does not support reading encrypted Parquet " +
           "files. To read encrypted or columnar encrypted files, disable the GPU Parquet " +
           s"reader via ${RapidsConf.ENABLE_PARQUET_READ.key}.")
       } else {
         throw new RuntimeException(s"$filePath is not a Parquet file. " +
-          s"Expected magic number at tail ${util.Arrays.toString(MAGIC)} " +
-          s"but found ${util.Arrays.toString(magic)}")
+          s"Expected magic number at tail ${jArrays.toString(MAGIC)} " +
+          s"but found ${jArrays.toString(magic)}")
       }
     }
   }
@@ -1074,7 +1074,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
   private val isCaseSensitive = sqlConf.caseSensitiveAnalysis
   private val debugDumpPrefix = rapidsConf.parquetDebugDumpPrefix
   private val debugDumpAlways = rapidsConf.parquetDebugDumpAlways
-  private val numThreads = rapidsConf.multiThreadReadNumThreads
+  private val poolConf = ResourcePoolConf.parse(rapidsConf)
   private val maxNumFileProcessed = rapidsConf.maxNumParquetFilesParallel
   private val ignoreMissingFiles = sqlConf.ignoreMissingFiles
   private val ignoreCorruptFiles = sqlConf.ignoreCorruptFiles
@@ -1138,7 +1138,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows, maxReadBatchSizeBytes,
       targetBatchSizeBytes, maxGpuColumnSizeBytes,
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, compressCfg,
-      metrics, partitionSchema, numThreads, maxNumFileProcessed, ignoreMissingFiles,
+      metrics, partitionSchema, poolConf, maxNumFileProcessed, ignoreMissingFiles,
       ignoreCorruptFiles, readUseFieldId, queryUsesInputFile, keepReadsInOrderFromConf,
       combineConf)
     // NOTE: Initialize must happen after the initialization of the reader, to ensure everything
@@ -1219,7 +1219,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       metrics.getOrElse(SCAN_TIME, NoopMetric).ns {
         val metaAndFilesArr = if (numFilesFilterParallel > 0) {
           val tc = TaskContext.get()
-          val threadPool = MultiFileReaderThreadPool.getOrCreateThreadPool(numThreads)
+          val threadPool = MultiFileReaderThreadPool.getOrCreateThreadPool(poolConf)
           files.grouped(numFilesFilterParallel).map { fileGroup =>
             // we need to copy the Hadoop Configuration because filter push down can mutate it,
             // which can affect other threads.
@@ -1258,7 +1258,8 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows, maxReadBatchSizeBytes,
       targetBatchSizeBytes, maxGpuColumnSizeBytes,
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, compressCfg,
-      metrics, partitionSchema, numThreads, ignoreMissingFiles, ignoreCorruptFiles, readUseFieldId)
+      metrics, partitionSchema, poolConf, ignoreMissingFiles, ignoreCorruptFiles,
+      readUseFieldId)
   }
 
   /**
@@ -2127,7 +2128,7 @@ case class ParquetSingleDataBlockMeta(
  *                                             usage that the reader will use
  * @param execMetrics metrics
  * @param partitionSchema Schema of partitions.
- * @param numThreads the size of the threadpool
+ * @param resourceConf resource pool configuration.
  * @param ignoreMissingFiles Whether to ignore missing files
  * @param ignoreCorruptFiles Whether to ignore corrupt files
  */
@@ -2147,13 +2148,13 @@ class MultiFileParquetPartitionReader(
     override val compressCfg: CpuCompressionConfig,
     override val execMetrics: Map[String, GpuMetric],
     partitionSchema: StructType,
-    numThreads: Int,
+    resourceConf: ResourcePoolConf,
     ignoreMissingFiles: Boolean,
     ignoreCorruptFiles: Boolean,
     useFieldId: Boolean)
   extends MultiFileCoalescingPartitionReaderBase(conf, clippedBlocks,
     partitionSchema, maxReadBatchSizeRows, maxReadBatchSizeBytes, maxGpuColumnSizeBytes,
-    numThreads, execMetrics)
+    resourceConf, execMetrics)
   with ParquetPartitionReaderBase {
 
   // Some implicits to convert the base class to the sub-class and vice versa
@@ -2163,7 +2164,8 @@ class MultiFileParquetPartitionReader(
   implicit def ParquetSingleDataBlockMeta(in: ExtraInfo): ParquetExtraInfo =
     in.asInstanceOf[ParquetExtraInfo]
 
-  // The runner to copy blocks to offset of HostMemoryBuffer
+  // The runner to copy blocks to offset of HostMemoryBuffer.
+  // Submit as an unbounded task since the buffer has already been allocated.
   class ParquetCopyBlocksRunner(
       taskContext: TaskContext,
       file: Path,
@@ -2171,7 +2173,7 @@ class MultiFileParquetPartitionReader(
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long,
       compressCfg: CpuCompressionConfig)
-    extends Callable[(Seq[DataBlockBase], Long)] {
+    extends UnboundedAsyncTask[(Seq[DataBlockBase], Long)] {
 
     override def call(): (Seq[DataBlockBase], Long) = {
       TrampolineUtil.setTaskContext(taskContext)
@@ -2234,7 +2236,7 @@ class MultiFileParquetPartitionReader(
       outhmb: HostMemoryBuffer,
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long,
-      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long)] = {
+      batchContext: BatchContext): AsyncTask[(Seq[DataBlockBase], Long)] = {
     new ParquetCopyBlocksRunner(taskContext, file, outhmb, blocks, offset, compressCfg)
   }
 
@@ -2320,7 +2322,7 @@ class MultiFileParquetPartitionReader(
  *                                             usage that the reader will use
  * @param execMetrics metrics
  * @param partitionSchema Schema of partitions.
- * @param numThreads the size of the threadpool
+ * @param resourceConf resource pool configuration.
  * @param maxNumFileProcessed the maximum number of files to read on the CPU side and waiting to be
  *                            processed on the GPU. This affects the amount of host memory used.
  * @param ignoreMissingFiles Whether to ignore missing files
@@ -2347,7 +2349,7 @@ class MultiFileCloudParquetPartitionReader(
     override val compressCfg: CpuCompressionConfig,
     override val execMetrics: Map[String, GpuMetric],
     partitionSchema: StructType,
-    numThreads: Int,
+    resourceConf: ResourcePoolConf,
     maxNumFileProcessed: Int,
     ignoreMissingFiles: Boolean,
     ignoreCorruptFiles: Boolean,
@@ -2355,7 +2357,8 @@ class MultiFileCloudParquetPartitionReader(
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
     combineConf: CombineConf)
-  extends MultiFileCloudPartitionReaderBase(conf, files, numThreads, maxNumFileProcessed, null,
+  extends MultiFileCloudPartitionReaderBase(conf,
+    files, resourceConf, maxNumFileProcessed, null,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
     keepReadsInOrder, combineConf)
   with ParquetPartitionReaderBase {
@@ -2598,7 +2601,12 @@ class MultiFileCloudParquetPartitionReader(
   private class ReadBatchRunner(
       file: PartitionedFile,
       filterFunc: PartitionedFile => ParquetFileInfoWithBlockMeta,
-      taskContext: TaskContext) extends Callable[HostMemoryBuffersWithMetaDataBase] with Logging {
+      taskContext: TaskContext) extends AsyncTask[HostMemoryBuffersWithMetaDataBase]
+      with Logging {
+
+    override val resource: TaskResource = TaskResource.newCpuResource(file.length)
+
+    override val priority: Float = AsyncTask.hostMemoryPenalty(file.length)
 
     private var blockChunkIter: BufferedIterator[BlockMetaData] = null
 
@@ -2708,19 +2716,20 @@ class MultiFileCloudParquetPartitionReader(
   }
 
   /**
-   * File reading logic in a Callable which will be running in a thread pool
+   * File reading logic wrapped an async task which will be scheduled and executed in a
+   * MemoryBoundedThreadExecutor. The larger the file, the lower priority of this task.
    *
    * @param tc      task context to use
    * @param file    file to be read
    * @param conf    configuration
    * @param filters push down filters
-   * @return Callable[HostMemoryBuffersWithMetaDataBase]
+   * @return AsyncTask[HostMemoryBuffersWithMetaDataBase]
    */
   override def getBatchRunner(
       tc: TaskContext,
       file: PartitionedFile,
       conf: Configuration,
-      filters: Array[Filter]): Callable[HostMemoryBuffersWithMetaDataBase] = {
+      filters: Array[Filter]): AsyncTask[HostMemoryBuffersWithMetaDataBase] = {
     new ReadBatchRunner(file, filterFunc, tc)
   }
 

@@ -16,7 +16,10 @@
 
 package com.nvidia.spark.rapids.io.async
 
-import java.util.concurrent.{BlockingQueue, Callable, FutureTask, RunnableFuture, ThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.{BlockingQueue, Callable, FutureTask, LinkedBlockingQueue, RunnableFuture, ThreadFactory, ThreadPoolExecutor, TimeUnit}
+
+import com.google.common.util.concurrent.ThreadFactoryBuilder
+
 
 class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task)
     with Comparable[RapidsFutureTask[T]] {
@@ -43,7 +46,7 @@ class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task)
     heldResource = false
   }
 
-  def adjustPriority(delta: Int): Float = {
+  def adjustPriority(delta: Float): Float = {
     require(!completed, "Task has already been completed")
     priority += delta
     priority
@@ -58,14 +61,15 @@ class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task)
   }
 }
 
-class TrafficControlThreadExecutor(mgr: ResourceManager,
-    throttleTimeoutMs: Long,
-    priorityPenalty: Int,
+class ResourceBoundedThreadExecutor(mgr: ResourcePool,
+    waitResourceTimeoutMs: Long,
+    priorityPenalty: Float,
     corePoolSize: Int,
     maximumPoolSize: Int,
     workQueue: BlockingQueue[Runnable],
+    threadFactory: ThreadFactory,
     keepAliveTime: Long = 100L) extends ThreadPoolExecutor(corePoolSize,
-  maximumPoolSize, keepAliveTime, TimeUnit.SECONDS, workQueue) {
+  maximumPoolSize, keepAliveTime, TimeUnit.SECONDS, workQueue, threadFactory) {
 
   override protected def newTaskFor[T](fn: Callable[T]): RunnableFuture[T] = {
     fn match {
@@ -80,7 +84,7 @@ class TrafficControlThreadExecutor(mgr: ResourceManager,
   override def beforeExecute(t: Thread, r: Runnable): Unit = {
     r match {
       case fut: RapidsFutureTask[_] =>
-        if (mgr.acquireResource(fut.task, throttleTimeoutMs)) {
+        if (mgr.acquireResource(fut.task, waitResourceTimeoutMs)) {
           fut.holdResource()
         }
       case _ =>
@@ -110,10 +114,24 @@ class TrafficControlThreadExecutor(mgr: ResourceManager,
   }
 }
 
-object TrafficControlThreadExecutor {
-  def apply(throttle: ResourceManager,
-      throttleTimeoutMs: Long = 1000L,
-      priorityPenalty: Int = 10): TrafficControlThreadExecutor = {
+object ResourceBoundedThreadExecutor {
+  def apply(name: String,
+      pool: ResourcePool,
+      maxThreadNumber: Int,
+      waitResourceTimeoutMs: Long = 60 * 1000L,
+      priorityPenalty: Float = 10.0f): ResourceBoundedThreadExecutor = {
+    val taskQueue = new LinkedBlockingQueue[Runnable]()
+    val threadFactory: ThreadFactory = new ThreadFactoryBuilder()
+        .setDaemon(true)
+        .setNameFormat(name)
+        .build()
 
+    new ResourceBoundedThreadExecutor(pool,
+      waitResourceTimeoutMs,
+      priorityPenalty,
+      corePoolSize = maxThreadNumber,
+      maximumPoolSize = maxThreadNumber,
+      workQueue = taskQueue,
+      threadFactory = threadFactory)
   }
 }

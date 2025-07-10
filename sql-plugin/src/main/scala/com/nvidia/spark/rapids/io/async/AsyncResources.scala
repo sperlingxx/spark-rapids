@@ -31,15 +31,37 @@ object TaskResource {
 }
 
 /**
- * Simple wrapper around a [[Callable]] that also keeps track of the host memory bytes used by
- * the task.
- *
- * Note: we may want to add more metadata to the task in the future, such as the device memory,
- * as we implement more throttling strategies.
+ * The AsyncTask interface represents a task that can be scheduled by Resource.
  */
-class AsyncTask[T](val resource: TaskResource,
-    val priority: Float,
-    functor: () => T) extends Callable[T] {
+trait AsyncTask[T] extends Callable[T] {
+  /**
+   * Resource required by the task, such as host memory or GPU semaphore.
+   */
+  def resource: TaskResource
+
+  /**
+   * Priority of the task, higher value means higher priority.
+   */
+  def priority: Float
+}
+
+abstract class UnboundedAsyncTask[T] extends AsyncTask[T] {
+  /**
+   * Unbounded tasks do not have a resource limit, so they can be scheduled without any
+   * restrictions.
+   */
+  override val resource: TaskResource = TaskResource.newCpuResource(0L)
+
+  /**
+   * Unbounded tasks have the highest priority.
+   */
+  override val priority: Float = Float.MaxValue
+}
+
+class AsyncFunctor[T](
+    override val resource: TaskResource,
+    override val priority: Float,
+    functor: () => T) extends AsyncTask[T] {
   override def call(): T = functor()
 }
 
@@ -55,22 +77,22 @@ object AsyncTask {
       memoryBytes: Long,
       priority: Float = 0.0f): AsyncTask[T] = {
     val adjustedPriority = hostMemoryPenalty(memoryBytes, priority)
-    new AsyncTask[T](TaskResource.newCpuResource(memoryBytes), adjustedPriority, fn)
+    new AsyncFunctor[T](TaskResource.newCpuResource(memoryBytes), adjustedPriority, fn)
   }
 
   def newUnboundedTask[T](fn: () => T): AsyncTask[T] = {
-    new AsyncTask[T](TaskResource.newCpuResource(0L), Float.MaxValue, fn)
+    new AsyncFunctor[T](TaskResource.newCpuResource(0L), Float.MaxValue, fn)
   }
 }
 
 /**
- * Throttle interface to be implemented by different throttling strategies.
+ * ResourceManager interface to be implemented for AsyncTasks requiring different kinds of
+ * resources.
  *
- * Currently, only HostMemoryThrottle is implemented, which limits the maximum in-flight host
- * memory bytes. In the future, we can add more throttling strategies, such as limiting the
- * device memory usage, the number of tasks, etc.
+ * Currently, only HostMemoryManager is implemented, which limits the maximum in-flight host
+ * memory bytes. In the future, we can add more.
  */
-trait ResourceManager {
+trait ResourcePool {
   /**
    * Returns true if the task can be accepted, false otherwise.
    * TrafficController will block the task from being scheduled until this method returns true.
@@ -86,23 +108,23 @@ trait ResourceManager {
 /**
  * Throttle implementation that limits the total host memory used by the in-flight tasks.
  */
-class HostMemoryManager(val maxInFlightHostMemoryBytes: Long) extends ResourceManager {
+class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool {
 
   private val lock = new ReentrantLock()
 
   private val condition = lock.newCondition()
 
   @GuardedBy("lock")
-  private var remaining: Long = maxInFlightHostMemoryBytes
+  private var remaining: Long = maxHostMemoryBytes
 
   override def acquireResource[T](task: AsyncTask[T], timeoutMs: Long): Boolean = {
     task.resource.hostMemoryBytes match {
       case 0 =>
         true
-      case required if required > maxInFlightHostMemoryBytes =>
+      case required if required > maxHostMemoryBytes =>
         throw new IllegalArgumentException(
           s"Task requires more host memory than total size of memory pool: " +
-              s"required=$required, maxAllowed=$maxInFlightHostMemoryBytes")
+              s"required=$required, maxAllowed=$maxHostMemoryBytes")
       case required: Long =>
         var isDone = false
         var isTimeout = false
@@ -131,10 +153,10 @@ class HostMemoryManager(val maxInFlightHostMemoryBytes: Long) extends ResourceMa
       lock.lockInterruptibly()
       try {
         remaining += task.resource.hostMemoryBytes
-        require(remaining <= maxInFlightHostMemoryBytes,
+        require(remaining <= maxHostMemoryBytes,
           s"Released more host memory than allowed: " +
               s"released=${task.resource.hostMemoryBytes}, remaining=$remaining, " +
-              s"maxAllowed=$maxInFlightHostMemoryBytes")
+              s"maxAllowed=$maxHostMemoryBytes")
         condition.signalAll()
       } finally {
         lock.unlock()

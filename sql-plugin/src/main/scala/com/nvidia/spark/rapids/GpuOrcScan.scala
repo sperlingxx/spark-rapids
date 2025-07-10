@@ -23,7 +23,6 @@ import java.nio.channels.Channels
 import java.nio.charset.StandardCharsets
 import java.time.ZoneId
 import java.util
-import java.util.concurrent.Callable
 import java.util.regex.Pattern
 
 import scala.annotation.tailrec
@@ -39,6 +38,7 @@ import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
 import com.nvidia.spark.rapids.SchemaUtils._
 import com.nvidia.spark.rapids.filecache.FileCache
+import com.nvidia.spark.rapids.io.async.{AsyncTask, TaskResource, UnboundedAsyncTask}
 import com.nvidia.spark.rapids.jni.{CastStrings, RmmSpark}
 import com.nvidia.spark.rapids.shims.{ColumnDefaultValuesShims, GpuOrcDataReader, NullOutputStreamShim, OrcCastingShims, OrcReadingShims, OrcShims, ShimFilePartitionReaderFactory}
 import org.apache.commons.io.IOUtils
@@ -2011,7 +2011,7 @@ class MultiFileCloudOrcPartitionReader(
     maxGpuColumnSizeBytes: Long,
     useChunkedReader: Boolean,
     maxChunkedReaderMemoryUsageSizeBytes: Long,
-    numThreads: Int,
+    resourceConf: ResourcePoolConf,
     maxNumFileProcessed: Int,
     override val debugDumpPrefix: Option[String],
     override val debugDumpAlways: Boolean,
@@ -2023,7 +2023,8 @@ class MultiFileCloudOrcPartitionReader(
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
     combineConf: CombineConf)
-  extends MultiFileCloudPartitionReaderBase(conf, files, numThreads, maxNumFileProcessed, filters,
+  extends MultiFileCloudPartitionReaderBase(conf,
+    files, resourceConf, maxNumFileProcessed, filters,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
     keepReadsInOrder = keepReadsInOrder, combineConf = combineConf)
   with MultiFileReaderFunctions with OrcPartitionReaderBase {
@@ -2054,7 +2055,11 @@ class MultiFileCloudOrcPartitionReader(
       taskContext: TaskContext,
       partFile: PartitionedFile,
       conf: Configuration,
-      filters: Array[Filter]) extends Callable[HostMemoryBuffersWithMetaDataBase]  {
+      filters: Array[Filter]) extends AsyncTask[HostMemoryBuffersWithMetaDataBase]  {
+
+    override val resource: TaskResource = TaskResource.newCpuResource(partFile.length)
+
+    override val priority: Float = AsyncTask.hostMemoryPenalty(partFile.length)
 
     private var blockChunkIter: BufferedIterator[OrcOutputStripe] = null
 
@@ -2162,7 +2167,7 @@ class MultiFileCloudOrcPartitionReader(
       tc: TaskContext,
       file: PartitionedFile,
       conf: Configuration,
-      filters: Array[Filter]): Callable[HostMemoryBuffersWithMetaDataBase] = {
+      filters: Array[Filter]): AsyncTask[HostMemoryBuffersWithMetaDataBase] = {
     new ReadBatchRunner(tc, file, conf, filters)
   }
 
@@ -2582,7 +2587,7 @@ private case class OrcSingleStripeMeta(
  *                                             usage that the reader will use
  * @param execMetrics           metrics
  * @param partitionSchema       schema of partitions
- * @param numThreads            the size of the threadpool
+ * @param resourceConf          resource pool configuration.
  * @param isCaseSensitive       whether the name check should be case sensitive or not
  */
 class MultiFileOrcPartitionReader(
@@ -2600,11 +2605,11 @@ class MultiFileOrcPartitionReader(
     maxChunkedReaderMemoryUsageSizeBytes: Long,
     execMetrics: Map[String, GpuMetric],
     partitionSchema: StructType,
-    numThreads: Int,
+    resourceConf: ResourcePoolConf,
     isCaseSensitive: Boolean)
   extends MultiFileCoalescingPartitionReaderBase(conf, clippedStripes,
     partitionSchema, maxReadBatchSizeRows, maxReadBatchSizeBytes, maxGpuColumnSizeBytes,
-    numThreads, execMetrics)
+    resourceConf, execMetrics)
     with OrcCommonFunctions {
 
   // implicit to convert SchemaBase to Orc TypeDescription
@@ -2615,14 +2620,15 @@ class MultiFileOrcPartitionReader(
     in.asInstanceOf[OrcExtraInfo]
 
   // The runner to copy stripes to the offset of HostMemoryBuffer and update
-  // the StripeInformation to construct the file Footer
+  // the StripeInformation to construct the file Footer.
+  // Submit as an unbounded task since the buffer has already been allocated.
   class OrcCopyStripesRunner(
       taskContext: TaskContext,
       file: Path,
       outhmb: HostMemoryBuffer,
       stripes: ArrayBuffer[DataBlockBase],
       offset: Long)
-    extends Callable[(Seq[DataBlockBase], Long)] {
+    extends UnboundedAsyncTask[(Seq[DataBlockBase], Long)] {
 
     override def call(): (Seq[DataBlockBase], Long) = {
       TrampolineUtil.setTaskContext(taskContext)
@@ -2727,8 +2733,8 @@ class MultiFileOrcPartitionReader(
    * @param blocks blocks meta info to specify which blocks to be read
    * @param offset used as the offset adjustment
    * @param batchContext the batch building context
-   * @return Callable[(Seq[DataBlockBase], Long)], which will be submitted to a
-   *         ThreadPoolExecutor, and the Callable will return a tuple result and
+   * @return AsyncTask[(Seq[DataBlockBase], Long)], which will be submitted to a
+   *         ThreadPoolExecutor, and the task will return a tuple result and
    *         result._1 is block meta info with the offset adjusted
    *         result._2 is the bytes read
    */
@@ -2738,7 +2744,7 @@ class MultiFileOrcPartitionReader(
       outhmb: HostMemoryBuffer,
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long,
-      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long)] = {
+      batchContext: BatchContext): AsyncTask[(Seq[DataBlockBase], Long)] = {
     new OrcCopyStripesRunner(tc, file, outhmb, blocks, offset)
   }
 
