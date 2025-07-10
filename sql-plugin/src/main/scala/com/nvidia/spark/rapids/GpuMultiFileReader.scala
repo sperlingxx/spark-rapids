@@ -18,7 +18,7 @@ package com.nvidia.spark.rapids
 
 import java.io.{File, IOException}
 import java.net.{URI, URISyntaxException}
-import java.util.concurrent.{Callable, ConcurrentLinkedQueue, ExecutorCompletionService, Future, ThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.{CompletionService, ConcurrentLinkedQueue, Future, ThreadPoolExecutor, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.annotation.tailrec
@@ -32,7 +32,7 @@ import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits.{AutoCloseableArray, AutoCloseableProducingSeq}
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
-import com.nvidia.spark.rapids.io.async.{AsyncTask, HostMemoryPool, ResourceBoundedThreadExecutor}
+import com.nvidia.spark.rapids.io.async.{AsyncTask, BoundedCompletionService, HostMemoryPool, ResourceBoundedThreadExecutor}
 import org.apache.commons.io.IOUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
@@ -366,13 +366,13 @@ abstract class MultiFileCloudPartitionReaderBase(
   protected var combineLeftOverFiles: Option[Array[HostMemoryBuffersWithMetaDataBase]] = None
   private val isInit: AtomicBoolean = new AtomicBoolean(false)
   private val tasks = new ConcurrentLinkedQueue[Future[HostMemoryBuffersWithMetaDataBase]]()
-  private val tasksToRun = new Queue[Callable[HostMemoryBuffersWithMetaDataBase]]()
+  private val tasksToRun = new Queue[AsyncTask[HostMemoryBuffersWithMetaDataBase]]()
   private[this] val inputMetrics = Option(TaskContext.get).map(_.taskMetrics().inputMetrics)
     .getOrElse(TrampolineUtil.newInputMetrics())
   // this is used when the read order doesn't matter and in that case, the tasks queue
   // above is used to track any left being processed that need to be cleaned up if we exit early
   // like in the case of a limit call and we don't read all files
-  private var fcs: ExecutorCompletionService[HostMemoryBuffersWithMetaDataBase] = null
+  private var fcs: CompletionService[HostMemoryBuffersWithMetaDataBase] = null
 
   // If I/O eager prefetch is enabled, submit async reading tasks eagerly instead of triggering
   // async reading tasks when the first batch is requested.
@@ -399,7 +399,8 @@ abstract class MultiFileCloudPartitionReaderBase(
         if (fcs == null) {
           val threadPool =
             MultiFileReaderThreadPool.getOrCreateThreadPool(resourceConf)
-          fcs = new ExecutorCompletionService[HostMemoryBuffersWithMetaDataBase](threadPool)
+                .asInstanceOf[ResourceBoundedThreadExecutor]
+          fcs = new BoundedCompletionService[HostMemoryBuffersWithMetaDataBase](threadPool)
         }
       }
     } else {

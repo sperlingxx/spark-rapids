@@ -22,7 +22,6 @@ import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
 import java.nio.charset.StandardCharsets
 import java.util.{Arrays => jArrays, Collections, Locale}
-import java.util.concurrent._
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
@@ -1189,7 +1188,8 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       files: Array[PartitionedFile],
       conf: Configuration,
       filters: Array[Filter],
-      readDataSchema: StructType) extends Callable[Array[BlockMetaWithPartFile]] with Logging {
+      readDataSchema: StructType) extends UnboundedAsyncTask[Array[BlockMetaWithPartFile]]
+      with Logging {
 
     override def call(): Array[BlockMetaWithPartFile] = {
       TrampolineUtil.setTaskContext(taskContext)

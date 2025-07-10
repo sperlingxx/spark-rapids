@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids.io.async
 
-import java.util.concurrent.{BlockingQueue, Callable, FutureTask, LinkedBlockingQueue, RunnableFuture, ThreadFactory, ThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.{BlockingQueue, Callable, Future, FutureTask, LinkedBlockingQueue, RunnableFuture, ThreadFactory, ThreadPoolExecutor, TimeUnit}
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder
 
@@ -71,13 +71,42 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
     keepAliveTime: Long = 100L) extends ThreadPoolExecutor(corePoolSize,
   maximumPoolSize, keepAliveTime, TimeUnit.SECONDS, workQueue, threadFactory) {
 
-  override protected def newTaskFor[T](fn: Callable[T]): RunnableFuture[T] = {
+  override def submit[T](fn: Callable[T]): Future[T] = {
     fn match {
       case task: AsyncTask[T] =>
-        new RapidsFutureTask(task)
+        super.submit(task)
       case f =>
         throw new IllegalArgumentException(
-          s"Callable must be of type Task, but got ${f.getClass.getName}")
+          s"ResourceBoundedThreadExecutor only accepts AsyncTask, but got: ${f.getClass.getName}")
+    }
+  }
+
+  // This method is only for the extensions of RapidsFutureTask.
+  override def submit[T](r: Runnable, result: T): Future[T] = {
+    r match {
+      case futTask: RapidsFutureTask[T] =>
+        super.submit(futTask, result)
+      case _ =>
+        throw new UnsupportedOperationException("only accepts AsyncTask or RapidsFutureTask")
+    }
+  }
+
+  override def submit(r: Runnable): Future[_] = {
+    throw new UnsupportedOperationException("only accepts AsyncTask or RapidsFutureTask")
+  }
+
+  override protected def newTaskFor[T](fn: Callable[T]): RunnableFuture[T] = {
+    fn match {
+      case task: AsyncTask[T] => new RapidsFutureTask(task)
+      case f => throw new RuntimeException(s"Unexpected functor: ${f.getClass.getName}")
+    }
+  }
+
+  override protected def newTaskFor[T](r: Runnable, result: T): RunnableFuture[T] = {
+    r match {
+      case futTask: RapidsFutureTask[T] => futTask
+      case task: AsyncTask[T] => new RapidsFutureTask(task)
+      case f => throw new RuntimeException(s"Unexpected runnable: ${f.getClass.getName}")
     }
   }
 
@@ -88,14 +117,14 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
           fut.holdResource()
         }
       case _ =>
-        throw new IllegalArgumentException(
-          s"Runnable must be of type RapidsFutureTask, but got ${r.getClass.getName}")
+        throw new RuntimeException(s"Unexpected runnable: ${r.getClass.getName}")
     }
   }
 
   override def afterExecute(r: Runnable, t: Throwable): Unit = {
     r match {
       case fut: RapidsFutureTask[_] =>
+        // Release the held resource if it was acquired.
         if (fut.isHeldResource) {
           mgr.releaseResource(fut.task)
           fut.releaseResource()
@@ -108,8 +137,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
             s"Failed to re-add task ${fut.task} to the work queue after execution")
         }
       case _ =>
-        throw new IllegalArgumentException(
-          s"Runnable must be of type RapidsFutureTask, but got ${r.getClass.getName}")
+        throw new RuntimeException(s"Unexpected runnable: ${r.getClass.getName}")
     }
   }
 }
