@@ -1111,8 +1111,17 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .startupOnly()
       .internal()
       .longConf
-      .checkValue(v => v > 0, "The timeout must be greater than zero")
+      .checkValue(v => v >= 0, "The timeout must be greater than zero")
       .createWithDefault(30 * 1000L) // 30 seconds
+
+  val MULTITHREAD_READ_STAGE_LEVEL_POOL = conf("spark.rapids.sql.multiThreadedRead.stageLevelPool")
+      .doc("Enable test mode for the multi-threaded read. This will create different " +
+        "threadpools for each stage, so as to verify threadpools with different configs " +
+        "as independent test cases which can be run in parallel.")
+      .startupOnly()
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
 
   val ENABLE_PARQUET = conf("spark.rapids.sql.format.parquet.enabled")
     .doc("When set to false disables all parquet input and output acceleration")
@@ -3115,6 +3124,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val multiThreadMemoryLimit: Long = get(MULTITHREAD_READ_MEM_LIMIT)
 
   lazy val multiThreadReadTaskTimeout: Long = get(MULTITHREAD_READ_TASK_TIMEOUT)
+
+  lazy val multiThreadReadStageLevelPool: Boolean = get(MULTITHREAD_READ_STAGE_LEVEL_POOL)
 
   lazy val isParquetEnabled: Boolean = get(ENABLE_PARQUET)
 

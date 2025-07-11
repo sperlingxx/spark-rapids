@@ -17,22 +17,15 @@
 
 package com.nvidia.spark.rapids.io.async
 
-import java.util.concurrent.{Callable, CompletionService, Future, FutureTask, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.{Callable, CompletionService, Future, LinkedBlockingQueue, TimeUnit}
 
 class BoundedCompletionService[V](
     executor: ResourceBoundedThreadExecutor) extends CompletionService[V] {
 
   private val completionQueue = new LinkedBlockingQueue[Future[V]]()
 
-  private class CompletionFutureTask(task: AsyncTask[V]) extends FutureTask[V](task) {
-    private var completed: Boolean = false
-
-    override def run(): Unit = {
-      if (!completed) {
-        super.run()
-        completed = true
-      }
-    }
+  private class CompletionFutureTask(
+      task: AsyncTask[V]) extends RapidsFutureTask[V](task) {
 
     override def done(): Unit = {
       completionQueue.offer(this)
@@ -44,7 +37,7 @@ class BoundedCompletionService[V](
     task match {
       case asyncTask: AsyncTask[V] =>
         val futureTask = new CompletionFutureTask(asyncTask)
-        executor.submit(futureTask, null)
+        executor.submit(futureTask, null.asInstanceOf[V])
       case _ =>
         throw new IllegalArgumentException("Task must be an instance of AsyncTask")
     }

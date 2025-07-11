@@ -125,26 +125,26 @@ object MultiFileReaderThreadPool extends Logging {
 
   private def initThreadPool(conf: ResourcePoolConf): ThreadPoolExecutor = synchronized {
     if (threadPool.isEmpty) {
-      val maxThreads = conf.maxThreadNumber
-      val numThreads = Math.max(maxThreads, GpuDeviceManager.getNumCores)
-
-      if (maxThreads != numThreads) {
-        logWarning(s"Configuring the file reader thread pool with a max of $numThreads " +
-            s"threads instead of ${RapidsConf.MULTITHREAD_READ_NUM_THREADS} = $maxThreads")
-      }
-
-      val resourcePool = new HostMemoryPool(conf.hostMemoryCapacity)
-      val threadPoolExecutor = ResourceBoundedThreadExecutor(
-        "multithreaded file reader worker",
-        resourcePool,
-        conf.maxThreadNumber,
-        conf.waitResourceTimeoutMs,
-        conf.priorityPenalty)
-      threadPoolExecutor.allowCoreThreadTimeOut(true)
-      logDebug(s"Using $numThreads for the multithreaded reader thread pool")
-      threadPool = Some(threadPoolExecutor)
+      threadPool = Some(createThreadPool( "multithreaded file reader worker", conf))
     }
     threadPool.get
+  }
+
+  private def createThreadPool(name: String, conf: ResourcePoolConf): ThreadPoolExecutor = {
+    val maxThreads = conf.maxThreadNumber
+    val numThreads = Math.max(maxThreads, GpuDeviceManager.getNumCores)
+    if (maxThreads != numThreads) {
+      logWarning(s"Configuring the file reader thread pool with a max of $numThreads " +
+          s"threads instead of ${RapidsConf.MULTITHREAD_READ_NUM_THREADS} = $maxThreads")
+    }
+    logDebug(s"Using $numThreads for the multithreaded reader thread pool")
+
+    val pool = new HostMemoryPool(conf.hostMemoryCapacity)
+    val threadExecutor = ResourceBoundedThreadExecutor.apply(name,
+      pool,
+      numThreads, conf.waitResourceTimeoutMs, conf.priorityPenalty)
+    threadExecutor.allowCoreThreadTimeOut(true)
+    threadExecutor
   }
 
   /**
@@ -153,9 +153,25 @@ object MultiFileReaderThreadPool extends Logging {
    *       if it is not the right size compared to the number of cores available.
    */
   def getOrCreateThreadPool(conf: ResourcePoolConf): ThreadPoolExecutor = {
-    threadPool.getOrElse {
-      initThreadPool(conf)
+    if (conf.stageLevelPool) {
+      val stageId = TaskContext.get().stageId()
+      getOrCreateStageThreadPool(stageId, conf)
+    } else {
+      threadPool.getOrElse {
+        initThreadPool(conf)
+      }
     }
+  }
+
+  private lazy val stageLevelPools: java.util.concurrent.ConcurrentMap[Int, ThreadPoolExecutor] = {
+    new java.util.concurrent.ConcurrentHashMap[Int, ThreadPoolExecutor]()
+  }
+
+  private def getOrCreateStageThreadPool(stageId: Int,
+      conf: ResourcePoolConf): ThreadPoolExecutor = {
+    stageLevelPools.computeIfAbsent(stageId, _ => {
+      createThreadPool(s"stage pool of MultiFileReader for stage($stageId)", conf)
+    })
   }
 }
 
@@ -316,7 +332,8 @@ case class ResourcePoolConf(
     hostMemoryCapacity: Long, // The maximum host memory used by in-flight tasks
     waitResourceTimeoutMs: Long, // The timeout for acquiring resources
     priorityPenalty: Float, // The penalty for task priority if failed to acquire resource
-    maxThreadNumber: Int) // The maximum number of threads used by the thread pool
+    maxThreadNumber: Int, // The maximum number of threads used by the thread pool
+    stageLevelPool: Boolean) // Only for testing, create pools for each task
 
 object ResourcePoolConf {
   def parse(rapidsConf: RapidsConf): ResourcePoolConf = {
@@ -324,7 +341,8 @@ object ResourcePoolConf {
       rapidsConf.multiThreadMemoryLimit,
       rapidsConf.multiThreadReadTaskTimeout,
       -0.05f, // 0.05 seems to be a good value for priority values normalized to 1.0
-      rapidsConf.multiThreadReadNumThreads)
+      rapidsConf.multiThreadReadNumThreads,
+      rapidsConf.multiThreadReadStageLevelPool)
   }
 }
 

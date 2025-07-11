@@ -135,7 +135,6 @@ reader_opt_confs_no_native = [original_parquet_file_reader_conf, multithreaded_p
 
 reader_opt_confs = reader_opt_confs_native + reader_opt_confs_no_native
 
-
 @pytest.mark.parametrize('parquet_gens', [[byte_gen, short_gen, int_gen, long_gen]], ids=idfn)
 @pytest.mark.parametrize('read_func', [read_parquet_df])
 @pytest.mark.parametrize('reader_confs', [coalesce_parquet_file_reader_multithread_filter_conf,
@@ -201,6 +200,52 @@ def test_parquet_read_round_trip(spark_tmp_path, parquet_gens, read_func, reader
     assert_gpu_and_cpu_are_equal_collect(read_func(data_path),
             conf=all_confs)
 
+def resource_bounded_multithreaded_reader_conf():
+    base_conf = {
+        'spark.rapids.sql.multiThreadedRead.stageLevelPool': 'true',
+        'spark.rapids.sql.format.parquet.reader.footer.type': 'NATIVE',
+        'spark.rapids.sql.reader.multithreaded.combine.sizeBytes': '0',
+        'spark.sql.sources.useV1SourceList': 'parquet',
+        # set the int96 rebase mode values because its LEGACY in databricks which will preclude this op from running on GPU
+        int96RebaseModeInReadKey : 'CORRECTED',
+        datetimeRebaseModeInReadKey : 'CORRECTED'
+    }
+    keep_order = ('spark.rapids.sql.format.parquet.multithreaded.read.keepOrder', [False, True])
+    reader_type = ('spark.rapids.sql.format.parquet.reader.type', ['MULTITHREADED', 'COALESCING'])
+    pool_size = ('spark.rapids.sql.multiThreadedRead.numThreads', [32, 64, 128])
+    memory_limit = ('spark.rapids.sql.multiThreadedRead.memoryLimit', [
+        32 << 20,   # 32MB
+        128 << 20,  # 128MB
+        512 << 20,  # 512MB
+    ])
+    task_timeout = ('spark.rapids.sql.multiThreadedRead.taskTimeout', [0, 1000, 30 * 1000])
+
+    conf_matrix = [base_conf]
+    for conf_branch in [keep_order, reader_type, pool_size, memory_limit, task_timeout]:
+        branch_key, branch_values = conf_branch
+        updated_matrix = []
+        for conf in conf_matrix:
+            for value in branch_values:
+                conf_copy = conf.copy()
+                conf_copy[branch_key] = value
+                updated_matrix.append(conf_copy)
+        conf_matrix = updated_matrix
+
+    return conf_matrix
+
+resource_bounded_pool_conf_matrix = resource_bounded_multithreaded_reader_conf()
+
+@pytest.mark.parametrize('parquet_gens', parquet_gens_list, ids=idfn)
+@pytest.mark.parametrize('reader_confs', resource_bounded_pool_conf_matrix, ids=idfn)
+@tz_sensitive_test
+@allow_non_gpu(*non_utc_allow)
+def test_parquet_read_round_trip_multithread_flow_ctrl(spark_tmp_path, parquet_gens, reader_confs):
+    gen_list = [('_c' + str(i), gen) for i, gen in enumerate(parquet_gens)]
+    data_path = spark_tmp_path + '/PARQUET_DATA'
+    with_cpu_session(
+            lambda spark : gen_df(spark, gen_list).write.parquet(data_path),
+            conf=rebase_write_corrected_conf)
+    assert_gpu_and_cpu_are_equal_collect(read_parquet_sql(data_path), conf=reader_confs)
 
 @allow_non_gpu('FileSourceScanExec')
 @pytest.mark.parametrize('read_func', [read_parquet_df, read_parquet_sql])
