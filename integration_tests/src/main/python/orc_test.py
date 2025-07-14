@@ -23,6 +23,7 @@ from spark_init_internal import spark_version
 from spark_session import *
 from parquet_test import _nested_pruning_schemas
 from conftest import is_databricks_runtime
+from multithread_file_reader_utils import resource_bounded_multithreaded_reader_conf
 
 pytestmark = pytest.mark.nightly_resource_consuming_test
 
@@ -204,6 +205,40 @@ def test_read_round_trip(spark_tmp_path, orc_gens, read_func, reader_confs, v1_e
     assert_gpu_and_cpu_are_equal_collect(
             read_func(data_path),
             conf=all_confs)
+
+_resource_bounded_pool_conf_matrix = resource_bounded_multithreaded_reader_conf('orc')
+
+@pytest.mark.parametrize('orc_gens', orc_gens_list, ids=idfn)
+@pytest.mark.parametrize('reader_confs', _resource_bounded_pool_conf_matrix, ids=idfn)
+@tz_sensitive_test
+@allow_non_gpu(*non_utc_allow)
+def test_read_multithread_flow_ctrl_round_trip(spark_tmp_path, orc_gens, reader_confs):
+    gen_list = [('_c' + str(i), gen) for i, gen in enumerate(orc_gens)]
+    data_path = spark_tmp_path + '/ORC_DATA'
+    with_cpu_session(
+        lambda spark : gen_df(spark, gen_list).write.orc(data_path))
+    assert_gpu_and_cpu_are_equal_collect(read_orc_sql(data_path), conf=reader_confs)
+
+# Ensure that the multithreaded reader will not be blocked if the error is raised during the task
+# scheduling.
+@pytest.mark.parametrize('keep_order', [False, True], ids=idfn)
+@pytest.mark.parametrize('timeout', [0, 10, 1000, 10000], ids=idfn)
+def test_read_multithread_flow_ctrl_quick_crash(spark_tmp_path, keep_order, timeout):
+    data_path = spark_tmp_path + '/PARQUET_DATA'
+    with_cpu_session(
+        lambda spark: gen_df(spark, [('a', long_gen)]).write.orc(data_path))
+    tiny_pool_conf = {
+        'spark.rapids.sql.multiThreadedRead.stageLevelPool': 'true',
+        'spark.rapids.sql.format.orc.reader.type': 'MULTITHREADED',
+        'spark.rapids.sql.multiThreadedRead.numThreads': 64,
+        'spark.rapids.sql.multiThreadedRead.memoryLimit': 1 << 10,  # 1KB
+        'spark.rapids.sql.multiThreadedRead.taskTimeout': timeout,
+        'spark.rapids.sql.format.orc.multithreaded.read.keepOrder': keep_order,
+    }
+    fn = lambda ss: (read_orc_sql(data_path))(ss).write.parquet(data_path + '_tmpout')
+    assert_spark_exception(
+        lambda: with_gpu_session(fn, conf=tiny_pool_conf),
+        "Invalid resource request: Task requires more host memory")
 
 # Use every type except boolean, see https://github.com/NVIDIA/spark-rapids/issues/11762 and
 # https://github.com/rapidsai/cudf/issues/6763 .

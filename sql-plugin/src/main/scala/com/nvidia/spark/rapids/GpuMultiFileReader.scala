@@ -333,7 +333,7 @@ case class ResourcePoolConf(
     waitResourceTimeoutMs: Long, // The timeout for acquiring resources
     priorityPenalty: Float, // The penalty for task priority if failed to acquire resource
     maxThreadNumber: Int, // The maximum number of threads used by the thread pool
-    stageLevelPool: Boolean) // Only for testing, create pools for each task
+    stageLevelPool: Boolean = false) // Only for testing, create pools for each task
 
 object ResourcePoolConf {
   def parse(rapidsConf: RapidsConf): ResourcePoolConf = {

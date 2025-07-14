@@ -19,7 +19,6 @@ package com.nvidia.spark.rapids.io.async
 import java.util.concurrent.{BlockingQueue, Callable, Future, FutureTask, LinkedBlockingQueue, RunnableFuture, ThreadFactory, ThreadPoolExecutor, TimeUnit}
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder
-import com.nvidia.spark.rapids.RapidsConf
 
 import org.apache.spark.internal.Logging
 
@@ -28,8 +27,9 @@ class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task)
   private var priority: Float = task.priority
   private var heldResource: Boolean = false
   private var completed: Boolean = false
+  private var caughtException: Boolean = false
 
-  override def run(): Unit = {
+  override def run(): Unit = if (!caughtException) {
     require(!completed, "Task has already been completed")
     if (heldResource) {
       super.run()
@@ -54,6 +54,12 @@ class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task)
     priority
   }
 
+  override def setException(e: Throwable): Unit = {
+    caughtException = true
+    completed = true
+    super.setException(e)
+  }
+
   def isHeldResource: Boolean = heldResource
 
   def isCompleted: Boolean = completed
@@ -73,7 +79,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
     keepAliveTime: Long = 100L) extends ThreadPoolExecutor(corePoolSize,
   maximumPoolSize, keepAliveTime, TimeUnit.SECONDS, workQueue, threadFactory) with Logging {
 
-  logError(s"Creating ResourceBoundedThreadExecutor with " +
+  logWarning(s"Creating ResourceBoundedThreadExecutor with resourcePool: ${mgr.toString}, " +
     s"corePoolSize: $corePoolSize, maximumPoolSize: $maximumPoolSize, " +
     s"waitResourceTimeoutMs: $waitResourceTimeoutMs, priorityPenalty: $priorityPenalty")
 
@@ -124,8 +130,15 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
   override def beforeExecute(t: Thread, r: Runnable): Unit = {
     r match {
       case fut: RapidsFutureTask[_] =>
-        if (mgr.acquireResource(fut.task, waitResourceTimeoutMs)) {
-          fut.holdResource()
+        mgr.acquireResource(fut.task, waitResourceTimeoutMs) match {
+          case AcquireSuccessful =>
+            fut.holdResource()
+          case AcquireFailed =>
+            // bypass the execution via not holding the resource
+          case AcquireExcepted(exception) =>
+            logError(s"Invalid resource request for task ${fut.task}: ${exception.getMessage}")
+            // setException will unblock the corresponding waiting thread by failing it
+            fut.setException(exception)
         }
       case _ =>
         throw new RuntimeException(s"Unexpected runnable: ${r.getClass.getName}")

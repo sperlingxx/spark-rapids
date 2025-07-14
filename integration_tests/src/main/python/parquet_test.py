@@ -27,6 +27,7 @@ from pyspark.sql.functions import *
 from spark_init_internal import spark_version
 from spark_session import *
 from conftest import is_databricks_runtime, is_dataproc_runtime
+from multithread_file_reader_utils import resource_bounded_multithreaded_reader_conf
 
 # mark this test as ci_1 for mvn verify sanity check in pre-merge CI
 pytestmark = [pytest.mark.premerge_ci_1]
@@ -200,52 +201,45 @@ def test_parquet_read_round_trip(spark_tmp_path, parquet_gens, read_func, reader
     assert_gpu_and_cpu_are_equal_collect(read_func(data_path),
             conf=all_confs)
 
-def resource_bounded_multithreaded_reader_conf():
-    base_conf = {
-        'spark.rapids.sql.multiThreadedRead.stageLevelPool': 'true',
-        'spark.rapids.sql.format.parquet.reader.footer.type': 'NATIVE',
-        'spark.rapids.sql.reader.multithreaded.combine.sizeBytes': '0',
-        'spark.sql.sources.useV1SourceList': 'parquet',
-        # set the int96 rebase mode values because its LEGACY in databricks which will preclude this op from running on GPU
-        int96RebaseModeInReadKey : 'CORRECTED',
-        datetimeRebaseModeInReadKey : 'CORRECTED'
-    }
-    keep_order = ('spark.rapids.sql.format.parquet.multithreaded.read.keepOrder', [False, True])
-    reader_type = ('spark.rapids.sql.format.parquet.reader.type', ['MULTITHREADED', 'COALESCING'])
-    pool_size = ('spark.rapids.sql.multiThreadedRead.numThreads', [32, 64, 128])
-    memory_limit = ('spark.rapids.sql.multiThreadedRead.memoryLimit', [
-        32 << 20,   # 32MB
-        128 << 20,  # 128MB
-        512 << 20,  # 512MB
-    ])
-    task_timeout = ('spark.rapids.sql.multiThreadedRead.taskTimeout', [0, 1000, 30 * 1000])
-
-    conf_matrix = [base_conf]
-    for conf_branch in [keep_order, reader_type, pool_size, memory_limit, task_timeout]:
-        branch_key, branch_values = conf_branch
-        updated_matrix = []
-        for conf in conf_matrix:
-            for value in branch_values:
-                conf_copy = conf.copy()
-                conf_copy[branch_key] = value
-                updated_matrix.append(conf_copy)
-        conf_matrix = updated_matrix
-
-    return conf_matrix
-
-resource_bounded_pool_conf_matrix = resource_bounded_multithreaded_reader_conf()
+_resource_bounded_pool_conf_matrix = resource_bounded_multithreaded_reader_conf('parquet', {
+    # set the int96 rebase mode values because its LEGACY in databricks which will preclude this op from running on GPU
+    int96RebaseModeInReadKey : 'CORRECTED',
+    datetimeRebaseModeInReadKey : 'CORRECTED'
+})
 
 @pytest.mark.parametrize('parquet_gens', parquet_gens_list, ids=idfn)
-@pytest.mark.parametrize('reader_confs', resource_bounded_pool_conf_matrix, ids=idfn)
+@pytest.mark.parametrize('reader_confs', _resource_bounded_pool_conf_matrix, ids=idfn)
 @tz_sensitive_test
 @allow_non_gpu(*non_utc_allow)
-def test_parquet_read_round_trip_multithread_flow_ctrl(spark_tmp_path, parquet_gens, reader_confs):
+def test_parquet_read_multithread_flow_ctrl_round_trip(spark_tmp_path, parquet_gens, reader_confs):
     gen_list = [('_c' + str(i), gen) for i, gen in enumerate(parquet_gens)]
     data_path = spark_tmp_path + '/PARQUET_DATA'
     with_cpu_session(
             lambda spark : gen_df(spark, gen_list).write.parquet(data_path),
             conf=rebase_write_corrected_conf)
     assert_gpu_and_cpu_are_equal_collect(read_parquet_sql(data_path), conf=reader_confs)
+
+# Ensure that the multithreaded reader will not be blocked if the error is raised during the task
+# scheduling.
+@pytest.mark.parametrize('keep_order', [False, True], ids=idfn)
+@pytest.mark.parametrize('timeout', [0, 10, 1000, 10000], ids=idfn)
+def test_parquet_read_multithread_flow_ctrl_quick_crash(spark_tmp_path, keep_order, timeout):
+    data_path = spark_tmp_path + '/PARQUET_DATA'
+    with_cpu_session(
+            lambda spark: gen_df(spark, [('a', long_gen)]).write.parquet(data_path),
+            conf=rebase_write_corrected_conf)
+    tiny_pool_conf = {
+        'spark.rapids.sql.multiThreadedRead.stageLevelPool': 'true',
+        'spark.rapids.sql.format.parquet.reader.type': 'MULTITHREADED',
+        'spark.rapids.sql.multiThreadedRead.numThreads': 64,
+        'spark.rapids.sql.multiThreadedRead.memoryLimit': 1 << 10,  # 1KB
+        'spark.rapids.sql.multiThreadedRead.taskTimeout': timeout,
+        'spark.rapids.sql.format.parquet.multithreaded.read.keepOrder': keep_order,
+    }
+    fn = lambda ss: (read_parquet_sql(data_path))(ss).write.parquet(data_path + '_tmpout')
+    assert_spark_exception(
+            lambda: with_gpu_session(fn, conf=tiny_pool_conf),
+            "Invalid resource request: Task requires more host memory")
 
 @allow_non_gpu('FileSourceScanExec')
 @pytest.mark.parametrize('read_func', [read_parquet_df, read_parquet_sql])

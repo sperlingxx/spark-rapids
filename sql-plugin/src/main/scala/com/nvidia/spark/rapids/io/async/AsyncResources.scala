@@ -85,6 +85,18 @@ object AsyncTask {
   }
 }
 
+// Being thrown when a task requests resources that are not valid or exceed the limits
+class InvalidResourceRequest(msg: String) extends RuntimeException(
+  s"Invalid resource request: $msg")
+
+// Represents the status of acquiring resources for a task
+sealed trait AcquireStatus
+case object AcquireSuccessful extends AcquireStatus
+// AcquireFailed indicates that the task could not be scheduled due to resource constraints
+case object AcquireFailed extends AcquireStatus
+// AcquireExcepted indicates that an exception occurred while trying to acquire resources
+case class AcquireExcepted(exception: Throwable) extends AcquireStatus
+
 /**
  * ResourceManager interface to be implemented for AsyncTasks requiring different kinds of
  * resources.
@@ -97,7 +109,7 @@ trait ResourcePool {
    * Returns true if the task can be accepted, false otherwise.
    * TrafficController will block the task from being scheduled until this method returns true.
    */
-  def acquireResource[T](task: AsyncTask[T], timeout: Long): Boolean
+  def acquireResource[T](task: AsyncTask[T], timeout: Long): AcquireStatus
 
   /**
    * Callback to be called when a task is completed, either successfully or with an exception.
@@ -117,14 +129,15 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool {
   @GuardedBy("lock")
   private var remaining: Long = maxHostMemoryBytes
 
-  override def acquireResource[T](task: AsyncTask[T], timeoutMs: Long): Boolean = {
+  override def acquireResource[T](task: AsyncTask[T], timeoutMs: Long): AcquireStatus = {
     task.resource.hostMemoryBytes match {
       case 0 =>
-        true
+        AcquireSuccessful
       case required if required > maxHostMemoryBytes =>
-        throw new IllegalArgumentException(
-          s"Task requires more host memory than total size of memory pool: " +
-              s"required=$required, maxAllowed=$maxHostMemoryBytes")
+        // Call the failure callback to notify the caller about the failure
+        AcquireExcepted(
+          new InvalidResourceRequest(
+            s"Task requires more host memory($required) than pool size($maxHostMemoryBytes)"))
       case required: Long =>
         var isDone = false
         var isTimeout = false
@@ -141,10 +154,12 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool {
               isTimeout = true
             }
           }
+          if (isDone) AcquireSuccessful else AcquireFailed
+        } catch {
+          case ex: Throwable => AcquireExcepted(ex)
         } finally {
           lock.unlock()
         }
-        isDone
     }
   }
 
@@ -162,5 +177,9 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool {
         lock.unlock()
       }
     }
+  }
+
+  override def toString: String = {
+    s"HostMemoryPool(maxHostMemoryBytes=${maxHostMemoryBytes >> 20}MB)"
   }
 }
