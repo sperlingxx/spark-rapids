@@ -171,7 +171,7 @@ object ResourceBoundedThreadExecutor {
       pool: ResourcePool,
       maxThreadNumber: Int,
       waitResourceTimeoutMs: Long = 60 * 1000L,
-      priorityPenalty: Float = 10.0f): ResourceBoundedThreadExecutor = {
+      priorityPenalty: Float = 0.0f): ResourceBoundedThreadExecutor = {
     val taskQueue = new LinkedBlockingQueue[Runnable]()
     val threadFactory: ThreadFactory = new ThreadFactoryBuilder()
         .setDaemon(true)
