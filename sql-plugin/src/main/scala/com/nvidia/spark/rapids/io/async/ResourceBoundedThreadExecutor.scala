@@ -16,15 +16,14 @@
 
 package com.nvidia.spark.rapids.io.async
 
-import java.util.concurrent.{BlockingQueue, Callable, Future, FutureTask, LinkedBlockingQueue, RunnableFuture, ThreadFactory, ThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.{BlockingQueue, Callable, Future, FutureTask, PriorityBlockingQueue, RunnableFuture, ThreadFactory, ThreadPoolExecutor, TimeUnit}
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder
 
 import org.apache.spark.internal.Logging
 
-class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task)
-    with Comparable[RapidsFutureTask[T]] {
-  private var priority: Float = task.priority
+class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task) {
+  private[async] var priority: Float = task.priority
   private var heldResource: Boolean = false
   private var completed: Boolean = false
   private var caughtException: Boolean = false
@@ -63,9 +62,11 @@ class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task)
   def isHeldResource: Boolean = heldResource
 
   def isCompleted: Boolean = completed
+}
 
-  override def compareTo(o: RapidsFutureTask[T]): Int = {
-    priority.compareTo(o.priority)
+class RapidsFutureTaskComparator[T] extends java.util.Comparator[RapidsFutureTask[T]] {
+  override def compare(o1: RapidsFutureTask[T], o2: RapidsFutureTask[T]): Int = {
+    (-o1.priority).compareTo(-o2.priority)
   }
 }
 
@@ -167,12 +168,12 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
 }
 
 object ResourceBoundedThreadExecutor {
-  def apply(name: String,
+  def apply[T](name: String,
       pool: ResourcePool,
       maxThreadNumber: Int,
       waitResourceTimeoutMs: Long = 60 * 1000L,
       priorityPenalty: Float = 0.0f): ResourceBoundedThreadExecutor = {
-    val taskQueue = new LinkedBlockingQueue[Runnable]()
+    val taskQueue = new PriorityBlockingQueue(4096, new RapidsFutureTaskComparator[T])
     val threadFactory: ThreadFactory = new ThreadFactoryBuilder()
         .setDaemon(true)
         .setNameFormat(name)
@@ -183,7 +184,7 @@ object ResourceBoundedThreadExecutor {
       priorityPenalty,
       corePoolSize = maxThreadNumber,
       maximumPoolSize = maxThreadNumber,
-      workQueue = taskQueue,
+      workQueue = taskQueue.asInstanceOf[BlockingQueue[Runnable]],
       threadFactory = threadFactory)
   }
 }

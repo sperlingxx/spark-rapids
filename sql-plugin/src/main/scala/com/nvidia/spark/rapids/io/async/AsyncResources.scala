@@ -70,7 +70,7 @@ object AsyncTask {
   // lightweight tasks should have higher priority
   def hostMemoryPenalty(memoryBytes: Long, priority: Float = 0.0f): Float = {
     require(memoryBytes >= 0, s"Memory bytes must be non-negative, got: $memoryBytes")
-    priority + (Long.MaxValue - memoryBytes).toFloat / Long.MaxValue
+    priority - math.log10(memoryBytes).toFloat
   }
 
   def newCpuTask[T](fn: () => T,

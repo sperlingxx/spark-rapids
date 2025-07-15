@@ -140,9 +140,12 @@ object MultiFileReaderThreadPool extends Logging {
     logDebug(s"Using $numThreads for the multithreaded reader thread pool")
 
     val pool = new HostMemoryPool(conf.hostMemoryCapacity)
-    val threadExecutor = ResourceBoundedThreadExecutor.apply(name,
-      pool,
-      numThreads, conf.waitResourceTimeoutMs, conf.priorityPenalty)
+    val threadExecutor = ResourceBoundedThreadExecutor[HostMemoryBuffersWithMetaDataBase](
+        name,
+        pool,
+        numThreads,
+        conf.waitResourceTimeoutMs,
+        conf.priorityPenalty)
     threadExecutor.allowCoreThreadTimeOut(true)
     threadExecutor
   }
