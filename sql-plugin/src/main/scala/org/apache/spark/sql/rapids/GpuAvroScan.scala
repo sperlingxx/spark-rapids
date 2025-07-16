@@ -30,7 +30,7 @@ import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, FILTER_TIME, GPU_DECODE_TIME, NUM_OUTPUT_BATCHES, READ_FS_TIME, SCAN_TIME, WRITE_BUFFER_TIME}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
-import com.nvidia.spark.rapids.io.async.{AsyncTask, TaskResource, UnboundedAsyncTask}
+import com.nvidia.spark.rapids.io.async.{AsyncTask, UnboundedAsyncTask}
 import com.nvidia.spark.rapids.jni.RmmSpark
 import com.nvidia.spark.rapids.shims.ShimFilePartitionReaderFactory
 import org.apache.avro.Schema
@@ -724,13 +724,9 @@ class GpuMultiFileCloudAvroPartitionReader(
       taskContext: TaskContext,
       partFile: PartitionedFile,
       config: Configuration,
-      filters: Array[Filter]) extends AsyncTask[HostMemoryBuffersWithMetaDataBase] with Logging {
+      filters: Array[Filter]) extends UnboundedAsyncTask[BufferResult] with Logging {
 
-    override val resource: TaskResource = TaskResource.newCpuResource(partFile.length)
-
-    override val priority: Float = AsyncTask.hostMemoryPenalty(partFile.length)
-
-    override def call(): HostMemoryBuffersWithMetaDataBase = {
+    override def callImpl(): BufferResult = {
       TrampolineUtil.setTaskContext(taskContext)
       // Mark the async thread as a pool thread within the RetryFramework
       RmmSpark.poolThreadWorkingOnTask(taskContext.taskAttemptId())
@@ -1013,7 +1009,7 @@ class GpuMultiFileAvroPartitionReader(
 
     private val headerSync = Some(batchContext.mergedHeader.sync)
 
-    override def call(): (Seq[DataBlockBase], Long) = {
+    override def callImpl(): (Seq[DataBlockBase], Long) = {
       TrampolineUtil.setTaskContext(taskContext)
       try {
         val startBytesRead = fileSystemBytesRead()

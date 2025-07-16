@@ -37,7 +37,7 @@ import com.nvidia.spark.rapids.RapidsConf.ParquetFooterReaderType
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
 import com.nvidia.spark.rapids.filecache.FileCache
-import com.nvidia.spark.rapids.io.async.{AsyncTask, TaskResource, UnboundedAsyncTask}
+import com.nvidia.spark.rapids.io.async._
 import com.nvidia.spark.rapids.jni.{DateTimeRebase, ParquetFooter, RmmSpark}
 import com.nvidia.spark.rapids.parquet.ParquetPartitionReader.{CopyRange, LocalCopy, PARQUET_MAGIC}
 import com.nvidia.spark.rapids.shims.{ColumnDefaultValuesShims, GpuParquetCrypto, GpuTypeShims, ShimFilePartitionReaderFactory, SparkShimImpl}
@@ -1191,7 +1191,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       readDataSchema: StructType) extends UnboundedAsyncTask[Array[BlockMetaWithPartFile]]
       with Logging {
 
-    override def call(): Array[BlockMetaWithPartFile] = {
+    override def callImpl(): Array[BlockMetaWithPartFile] = {
       TrampolineUtil.setTaskContext(taskContext)
       try {
         files.map { file =>
@@ -1226,7 +1226,9 @@ case class GpuParquetMultiFilePartitionReaderFactory(
             threadPool.submit(
               new CoalescingFilterRunner(footerReadType, tc, fileGroup, new Configuration(conf),
                 filters, readDataSchema))
-          }.toArray.flatMap(_.get())
+          }.toArray.flatMap { future =>
+            future.get().result
+          }
         } else {
           // We need to copy the Hadoop Configuration because filter push down can mutate it. In
           // this case we are serially iterating through the files so each one mutating it serially
@@ -2175,7 +2177,7 @@ class MultiFileParquetPartitionReader(
       compressCfg: CpuCompressionConfig)
     extends UnboundedAsyncTask[(Seq[DataBlockBase], Long)] {
 
-    override def call(): (Seq[DataBlockBase], Long) = {
+    override def callImpl(): (Seq[DataBlockBase], Long) = {
       TrampolineUtil.setTaskContext(taskContext)
       try {
         val startBytesRead = fileSystemBytesRead()
@@ -2463,9 +2465,14 @@ class MultiFileCloudParquetPartitionReader(
         metaToUse.clippedSchema,
         metaToUse.readSchema,
         Some(combinedMeta.allPartValues))
+      // Combine the metrics from all the parts
       val filterTime = combinedMeta.toCombine.map(_.getFilterTime).sum
       val bufferTime = combinedMeta.toCombine.map(_.getBufferTime).sum
       newHmbMeta.setMetrics(filterTime, bufferTime)
+      // Combine the release callbacks from all the parts
+      combinedMeta.toCombine.foreach { hmb =>
+        hmb.combineReleaseCallbacks(newHmbMeta)
+      }
       newHmbMeta
     }
     logDebug(s"Took ${(System.currentTimeMillis() - startCombineTime)} " +
@@ -2608,6 +2615,8 @@ class MultiFileCloudParquetPartitionReader(
 
     override val priority: Float = AsyncTask.hostMemoryPenalty(file.length)
 
+    override val holdResourceAfterCompletion: Boolean = true
+
     private var blockChunkIter: BufferedIterator[BlockMetaData] = null
 
     /**
@@ -2618,7 +2627,7 @@ class MultiFileCloudParquetPartitionReader(
      *
      * Note that the TaskContext is not set in these threads and should not be used.
      */
-    override def call(): HostMemoryBuffersWithMetaDataBase = {
+    override def callImpl(): HostMemoryBuffersWithMetaDataBase = {
       TrampolineUtil.setTaskContext(taskContext)
       // Mark the async thread as a pool thread within the RetryFramework
       RmmSpark.poolThreadWorkingOnTask(taskContext.taskAttemptId())
@@ -2777,9 +2786,17 @@ class MultiFileCloudParquetPartitionReader(
     case buffer: HostMemoryBuffersWithMetaData =>
       val memBuffersAndSize = buffer.memBuffersAndSizes
       val hmbAndInfo = memBuffersAndSize.head
-      val batchIter = readBufferToBatches(buffer.dateRebaseMode,
-        buffer.timestampRebaseMode, buffer.hasInt96Timestamps, buffer.clippedSchema,
-        buffer.readSchema, buffer.partitionedFile, hmbAndInfo.hmbs, buffer.allPartValues)
+      val batchIter = try {
+        readBufferToBatches(buffer.dateRebaseMode,
+          buffer.timestampRebaseMode, buffer.hasInt96Timestamps, buffer.clippedSchema,
+          buffer.readSchema, buffer.partitionedFile, hmbAndInfo.hmbs, buffer.allPartValues)
+      } finally {
+        // Release the virtual budget of host memory back to the resource pool after all
+        // related buffers were consumed.
+        if (memBuffersAndSize.length == 1) {
+          buffer.releaseResource()
+        }
+      }
       if (memBuffersAndSize.length > 1) {
         val updatedBuffers = memBuffersAndSize.drop(1)
         currentFileHostBuffers = Some(buffer.copy(memBuffersAndSizes = updatedBuffers))

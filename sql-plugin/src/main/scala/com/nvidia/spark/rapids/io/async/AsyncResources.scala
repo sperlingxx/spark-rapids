@@ -20,6 +20,8 @@ import java.util.concurrent.{Callable, TimeUnit}
 import java.util.concurrent.locks.ReentrantLock
 import javax.annotation.concurrent.GuardedBy
 
+import org.apache.spark.internal.Logging
+
 case class TaskResource(hostMemoryBytes: Long, requireGpuSemaphore: Boolean)
 
 object TaskResource {
@@ -30,10 +32,14 @@ object TaskResource {
   def newGpuResource(): TaskResource = new TaskResource(0L, true)
 }
 
+case class AsyncResult[T](
+    result: T,
+    releaseResourceCallback: Option[() => Unit])
+
 /**
  * The AsyncTask interface represents a task that can be scheduled by Resource.
  */
-trait AsyncTask[T] extends Callable[T] {
+trait AsyncTask[T] extends Callable[AsyncResult[T]] {
   /**
    * Resource required by the task, such as host memory or GPU semaphore.
    */
@@ -43,6 +49,44 @@ trait AsyncTask[T] extends Callable[T] {
    * Priority of the task, higher value means higher priority.
    */
   def priority: Float
+
+  /**
+   * The abstract method defines the actual task logic, which should be implemented by the
+   * subclass.
+   */
+  protected def callImpl(): T
+
+  def call(): AsyncResult[T] = {
+    val result = callImpl()
+    if (holdResourceAfterCompletion) {
+      require(releaseResourceCallback != null,
+        "Release callback is not set, please set it before calling fetchReleaseCallback")
+      AsyncResult(result, Some(releaseResource))
+    } else {
+      AsyncResult(result, None)
+    }
+  }
+
+  /**
+   * Returns true if the task should release its resources after completion.
+   * This is useful for tasks that are not long-lived and can release resources
+   * immediately after they finish.
+   */
+  def holdResourceAfterCompletion: Boolean = false
+
+  /**
+   * Guarantees the release callback will NOT be called unless the task holds the resource.
+   */
+  private def releaseResource(): Unit = {
+    require(holdResource, "Task does NOT hold resource after completion")
+    require(releaseResourceCallback != null, "releaseResourceCallback is not registered")
+    releaseResourceCallback()
+    holdResource = false
+  }
+
+  private[async] var releaseResourceCallback: () => Unit = _
+
+  private[async] var holdResource = false
 }
 
 abstract class UnboundedAsyncTask[T] extends AsyncTask[T] {
@@ -62,7 +106,7 @@ class AsyncFunctor[T](
     override val resource: TaskResource,
     override val priority: Float,
     functor: () => T) extends AsyncTask[T] {
-  override def call(): T = functor()
+  override def callImpl(): T = functor()
 }
 
 object AsyncTask {
@@ -120,7 +164,7 @@ trait ResourcePool {
 /**
  * Throttle implementation that limits the total host memory used by the in-flight tasks.
  */
-class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool {
+class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Logging {
 
   private val lock = new ReentrantLock()
 
@@ -149,7 +193,10 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool {
               remaining -= required
               isDone = true
             } else if (waitTimeNs > 0) {
+              val beforeWait = waitTimeNs
               waitTimeNs = condition.awaitNanos(waitTimeNs)
+              logWarning(s"Waiting ${TimeUnit.NANOSECONDS.toMillis(beforeWait - waitTimeNs)}ms " +
+                  s"for HostMemory: required=${required >> 10}KB, remaining=${remaining >> 10}KB")
             } else {
               isTimeout = true
             }

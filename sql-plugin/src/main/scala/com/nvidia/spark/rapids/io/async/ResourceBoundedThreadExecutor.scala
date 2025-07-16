@@ -22,7 +22,7 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder
 
 import org.apache.spark.internal.Logging
 
-class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[T](task) {
+class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[AsyncResult[T]](task) {
   private[async] var priority: Float = task.priority
   private var heldResource: Boolean = false
   private var completed: Boolean = false
@@ -87,6 +87,8 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
   override def submit[T](fn: Callable[T]): Future[T] = {
     fn match {
       case task: AsyncTask[T] =>
+        //register the resource release callback
+        task.releaseResourceCallback = () => mgr.releaseResource(task)
         super.submit(task)
       case f =>
         throw new IllegalArgumentException(
@@ -110,7 +112,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
 
   override protected def newTaskFor[T](fn: Callable[T]): RunnableFuture[T] = {
     fn match {
-      case task: AsyncTask[T] =>
+      case task: AsyncTask[AsyncResult[_]] =>
         new RapidsFutureTask(task)
       case f =>
         throw new RuntimeException(s"Unexpected functor: ${f.getClass.getName}")
@@ -122,7 +124,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
       case futTask: RapidsFutureTask[_] =>
         futTask.asInstanceOf[RunnableFuture[T]]
       case task: AsyncTask[_] =>
-        new RapidsFutureTask(task.asInstanceOf[AsyncTask[T]])
+        new RapidsFutureTask(task).asInstanceOf[RunnableFuture[T]]
       case f =>
         throw new RuntimeException(s"Unexpected runnable: ${f.getClass.getName}")
     }
@@ -151,8 +153,13 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
       case fut: RapidsFutureTask[_] =>
         // Release the held resource if it was acquired.
         if (fut.isHeldResource) {
-          mgr.releaseResource(fut.task)
-          fut.releaseResource()
+          // Release intermediately if the task supports that or if an exception occurred.
+          if (!fut.task.holdResourceAfterCompletion || t != null) {
+            fut.task.releaseResourceCallback()
+            fut.releaseResource()
+          } else {
+            fut.task.holdResource = true
+          }
         }
         // If the task failed to acquire enough resource, we bypass the execution and re-add it to
         // the task queue with a priority penalty to avoid starvation.

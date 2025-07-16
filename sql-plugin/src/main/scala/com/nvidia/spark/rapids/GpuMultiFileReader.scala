@@ -32,7 +32,7 @@ import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits.{AutoCloseableArray, AutoCloseableProducingSeq}
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
-import com.nvidia.spark.rapids.io.async.{AsyncTask, BoundedCompletionService, HostMemoryPool, ResourceBoundedThreadExecutor}
+import com.nvidia.spark.rapids.io.async._
 import org.apache.commons.io.IOUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
@@ -105,6 +105,26 @@ trait HostMemoryBuffersWithMetaDataBase {
     val totalTime = _filterTime + _bufferTime
     _filterTime.toDouble / totalTime
   }
+
+  def releaseResource(): Unit = {
+    while (_releaseCallback.nonEmpty)  {
+      // Call the release callback to release the resources
+      _releaseCallback.dequeue()()
+    }
+  }
+
+  def addReleaseResourceCallback(callback: () => Unit): Unit = {
+    _releaseCallback.enqueue(callback)
+  }
+
+  def combineReleaseCallbacks(
+      other: HostMemoryBuffersWithMetaDataBase): Unit = {
+    while (_releaseCallback.nonEmpty) {
+      other._releaseCallback.enqueue(_releaseCallback.dequeue())
+    }
+  }
+
+  private val _releaseCallback: mutable.Queue[() => Unit] = mutable.Queue.empty
 }
 
 // This is a common trait for all kind of file formats
@@ -382,18 +402,21 @@ abstract class MultiFileCloudPartitionReaderBase(
     combineConf: CombineConf = CombineConf(-1, -1))
   extends FilePartitionReaderBase(conf, execMetrics) {
 
+  protected type BufferResult = HostMemoryBuffersWithMetaDataBase
+  protected type AsyncTaskResult = AsyncResult[BufferResult]
+
   private var filesToRead = 0
-  protected var currentFileHostBuffers: Option[HostMemoryBuffersWithMetaDataBase] = None
-  protected var combineLeftOverFiles: Option[Array[HostMemoryBuffersWithMetaDataBase]] = None
+  protected var currentFileHostBuffers: Option[BufferResult] = None
+  protected var combineLeftOverFiles: Option[Array[BufferResult]] = None
   private val isInit: AtomicBoolean = new AtomicBoolean(false)
-  private val tasks = new ConcurrentLinkedQueue[Future[HostMemoryBuffersWithMetaDataBase]]()
-  private val tasksToRun = new Queue[AsyncTask[HostMemoryBuffersWithMetaDataBase]]()
+  private val tasks = new ConcurrentLinkedQueue[Future[AsyncTaskResult]]()
+  private val tasksToRun = new Queue[AsyncTask[BufferResult]]()
   private[this] val inputMetrics = Option(TaskContext.get).map(_.taskMetrics().inputMetrics)
     .getOrElse(TrampolineUtil.newInputMetrics())
   // this is used when the read order doesn't matter and in that case, the tasks queue
   // above is used to track any left being processed that need to be cleaned up if we exit early
   // like in the case of a limit call and we don't read all files
-  private var fcs: CompletionService[HostMemoryBuffersWithMetaDataBase] = null
+  private var fcs: CompletionService[AsyncTaskResult] = null
 
   // If I/O eager prefetch is enabled, submit async reading tasks eagerly instead of triggering
   // async reading tasks when the first batch is requested.
@@ -524,6 +547,21 @@ abstract class MultiFileCloudPartitionReaderBase(
       numRows >= maxReadBatchSizeRows
   }
 
+  // Unwrap AsyncTaskResult to facilitate the combination of file buffers.
+  protected def convertAsyncResult(taskResult: AsyncTaskResult): BufferResult = {
+    taskResult.releaseResourceCallback.foreach { cb =>
+        taskResult.result match {
+          // If the task result is empty, call the release callback ASAP.
+          case bufWithMeta if bufWithMeta.bytesRead == 0 =>
+            cb()
+          // inject the release callback for deferred release
+          case bufWithMeta =>
+            bufWithMeta.addReleaseResourceCallback(cb)
+        }
+    }
+    taskResult.result
+  }
+
   /**
    * While there are files already read into host memory buffers, take up to
    * threshold size and append to the results ArrayBuffer.
@@ -548,7 +586,7 @@ abstract class MultiFileCloudPartitionReaderBase(
       if (hmbFuture == null) {
         if (combineConf.combineWaitTime > 0) {
           // no more are ready, wait to see if any finish within wait time
-          val hmbAndMeta = if (keepReadsInOrder) {
+          val taskResult = if (keepReadsInOrder) {
             tasks.poll().get(combineConf.combineWaitTime, TimeUnit.MILLISECONDS)
           } else {
             val fut = fcs.poll(combineConf.combineWaitTime, TimeUnit.MILLISECONDS)
@@ -559,6 +597,7 @@ abstract class MultiFileCloudPartitionReaderBase(
               fut.get()
             }
           }
+          val hmbAndMeta = convertAsyncResult(taskResult)
           if (hmbAndMeta != null) {
             results.append(hmbAndMeta)
             currSize += hmbAndMeta.memBuffersAndSizes.map(_.bytes).sum
@@ -572,9 +611,10 @@ abstract class MultiFileCloudPartitionReaderBase(
           takeMore = false
         }
       } else {
-        results.append(hmbFuture.get())
-        currSize += hmbFuture.get().memBuffersAndSizes.map(_.bytes).sum
-        currNumRows += hmbFuture.get().memBuffersAndSizes.map(_.numRows).sum
+        val hmbWithMeta = convertAsyncResult(hmbFuture.get())
+        results.append(hmbWithMeta)
+        currSize += hmbWithMeta.memBuffersAndSizes.map(_.bytes).sum
+        currNumRows += hmbWithMeta.memBuffersAndSizes.map(_.numRows).sum
         filesToRead -= 1
       }
     }
@@ -588,11 +628,11 @@ abstract class MultiFileCloudPartitionReaderBase(
     if (results.isEmpty) {
       // none were ready yet so wait as long as need for first one
       val hostBuffersWithMeta = if (keepReadsInOrder) {
-        tasks.poll().get()
+        convertAsyncResult(tasks.poll().get())
       } else {
         val bufMetaFut = fcs.take()
         tasks.remove(bufMetaFut)
-        bufMetaFut.get()
+        convertAsyncResult(bufMetaFut.get())
       }
       sizeRead += hostBuffersWithMeta.memBuffersAndSizes.map(_.bytes).sum
       numRowsRead += hostBuffersWithMeta.memBuffersAndSizes.map(_.numRows).sum
@@ -607,7 +647,7 @@ abstract class MultiFileCloudPartitionReaderBase(
   }
 
   private def getNextBuffersAndMetaSingleFile(): HostMemoryBuffersWithMetaDataBase = {
-    val hmbAndMetaInfo = if (keepReadsInOrder) {
+    val taskResult = if (keepReadsInOrder) {
       tasks.poll().get()
     } else {
       val bufMetaFut = fcs.take()
@@ -615,7 +655,7 @@ abstract class MultiFileCloudPartitionReaderBase(
       bufMetaFut.get()
     }
     filesToRead -= 1
-    hmbAndMetaInfo
+    convertAsyncResult(taskResult)
   }
 
   private def getNextBuffersAndMeta(): HostMemoryBuffersWithMetaDataBase = {
@@ -774,8 +814,12 @@ abstract class MultiFileCloudPartitionReaderBase(
     batchIter = EmptyGpuColumnarBatchIterator
     tasks.asScala.foreach { task =>
       if (task.isDone()) {
-        task.get.memBuffersAndSizes.foreach { hmbInfo =>
+        val taskResult = task.get
+        taskResult.result.memBuffersAndSizes.foreach { hmbInfo =>
           hmbInfo.hmbs.safeClose()
+        }
+        taskResult.releaseResourceCallback.foreach { cb =>
+          cb()
         }
       } else {
         // Note we are not interrupting thread here so it

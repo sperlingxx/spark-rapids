@@ -20,9 +20,9 @@ package com.nvidia.spark.rapids.io.async
 import java.util.concurrent.{Callable, CompletionService, Future, LinkedBlockingQueue, TimeUnit}
 
 class BoundedCompletionService[V](
-    executor: ResourceBoundedThreadExecutor) extends CompletionService[V] {
+    executor: ResourceBoundedThreadExecutor) extends CompletionService[AsyncResult[V]] {
 
-  private val completionQueue = new LinkedBlockingQueue[Future[V]]()
+  private val completionQueue = new LinkedBlockingQueue[Future[AsyncResult[V]]]()
 
   private class CompletionFutureTask(
       task: AsyncTask[V]) extends RapidsFutureTask[V](task) {
@@ -33,7 +33,7 @@ class BoundedCompletionService[V](
     }
   }
 
-  override def submit(task: Callable[V]): Future[V] = {
+  override def submit(task: Callable[AsyncResult[V]]): Future[AsyncResult[V]] = {
     task match {
       case asyncTask: AsyncTask[V] =>
         val futureTask = new CompletionFutureTask(asyncTask)
@@ -43,15 +43,15 @@ class BoundedCompletionService[V](
     }
   }
 
-  override def submit(task: Runnable, result: V): Future[V] = {
+  override def submit(task: Runnable, result: AsyncResult[V]): Future[AsyncResult[V]] = {
     throw new UnsupportedOperationException("Runnable tasks are not supported")
   }
 
-  override def take(): Future[V] = completionQueue.take()
+  override def take(): Future[AsyncResult[V]] = completionQueue.take()
 
-  override def poll(): Future[V] = completionQueue.poll()
+  override def poll(): Future[AsyncResult[V]] = completionQueue.poll()
 
-  override def poll(timeout: Long, unit: TimeUnit): Future[V] = {
+  override def poll(timeout: Long, unit: TimeUnit): Future[AsyncResult[V]] = {
     completionQueue.poll(timeout, unit)
   }
 }

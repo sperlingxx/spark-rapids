@@ -2061,9 +2061,11 @@ class MultiFileCloudOrcPartitionReader(
 
     override val priority: Float = AsyncTask.hostMemoryPenalty(partFile.length)
 
+    override val holdResourceAfterCompletion: Boolean = true
+
     private var blockChunkIter: BufferedIterator[OrcOutputStripe] = null
 
-    override def call(): HostMemoryBuffersWithMetaDataBase = {
+    override def callImpl(): HostMemoryBuffersWithMetaDataBase = {
       TrampolineUtil.setTaskContext(taskContext)
       // Mark the async thread as a pool thread within the RetryFramework
       RmmSpark.poolThreadWorkingOnTask(taskContext.taskAttemptId())
@@ -2239,9 +2241,17 @@ class MultiFileCloudOrcPartitionReader(
         val memBuffersAndSize = buffer.memBuffersAndSizes
         val hmbInfo = memBuffersAndSize.head
         require(hmbInfo.hmbs.length == 1)
-        val batchIter = readBufferToBatches(hmbInfo.hmbs.head, hmbInfo.bytes,
-          buffer.updatedReadSchema, buffer.requestedMapping, filterHandler.isCaseSensitive,
-          buffer.partitionedFile, buffer.allPartValues)
+        val batchIter =  try {
+          readBufferToBatches(hmbInfo.hmbs.head, hmbInfo.bytes,
+            buffer.updatedReadSchema, buffer.requestedMapping, filterHandler.isCaseSensitive,
+            buffer.partitionedFile, buffer.allPartValues)
+        } finally {
+          // Release the virtual budget of host memory back to the resource pool after all
+          // related buffers were consumed.
+          if (memBuffersAndSize.length == 1) {
+            buffer.releaseResource()
+          }
+        }
         if (memBuffersAndSize.length > 1) {
           val updatedBuffers = memBuffersAndSize.drop(1)
           currentFileHostBuffers = Some(buffer.copy(memBuffersAndSizes = updatedBuffers))
@@ -2391,9 +2401,14 @@ class MultiFileCloudOrcPartitionReader(
           val newHmbWithMeta = metaToUse.copy(
             memBuffersAndSizes = Array(combinedRet),
             allPartValues = Some(combinedMeta.allPartValues))
+          // Combine the metrics from all the parts
           val filterTime = combinedMeta.toCombine.map(_.getFilterTime).sum
           val bufferTime = combinedMeta.toCombine.map(_.getBufferTime).sum
           newHmbWithMeta.setMetrics(filterTime, bufferTime)
+          // Combine the release callbacks from all the parts
+          combinedMeta.toCombine.foreach { hmb =>
+            hmb.combineReleaseCallbacks(newHmbWithMeta)
+          }
           newHmbWithMeta
         }
       }
@@ -2630,7 +2645,7 @@ class MultiFileOrcPartitionReader(
       offset: Long)
     extends UnboundedAsyncTask[(Seq[DataBlockBase], Long)] {
 
-    override def call(): (Seq[DataBlockBase], Long) = {
+    override def callImpl(): (Seq[DataBlockBase], Long) = {
       TrampolineUtil.setTaskContext(taskContext)
       try {
         doRead()
