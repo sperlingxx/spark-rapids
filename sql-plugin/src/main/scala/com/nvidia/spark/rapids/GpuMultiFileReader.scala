@@ -363,7 +363,7 @@ object ResourcePoolConf {
     ResourcePoolConf(
       rapidsConf.multiThreadMemoryLimit,
       rapidsConf.multiThreadReadTaskTimeout,
-      -0.05f, // 0.05 seems to be a good value for priority values normalized to 1.0
+      -10000.0f, // strong penalty for tasks that fail to acquire resources in case of deadlock
       rapidsConf.multiThreadReadNumThreads,
       rapidsConf.multiThreadReadStageLevelPool)
   }
@@ -1179,7 +1179,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       blocks.foreach { case (path, block) =>
         filesAndBlocks.getOrElseUpdate(path, new ArrayBuffer[DataBlockBase]) += block
       }
-      val tasks = new java.util.ArrayList[Future[(Seq[DataBlockBase], Long)]]()
+      val tasks = new java.util.ArrayList[Future[AsyncResult[(Seq[DataBlockBase], Long)]]]()
 
       val batchContext = createBatchContext(filesAndBlocks, clippedSchema)
       // First, estimate the output file size for the initial allocating.
@@ -1207,7 +1207,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
           }
 
           for (future <- tasks.asScala) {
-            val (blocks, bytesRead) = future.get()
+            val (blocks, bytesRead) = future.get().result
             allOutputBlocks ++= blocks
             TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
           }

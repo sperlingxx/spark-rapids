@@ -17,10 +17,11 @@
 package com.nvidia.spark.rapids.io.async
 
 import java.util.concurrent.{Callable, TimeUnit}
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
-import javax.annotation.concurrent.GuardedBy
 
 import org.apache.spark.internal.Logging
+
 
 case class TaskResource(hostMemoryBytes: Long, requireGpuSemaphore: Boolean)
 
@@ -87,6 +88,8 @@ trait AsyncTask[T] extends Callable[AsyncResult[T]] {
   private[async] var releaseResourceCallback: () => Unit = _
 
   private[async] var holdResource = false
+
+  def shouldNotBeBounded: Boolean = false
 }
 
 abstract class UnboundedAsyncTask[T] extends AsyncTask[T] {
@@ -170,8 +173,9 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
 
   private val condition = lock.newCondition()
 
-  @GuardedBy("lock")
-  private var remaining: Long = maxHostMemoryBytes
+  private val remaining: AtomicLong = new AtomicLong(maxHostMemoryBytes)
+
+  private val holdingBuffers: AtomicLong = new AtomicLong(0L)
 
   override def acquireResource[T](task: AsyncTask[T], timeoutMs: Long): AcquireStatus = {
     task.resource.hostMemoryBytes match {
@@ -189,19 +193,28 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
         lock.lockInterruptibly()
         try {
           while (!isDone && !isTimeout) {
-            if (remaining >= required) {
-              remaining -= required
+            if (remaining.get() >= required) {
+              remaining.getAndAdd(-required)
               isDone = true
+            } else if (task.shouldNotBeBounded) {
+              val rem = remaining.addAndGet(-required)
+              isDone = true
+              logWarning(s"Forceful acquired ${required >> 20}MB, remaining=${rem >> 20}MB, " +
+                  s"pending tasks=${holdingBuffers.get()}")
             } else if (waitTimeNs > 0) {
-              val beforeWait = waitTimeNs
               waitTimeNs = condition.awaitNanos(waitTimeNs)
-              logWarning(s"Waiting ${TimeUnit.NANOSECONDS.toMillis(beforeWait - waitTimeNs)}ms " +
-                  s"for HostMemory: required=${required >> 10}KB, remaining=${remaining >> 10}KB")
             } else {
               isTimeout = true
+              logError(s"Failed to acquire ${required >> 20}MB, remaining=" +
+                  s"${remaining.get() >> 20}MB, pending tasks=${holdingBuffers.get()}")
             }
           }
-          if (isDone) AcquireSuccessful else AcquireFailed
+          if (isDone) {
+            holdingBuffers.incrementAndGet()
+            AcquireSuccessful
+          } else {
+            AcquireFailed
+          }
         } catch {
           case ex: Throwable => AcquireExcepted(ex)
         } finally {
@@ -211,18 +224,15 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
   }
 
   override def releaseResource[T](task: AsyncTask[T]): Unit = {
-    if (task.resource.hostMemoryBytes > 0) {
-      lock.lockInterruptibly()
-      try {
-        remaining += task.resource.hostMemoryBytes
-        require(remaining <= maxHostMemoryBytes,
-          s"Released more host memory than allowed: " +
-              s"released=${task.resource.hostMemoryBytes}, remaining=$remaining, " +
-              s"maxAllowed=$maxHostMemoryBytes")
-        condition.signalAll()
-      } finally {
-        lock.unlock()
-      }
+    val toRelease = task.resource.hostMemoryBytes
+    if (toRelease > 0) {
+      val newVal = remaining.addAndGet(toRelease)
+      val pendingTaskNum = holdingBuffers.decrementAndGet()
+      logDebug(s"Release HostMemory(${toRelease >> 20}MB), " +
+          s"remaining=${newVal >> 20}MB, pending tasks=$pendingTaskNum")
+      lock.lock()
+      condition.signalAll()
+      lock.unlock()
     }
   }
 

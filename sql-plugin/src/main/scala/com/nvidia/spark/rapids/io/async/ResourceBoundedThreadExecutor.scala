@@ -66,7 +66,13 @@ class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[AsyncResult
 
 class RapidsFutureTaskComparator[T] extends java.util.Comparator[RapidsFutureTask[T]] {
   override def compare(o1: RapidsFutureTask[T], o2: RapidsFutureTask[T]): Int = {
-    (-o1.priority).compareTo(-o2.priority)
+    if (o1.task.shouldNotBeBounded) {
+      -1
+    } else if (o2.task.shouldNotBeBounded) {
+      1
+    } else {
+      (-o1.priority).compareTo(-o2.priority)
+    }
   }
 }
 
@@ -86,7 +92,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
 
   override def submit[T](fn: Callable[T]): Future[T] = {
     fn match {
-      case task: AsyncTask[T] =>
+      case task: AsyncTask[_] =>
         //register the resource release callback
         task.releaseResourceCallback = () => mgr.releaseResource(task)
         super.submit(task)
@@ -100,6 +106,8 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
   override def submit[T](r: Runnable, result: T): Future[T] = {
     r match {
       case futTask: RapidsFutureTask[_] =>
+        //register the resource release callback
+        futTask.task.releaseResourceCallback = () => mgr.releaseResource(futTask.task)
         super.submit(futTask, null.asInstanceOf[T])
       case _ =>
         throw new UnsupportedOperationException("only accepts AsyncTask or RapidsFutureTask")
@@ -112,7 +120,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
 
   override protected def newTaskFor[T](fn: Callable[T]): RunnableFuture[T] = {
     fn match {
-      case task: AsyncTask[AsyncResult[_]] =>
+      case task: AsyncTask[_] =>
         new RapidsFutureTask(task)
       case f =>
         throw new RuntimeException(s"Unexpected functor: ${f.getClass.getName}")

@@ -17,10 +17,8 @@
 package com.nvidia.spark.rapids
 
 import java.util.concurrent.{Future => JFuture}
-
 import scala.collection.mutable
-
-import com.nvidia.spark.rapids.io.async.{AsyncTask, HostMemoryPool, ResourceBoundedThreadExecutor}
+import com.nvidia.spark.rapids.io.async.{AsyncResult, AsyncTask, HostMemoryPool, ResourceBoundedThreadExecutor}
 import org.scalatest.funsuite.AnyFunSuite
 
 class ResourceBoundedExecutorSuite extends AnyFunSuite with RmmSparkRetrySuiteBase {
@@ -88,7 +86,7 @@ class ResourceBoundedExecutorSuite extends AnyFunSuite with RmmSparkRetrySuiteBa
     // Submit order: 1, 2, 3, 4, 5, 6
     // Execution order: 1, 4, 6, 2, 5, 3
     queue.clear()
-    val futures = mutable.ArrayBuffer[JFuture[Int]]()
+    val futures = mutable.ArrayBuffer[JFuture[AsyncResult[Int]]]()
     // priority = 5 - log10(1 << 20) = -1.02
     futures += executor.submit(AsyncTask.newCpuTask(fnBuilder(1),
       memoryBytes = 1 << 20, priority = 5.0f))

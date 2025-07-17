@@ -37,7 +37,7 @@ class BoundedCompletionService[V](
     task match {
       case asyncTask: AsyncTask[V] =>
         val futureTask = new CompletionFutureTask(asyncTask)
-        executor.submit(futureTask, null.asInstanceOf[V])
+        executor.submit(futureTask, null.asInstanceOf[AsyncResult[V]])
       case _ =>
         throw new IllegalArgumentException("Task must be an instance of AsyncTask")
     }

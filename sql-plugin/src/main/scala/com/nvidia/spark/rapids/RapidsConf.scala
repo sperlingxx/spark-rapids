@@ -1112,7 +1112,7 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .internal()
       .longConf
       .checkValue(v => v >= 0, "The timeout must be greater than zero")
-      .createWithDefault(30 * 1000L) // 30 seconds
+      .createWithDefault(5 * 1000L) // 5 seconds
 
   val MULTITHREAD_READ_STAGE_LEVEL_POOL = conf("spark.rapids.sql.multiThreadedRead.stageLevelPool")
       .doc("Enable test mode for the multi-threaded read. This will create different " +
