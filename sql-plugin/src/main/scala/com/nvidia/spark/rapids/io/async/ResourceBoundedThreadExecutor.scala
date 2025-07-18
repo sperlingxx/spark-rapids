@@ -66,19 +66,13 @@ class RapidsFutureTask[T](val task: AsyncTask[T]) extends FutureTask[AsyncResult
 
 class RapidsFutureTaskComparator[T] extends java.util.Comparator[RapidsFutureTask[T]] {
   override def compare(o1: RapidsFutureTask[T], o2: RapidsFutureTask[T]): Int = {
-    if (o1.task.shouldNotBeBounded) {
-      -1
-    } else if (o2.task.shouldNotBeBounded) {
-      1
-    } else {
-      (-o1.priority).compareTo(-o2.priority)
-    }
+    (-o1.priority).compareTo(-o2.priority)
   }
 }
 
 class ResourceBoundedThreadExecutor(mgr: ResourcePool,
     waitResourceTimeoutMs: Long,
-    priorityPenalty: Float,
+    retryPriorAdjust: Float,
     corePoolSize: Int,
     maximumPoolSize: Int,
     workQueue: BlockingQueue[Runnable],
@@ -88,7 +82,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
 
   logWarning(s"Creating ResourceBoundedThreadExecutor with resourcePool: ${mgr.toString}, " +
     s"corePoolSize: $corePoolSize, maximumPoolSize: $maximumPoolSize, " +
-    s"waitResourceTimeoutMs: $waitResourceTimeoutMs, priorityPenalty: $priorityPenalty")
+    s"waitResourceTimeoutMs: $waitResourceTimeoutMs, retryPriorityAdjustment: $retryPriorAdjust")
 
   override def submit[T](fn: Callable[T]): Future[T] = {
     fn match {
@@ -172,7 +166,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
         // If the task failed to acquire enough resource, we bypass the execution and re-add it to
         // the task queue with a priority penalty to avoid starvation.
         if (t == null && !fut.isCompleted) {
-          fut.adjustPriority(-priorityPenalty)
+          fut.adjustPriority(retryPriorAdjust)
           require(workQueue.add(fut),
             s"Failed to re-add task ${fut.task} to the work queue after execution")
         }
@@ -187,8 +181,8 @@ object ResourceBoundedThreadExecutor {
       pool: ResourcePool,
       maxThreadNumber: Int,
       waitResourceTimeoutMs: Long = 60 * 1000L,
-      priorityPenalty: Float = 0.0f): ResourceBoundedThreadExecutor = {
-    val taskQueue = new PriorityBlockingQueue(4096, new RapidsFutureTaskComparator[T])
+      retryPriorityAdjust: Float = 0.0f): ResourceBoundedThreadExecutor = {
+    val taskQueue = new PriorityBlockingQueue(10000, new RapidsFutureTaskComparator[T])
     val threadFactory: ThreadFactory = new ThreadFactoryBuilder()
         .setDaemon(true)
         .setNameFormat(name)
@@ -196,7 +190,7 @@ object ResourceBoundedThreadExecutor {
 
     new ResourceBoundedThreadExecutor(pool,
       waitResourceTimeoutMs,
-      priorityPenalty,
+      retryPriorityAdjust,
       corePoolSize = maxThreadNumber,
       maximumPoolSize = maxThreadNumber,
       workQueue = taskQueue.asInstanceOf[BlockingQueue[Runnable]],

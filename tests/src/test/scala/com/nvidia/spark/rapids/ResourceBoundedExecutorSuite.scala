@@ -17,7 +17,9 @@
 package com.nvidia.spark.rapids
 
 import java.util.concurrent.{Future => JFuture}
+
 import scala.collection.mutable
+
 import com.nvidia.spark.rapids.io.async.{AsyncResult, AsyncTask, HostMemoryPool, ResourceBoundedThreadExecutor}
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -33,7 +35,7 @@ class ResourceBoundedExecutorSuite extends AnyFunSuite with RmmSparkRetrySuiteBa
       new HostMemoryPool(100L << 20),
       maxThreadNumber = 1,
       waitResourceTimeoutMs = 0,
-      priorityPenalty = 0.0f)
+      retryPriorityAdjust = 0.0f)
 
     // The queue serves as an execution order tracker for verifying priority-based task
     // scheduling behavior, which records the actual sequence of task execution.

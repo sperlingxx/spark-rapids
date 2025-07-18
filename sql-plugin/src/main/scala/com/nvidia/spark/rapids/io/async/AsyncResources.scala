@@ -17,7 +17,7 @@
 package com.nvidia.spark.rapids.io.async
 
 import java.util.concurrent.{Callable, TimeUnit}
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import java.util.concurrent.locks.ReentrantLock
 
 import org.apache.spark.internal.Logging
@@ -68,6 +68,14 @@ trait AsyncTask[T] extends Callable[AsyncResult[T]] {
     }
   }
 
+  def onAcquire(): Unit = {
+    // This method can be overridden by subclasses to perform actions when the task is acquired.
+  }
+
+  def onRelease(): Unit = {
+    // This method can be overridden by subclasses to perform actions when the task is released.
+  }
+
   /**
    * Returns true if the task should release its resources after completion.
    * This is useful for tasks that are not long-lived and can release resources
@@ -89,6 +97,9 @@ trait AsyncTask[T] extends Callable[AsyncResult[T]] {
 
   private[async] var holdResource = false
 
+  /**
+   * Indicates whether the task should not be bounded by the resource limits.
+   */
   def shouldNotBeBounded: Boolean = false
 }
 
@@ -103,6 +114,54 @@ abstract class UnboundedAsyncTask[T] extends AsyncTask[T] {
    * Unbounded tasks have the highest priority.
    */
   override val priority: Float = Float.MaxValue
+
+  override val shouldNotBeBounded: Boolean = true
+}
+
+case class GroupSharedState(groupSize: Int,
+    launchedTasks: AtomicInteger,
+    releasedTasks: AtomicInteger,
+    holdingResource: AtomicBoolean)
+
+object GroupSharedState {
+  def apply(groupSize: Int): GroupSharedState = {
+    new GroupSharedState(groupSize,
+      new AtomicInteger(0), new AtomicInteger(0), new AtomicBoolean(false))
+  }
+}
+
+abstract class GroupedAsyncTask[T] extends AsyncTask[T] {
+  /**
+   * If some tasks of the group are already launched, the task should not be bounded
+   * in case of the deadlock.
+   */
+  override def shouldNotBeBounded: Boolean = {
+    sharedState.launchedTasks.get() > 0
+  }
+
+  override def call(): AsyncResult[T] = {
+    sharedState.launchedTasks.incrementAndGet()
+    super.call()
+  }
+
+  override def onAcquire(): Unit = {
+    sharedState.holdingResource.set(true)
+  }
+
+  override def onRelease(): Unit = {
+    val numReleased = sharedState.releasedTasks.incrementAndGet()
+    if (numReleased == sharedState.groupSize) {
+      sharedState.holdingResource.set(false)
+    }
+  }
+
+  protected val sharedState: GroupSharedState
+
+  def isHoldingResource: Boolean = sharedState.holdingResource.get()
+
+  def isNoneLaunched: Boolean = sharedState.launchedTasks.get() == 0
+
+  def isAllReleased: Boolean = sharedState.groupSize == sharedState.releasedTasks.get()
 }
 
 class AsyncFunctor[T](
@@ -177,6 +236,8 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
 
   private val holdingBuffers: AtomicLong = new AtomicLong(0L)
 
+  private val holdingGroups: AtomicInteger = new AtomicInteger(0)
+
   override def acquireResource[T](task: AsyncTask[T], timeoutMs: Long): AcquireStatus = {
     task.resource.hostMemoryBytes match {
       case 0 =>
@@ -189,28 +250,39 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
       case required: Long =>
         var isDone = false
         var isTimeout = false
-        var waitTimeNs = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         lock.lockInterruptibly()
         try {
+          task match {
+            case t: GroupedAsyncTask[T] if t.isHoldingResource => isDone = true
+            case _ => // Continue to acquire resources
+          }
+          var waitTimeNs = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
           while (!isDone && !isTimeout) {
             if (remaining.get() >= required) {
               remaining.getAndAdd(-required)
               isDone = true
-            } else if (task.shouldNotBeBounded) {
+            } else if (waitTimeNs > 0) {
+              waitTimeNs = condition.awaitNanos(waitTimeNs)
+            }/* else if (task.shouldNotBeBounded) {
               val rem = remaining.addAndGet(-required)
               isDone = true
               logWarning(s"Forceful acquired ${required >> 20}MB, remaining=${rem >> 20}MB, " +
-                  s"pending tasks=${holdingBuffers.get()}")
-            } else if (waitTimeNs > 0) {
-              waitTimeNs = condition.awaitNanos(waitTimeNs)
-            } else {
+                  s"pendingTasks=${holdingBuffers.get()}, pendingGroups=${holdingGroups.get()}")
+            }*/ else {
               isTimeout = true
-              logError(s"Failed to acquire ${required >> 20}MB, remaining=" +
-                  s"${remaining.get() >> 20}MB, pending tasks=${holdingBuffers.get()}")
+              logWarning(s"Failed to acquire ${required >> 20}MB, remaining=" +
+                  s"${remaining.get() >> 20}MB, " +
+                  s"pendingTasks=${holdingBuffers.get()}, pendingGroups=${holdingGroups.get()}")
             }
           }
           if (isDone) {
             holdingBuffers.incrementAndGet()
+            task match {
+              case grouped: GroupedAsyncTask[_] if !grouped.isHoldingResource =>
+                holdingGroups.incrementAndGet()
+              case _ => // No action needed for non-grouped tasks
+            }
+            task.onAcquire()
             AcquireSuccessful
           } else {
             AcquireFailed
@@ -224,7 +296,18 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
   }
 
   override def releaseResource[T](task: AsyncTask[T]): Unit = {
-    val toRelease = task.resource.hostMemoryBytes
+    task.onRelease()
+    val toRelease = task match {
+      case grouped: GroupedAsyncTask[_] =>
+        if (!grouped.isHoldingResource) {
+          holdingGroups.decrementAndGet()
+          grouped.resource.hostMemoryBytes
+        } else {
+          0L
+        }
+      case _ =>
+        task.resource.hostMemoryBytes
+    }
     if (toRelease > 0) {
       val newVal = remaining.addAndGet(toRelease)
       val pendingTaskNum = holdingBuffers.decrementAndGet()

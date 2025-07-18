@@ -165,7 +165,7 @@ object MultiFileReaderThreadPool extends Logging {
         pool,
         numThreads,
         conf.waitResourceTimeoutMs,
-        conf.priorityPenalty)
+        conf.retryPriorityAdjust)
     threadExecutor.allowCoreThreadTimeOut(true)
     threadExecutor
   }
@@ -354,7 +354,7 @@ case class CombineConf(
 case class ResourcePoolConf(
     hostMemoryCapacity: Long, // The maximum host memory used by in-flight tasks
     waitResourceTimeoutMs: Long, // The timeout for acquiring resources
-    priorityPenalty: Float, // The penalty for task priority if failed to acquire resource
+    retryPriorityAdjust: Float, // The penalty for task priority if failed to acquire resource
     maxThreadNumber: Int, // The maximum number of threads used by the thread pool
     stageLevelPool: Boolean = false) // Only for testing, create pools for each task
 
@@ -363,7 +363,7 @@ object ResourcePoolConf {
     ResourcePoolConf(
       rapidsConf.multiThreadMemoryLimit,
       rapidsConf.multiThreadReadTaskTimeout,
-      -10000.0f, // strong penalty for tasks that fail to acquire resources in case of deadlock
+      2.0f, // The default retry priority adjust is 2.0f
       rapidsConf.multiThreadReadNumThreads,
       rapidsConf.multiThreadReadStageLevelPool)
   }
@@ -476,6 +476,25 @@ abstract class MultiFileCloudPartitionReaderBase(
     limit
   }
 
+  protected lazy val runnerSharedState: Option[GroupSharedState] = {
+    if (inputFiles.length <= maxNumFileProcessed) {
+      Some(GroupSharedState(inputFiles.length))
+    } else {
+      None
+    }
+  }
+
+  protected lazy val groupResource: Option[TaskResource] = {
+    if (inputFiles.length <= maxNumFileProcessed) {
+      val totalFileSize = inputFiles.foldLeft(0L) { (acc, file) =>
+        acc + file.length
+      }
+      Some(TaskResource.newCpuResource(totalFileSize))
+    } else {
+      None
+    }
+  }
+
   // Each format should implement combineHMBs and canUseCombine if they support combining
   def combineHMBs(
       results: Array[HostMemoryBuffersWithMetaDataBase]): HostMemoryBuffersWithMetaDataBase = {
@@ -549,6 +568,9 @@ abstract class MultiFileCloudPartitionReaderBase(
 
   // Unwrap AsyncTaskResult to facilitate the combination of file buffers.
   protected def convertAsyncResult(taskResult: AsyncTaskResult): BufferResult = {
+    if (taskResult == null) {
+      return null
+    }
     taskResult.releaseResourceCallback.foreach { cb =>
         taskResult.result match {
           // If the task result is empty, call the release callback ASAP.

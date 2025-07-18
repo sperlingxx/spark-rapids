@@ -44,7 +44,7 @@ class GpuMultiFileReaderSuite extends AnyFunSuite with RmmSparkRetrySuiteBase {
       resourceConf = ResourcePoolConf(
         hostMemoryCapacity = 1L << 20, // 1MB
         waitResourceTimeoutMs = 10 * 1000L, // 10 seconds
-        priorityPenalty = 0.0f, // no penalty
+        retryPriorityAdjust = 0.0f, // no penalty
         maxThreadNumber = 1),
       maxNumFileProcessed = 1,
       filters = Array.empty,

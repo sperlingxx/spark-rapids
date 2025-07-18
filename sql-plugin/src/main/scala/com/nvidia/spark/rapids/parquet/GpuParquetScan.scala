@@ -22,6 +22,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
 import java.nio.charset.StandardCharsets
 import java.util.{Arrays => jArrays, Collections, Locale}
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
@@ -2605,28 +2606,29 @@ class MultiFileCloudParquetPartitionReader(
       override val allPartValues: Option[Array[(Long, InternalRow)]]
   ) extends HostMemoryBuffersWithMetaDataBase
 
+  private val taskSubmitCounter: AtomicLong = new AtomicLong(0L)
+
   private class ReadBatchRunner(
       file: PartitionedFile,
       filterFunc: PartitionedFile => ParquetFileInfoWithBlockMeta,
-      taskContext: TaskContext) extends AsyncTask[HostMemoryBuffersWithMetaDataBase]
-      with Logging {
+      taskContext: TaskContext)
+      extends GroupedAsyncTask[HostMemoryBuffersWithMetaDataBase] with Logging {
 
-    override val resource: TaskResource = TaskResource.newCpuResource(file.length)
+    override val resource: TaskResource = {
+      groupResource.getOrElse(TaskResource.newCpuResource(file.length))
+    }
 
-    override val priority: Float = AsyncTask.hostMemoryPenalty(file.length)
+    override val priority: Float = if (keepReadsInOrder) {
+      AsyncTask.hostMemoryPenalty(file.length, -taskSubmitCounter.incrementAndGet())
+    } else {
+      AsyncTask.hostMemoryPenalty(file.length)
+    }
 
     override val holdResourceAfterCompletion: Boolean = true
 
-    override def shouldNotBeBounded: Boolean = {
-      if (!heldSemaphore) {
-        GpuSemaphore.getLastSemAcqAndRelTime(taskContext) match {
-          case (acqTime, _) => heldSemaphore = acqTime > 0
-        }
-      }
-      heldSemaphore
+    override protected val sharedState: GroupSharedState = {
+      runnerSharedState.getOrElse(GroupSharedState(1))
     }
-
-    @transient private var heldSemaphore: Boolean = false
 
     private var blockChunkIter: BufferedIterator[BlockMetaData] = null
 
