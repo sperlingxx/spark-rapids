@@ -22,6 +22,7 @@ import ai.rapids.cudf.{ContiguousTable, Cuda, HostMemoryBuffer, NvtxColor, NvtxR
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
+import com.nvidia.spark.rapids.io.async.HostMemoryPool
 import com.nvidia.spark.rapids.jni.kudo.KudoGpuSerializer
 
 import org.apache.spark.TaskContext
@@ -140,6 +141,12 @@ trait GpuPartitioning extends Partitioning {
       }
       closeOnExcept(hostColumns) { _ =>
         Cuda.DEFAULT_STREAM.sync()
+      }
+      // Register the host columns with the common pool so that the overhead of ShuffleWrite
+      // phase can be taken into account when enforcing the memory-bounded flow control.
+      val commonPool = HostMemoryPool.getCommonPool
+      hostColumns.foreach { cv =>
+        commonPool.registerColumnVector(cv.getBase)
       }
       hostColumns
     }
