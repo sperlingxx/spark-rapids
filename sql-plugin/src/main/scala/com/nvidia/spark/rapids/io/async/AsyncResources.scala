@@ -20,6 +20,8 @@ import java.util.concurrent.{Callable, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import java.util.concurrent.locks.ReentrantLock
 
+import ai.rapids.cudf.HostColumnVector
+
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.rapids.execution.TrampolineUtil.bytesToString
 
@@ -439,6 +441,37 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
     }
   }
 
+  /**
+   * Registers a HostColumnVector with the pool, which contributes the memory overhead of the
+   * vector to the pool watermark. The pool will track the memory usage of the vector and release
+   * the corresponding overhead when the vector is closed.
+   */
+  def registerColumnVector(vec: HostColumnVector): Unit = {
+    val totalMemoryBytes = vec.getHostMemorySize
+    val rem = remaining.addAndGet(-totalMemoryBytes)
+    logDebug(
+      s"Registering HostColumnVector with size ${bytesToString(totalMemoryBytes)}," +
+      s" Pool remaining after registration: ${bytesToString(rem)}")
+    val handler = new EventHandlerWrapper(totalMemoryBytes, Option(vec.getEventHandler))
+    vec.setEventHandler(handler)
+  }
+
+  private class EventHandlerWrapper(
+      totalMemoryBytes: Long,
+      wrapped: Option[HostColumnVector.EventHandler]) extends HostColumnVector.EventHandler {
+    override def onClosed(cv: HostColumnVector, refCount: Int): Unit = {
+      if (refCount == 0) {
+        val rem = remaining.addAndGet(totalMemoryBytes)
+        logDebug(
+          s"HostColumnVector closed, releasing memory ${bytesToString(totalMemoryBytes)}," +
+          s" Pool remaining after release: ${bytesToString(rem)}")
+      }
+      wrapped.foreach { handler =>
+        handler.onClosed(cv, refCount)
+      }
+    }
+  }
+
   override def toString: String = {
     s"HostMemoryPool(maxHostMemoryBytes=${maxHostMemoryBytes >> 20}MB)"
   }
@@ -450,4 +483,26 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
         s"Task ${task.getClass.getName} does not require HostResource, but got $r")
     }
   }
+}
+
+object HostMemoryPool {
+  def getOrCreateCommonPool(maxHostMemoryBytes: Long): HostMemoryPool = {
+    if (commonPool == null) {
+      synchronized {
+        if (commonPool == null) {
+          commonPool = new HostMemoryPool(maxHostMemoryBytes)
+        }
+      }
+    }
+    commonPool
+  }
+
+  def getCommonPool: HostMemoryPool = {
+    if (commonPool == null) {
+      throw new IllegalStateException("Common HostMemoryPool has not been initialized yet")
+    }
+    commonPool
+  }
+
+  @volatile private var commonPool: HostMemoryPool = _
 }

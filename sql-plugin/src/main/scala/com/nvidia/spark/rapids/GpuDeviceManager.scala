@@ -22,6 +22,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
 import ai.rapids.cudf._
+import com.nvidia.spark.rapids.io.async.HostMemoryPool
 import com.nvidia.spark.rapids.jni.RmmSpark
 import com.nvidia.spark.rapids.spill.SpillFramework
 
@@ -447,12 +448,15 @@ object GpuDeviceManager extends Logging {
     }
     // Host memory limits must be set after the pinned memory pool is initialized
     HostAlloc.initialize(nonPinnedLimit)
-    // Fill the MULTITHREAD_READ_MEM_LIMIT with the 90% of the total OFF_HEAP memory
-    // if it is not set already.
-    if (conf.multiThreadMemoryLimit == 0) {
-      sparkConf.set(RapidsConf.MULTITHREAD_READ_MEM_LIMIT.key,
-        (0.9 * (pinnedSize + nonPinnedLimit)).toLong.toString)
+
+    // Initialize the common HostMemoryPool mainly used for Async Runners, such as I/O
+    val poolSize = conf.multiThreadMemoryLimit match {
+      // Fill the MULTITHREAD_READ_MEM_LIMIT with the 90% of the total OFF_HEAP memory
+      // if it is not set already.
+      case limit if limit <= 0 => (0.9 * (pinnedSize + nonPinnedLimit)).toLong
+      case limit => limit
     }
+    HostMemoryPool.getOrCreateCommonPool(poolSize)
   }
 
   // visible for testing
