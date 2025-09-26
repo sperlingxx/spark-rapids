@@ -16,8 +16,6 @@
 
 package org.apache.spark.rapids.hybrid
 
-import java.util.concurrent.TimeUnit.NANOSECONDS
-
 import scala.collection.mutable
 
 import com.nvidia.spark.rapids.{GpuExec, GpuMetric, RapidsConf, TargetSize}
@@ -114,6 +112,8 @@ case class HybridFileSourceScanExec(originPlan: FileSourceScanExec
    * Note: Databricks SparkPlan has a lazy value `commonMetrics`, here use another name
    */
   private val hybridCommonMetrics: Map[String, () => GpuMetric] = Map[String, () => GpuMetric](
+    NUM_OUTPUT_ROWS -> (() => createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_OUTPUT_ROWS)),
+    NUM_OUTPUT_BATCHES -> (() => createMetric(MODERATE_LEVEL, DESCRIPTION_NUM_OUTPUT_BATCHES)),
     "HybridScanTime" -> (() => createNanoTimingMetric(MODERATE_LEVEL, "HybridScanTime")),
     "GpuAcquireTime" -> (() => createNanoTimingMetric(MODERATE_LEVEL, "GpuAcquireTime")),
   )
@@ -137,7 +137,7 @@ case class HybridFileSourceScanExec(originPlan: FileSourceScanExec
 
   override lazy val allMetrics: Map[String, GpuMetric] = {
     val mapBuilder = Map.newBuilder[String, GpuMetric]
-    mapBuilder += SCAN_TIME -> createNanoTimingMetric(ESSENTIAL_LEVEL, "TotalTime")
+    mapBuilder += SCAN_TIME -> createNanoTimingMetric(ESSENTIAL_LEVEL, DESCRIPTION_SCAN_TIME)
     // Add common embedded metrics
     hybridCommonMetrics.foreach { case (key, generator) =>
       mapBuilder += key -> generator()
@@ -162,6 +162,8 @@ case class HybridFileSourceScanExec(originPlan: FileSourceScanExec
 
   override protected def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val scanTime = gpuLongMetric(SCAN_TIME)
+    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
     inputRDD.asInstanceOf[RDD[ColumnarBatch]].mapPartitionsInternal { batches =>
       new Iterator[ColumnarBatch] {
 
@@ -173,10 +175,14 @@ case class HybridFileSourceScanExec(originPlan: FileSourceScanExec
         }
 
         override def next(): ColumnarBatch = {
-          val startNs = System.nanoTime()
-          val batch = batches.next()
-          scanTime += NANOSECONDS.toMillis(System.nanoTime() - startNs)
-          batch
+          scanTime.ns {
+            batches.next() match {
+              case cb: ColumnarBatch =>
+                numOutputRows += cb.numRows()
+                numOutputBatches += 1
+                cb
+            }
+          }
         }
       }
     }

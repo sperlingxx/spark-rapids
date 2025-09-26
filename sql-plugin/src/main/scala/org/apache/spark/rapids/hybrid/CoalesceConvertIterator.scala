@@ -46,6 +46,10 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
   private val converterMetrics = Map(
     "C2COutputSize" -> GpuMetric.unwrap(metrics("C2COutputSize")))
 
+  private var scanOutputRows = 0L
+  private var prevDeckRows = 0L
+  private var curDeckRows = 0L
+
   private def upstreamHasNext(): Boolean = {
     val startTime = System.nanoTime()
     val hasNext = cpuScanIter.hasNext
@@ -56,6 +60,7 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
   private def upstreamNext(): ColumnarBatch = {
     val startTime = System.nanoTime()
     val batch = cpuScanIter.next()
+    scanOutputRows += batch.numRows()
     metrics("HybridScanTime") += System.nanoTime() - startTime
     batch
   }
@@ -108,7 +113,8 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
     // Keeps consuming input batches of cpuScanIter until targetVectors reaches `targetBatchSize`
     // or cpuScanIter being exhausted.
     while (true) {
-      val needFlush = if (upstreamHasNext()) {
+      var needFlush = false
+      if (upstreamHasNext()) {
         metrics("CpuReaderBatches") += 1
         // The only condition leading to a nonEmpty deck is targetVectors are unset after
         // the previous flushing
@@ -118,11 +124,15 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
         // tryAppendBatch, if failed which indicates the remaining space of targetVectors is NOT
         // enough the current input batch, then the batch will be placed on the deck and trigger
         // the flush of working targetVectors
-        !converterImpl.tryAppendBatch(upstreamNext())
+        val scanOutBatch = upstreamNext()
+        if (!converterImpl.tryAppendBatch(scanOutBatch)) {
+          curDeckRows = scanOutBatch.numRows() // the batch left on the deck
+          needFlush = true
+        }
       } else {
         // If cpuScanIter is exhausted, then flushes targetVectors as the last output item.
         srcExhausted = true
-        true
+        needFlush = true
       }
       if (needFlush) {
         metrics("CoalescedBatches") += 1
@@ -133,11 +143,36 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
         if (converterImpl.isDeckFilled) {
           converterImpl.setupTargetVectors()
         }
-        return rapidsHostBatch
+        // break the while loop
+        return checkOutput(rapidsHostBatch)
       }
     }
 
     throw new RuntimeException("should NOT reach this line")
+  }
+
+  // Check the row count for each batch, to detect potential bugs as early as possible.
+  private def checkOutput(columns: Array[RapidsHostColumn]): Array[RapidsHostColumn] = {
+    require(columns.length == schema.length)
+    // The output batch contains the remaining data of previous batch on the deck, but does not
+    // include the data newly placed on the deck.
+    val expect = prevDeckRows + scanOutputRows - curDeckRows
+    columns.indices.foreach { i =>
+      val rowCnt = columns(i).vector.getRowCount
+      if (rowCnt != expect) {
+        throw new IllegalStateException(
+          s"[Field($i) ${schema(i)}] rowCount $rowCnt mismatches the expected value $expect! " +
+              s"[prevDeckRows: $prevDeckRows, curDeckRows: $curDeckRows, " +
+              s"scanOutputRows: $scanOutputRows), " +
+              s"InputBatches: ${metrics("CpuReaderBatches").value}, " +
+              s"OutputBatches: ${metrics("CoalescedBatches").value}]")
+      }
+    }
+    // Reset the counters for next output batch
+    prevDeckRows = curDeckRows
+    curDeckRows = 0L
+    scanOutputRows = 0L
+    columns
   }
 }
 
