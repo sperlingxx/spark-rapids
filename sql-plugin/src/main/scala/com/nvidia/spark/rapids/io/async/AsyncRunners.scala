@@ -23,9 +23,13 @@ import java.util.function.LongUnaryOperator
 
 import scala.collection.mutable
 
+import ai.rapids.cudf.{HostMemoryAllocator, HostMemoryBuffer, MemoryBuffer}
+import com.nvidia.spark.rapids.HostAlloc
+import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
 import com.nvidia.spark.rapids.jni.TaskPriority
 
 import org.apache.spark.TaskContext
+import org.apache.spark.sql.rapids.execution.TrampolineUtil.bytesToString
 
 /**
  * Marker trait for resources required by AsyncRunners.
@@ -35,7 +39,7 @@ sealed trait AsyncRunResource
 /**
  * HostResource represents host memory resource requirement for CPU-bound tasks.
  */
-case class HostResource(hostMemoryBytes: Long) extends AsyncRunResource
+case class HostResource(sizeInBytes: Long) extends AsyncRunResource
 
 /**
  * DeviceResource is a marker object for GPU resources, no additional fields needed.
@@ -63,16 +67,16 @@ trait AsyncResult[T] extends AutoCloseable {
   val metrics: AsyncMetrics
 
   /**
-   * Indicates whether the result holds a release hook to be executed upon closure.
+   * Indicates whether the result holds a post-run close hook to extend resource lifecycle.
    */
-  val releaseHook: Option[() => Unit] = None
+  val closeHook: Option[() => Unit] = None
 
   /**
    * Trigger release hook if it exists. Do not try to close the data itself, because
    * the lifecycle of the data is managed by the caller.
    */
   override def close(): Unit = {
-    releaseHook.foreach(callback => callback())
+    closeHook.foreach(callback => callback())
   }
 }
 
@@ -116,7 +120,7 @@ class FastReleaseResult[T](override val data: T,
 class DecayReleaseResult[T](override val data: T,
     override val metrics: AsyncMetrics,
     releaseCallback: () => Unit) extends AsyncResult[T] {
-  override val releaseHook: Option[() => Unit] = Some(releaseCallback)
+  override val closeHook: Option[() => Unit] = Some(releaseCallback)
 }
 
 /**
@@ -164,7 +168,7 @@ case object Cancelled extends AsyncRunnerState
  *   explicitly invokes the release callback. This is useful for runners that need to retain
  *   resources for a certain period after execution.
  */
-trait AsyncRunner[T] extends Callable[AsyncResult[T]] {
+trait AsyncRunner[T] extends Callable[AsyncResult[T]] with AutoCloseable {
   /**
    * Resource required by the runner, such as host memory or GPU semaphore.
    */
@@ -174,6 +178,15 @@ trait AsyncRunner[T] extends Callable[AsyncResult[T]] {
    * Priority of the async runner, higher value means higher priority.
    */
   def priority: Long
+
+  /**
+   * Optional method which attempts to free up resources that have finished being used.
+   * This method is for recycling resources piece by piece, as soon as the piece ends its usage.
+   * In addition, it is a [mutable] operation, the returned resource should be deducted from the
+   * current resource requirement of the runner. If no resources can be freed at the moment,
+   * return None.
+   */
+  protected[async] def tryFree: Option[AsyncRunResource] = None
 
   /**
    * The abstract method defines the actual execution logic, which should be implemented by the
@@ -187,6 +200,25 @@ trait AsyncRunner[T] extends Callable[AsyncResult[T]] {
    * format to carry additional metadata or state.
    */
   protected def buildResult(resultData: T, metrics: AsyncMetrics): AsyncResult[T]
+
+  // Close method of AsyncRunner should be idempotent
+  override def close(): Unit = {
+    // poolPtr is set when the resource is acquired, and cleared when the runner is closed.
+    // Here inquiry the state of this runner through checking poolPtr.
+    if (poolPtr != null) {
+      withStateLock { rr =>
+        rr.getState match {
+          case Cancelled | Closed(_) | Completed | ExecFailed(_) =>
+            // terminated states, safe to close
+          case Running => throw new IllegalStateException( // unsafe to close on the fly
+            s"$this is still running, please call cancel() instead of close()")
+          case _ =>
+            throw new IllegalStateException(s"should NOT reach here $this")
+        }
+        Option(poolPtr).foreach { _.finishUpRunner(this) }
+      }
+    }
+  }
 
   def call(): AsyncResult[T] = {
     require(result.isEmpty, s"AsyncRunner.call() should only be called once: $this")
@@ -217,18 +249,17 @@ trait AsyncRunner[T] extends Callable[AsyncResult[T]] {
    * This method is called when the required resource has been just acquired from pool.
    * It can be overridden by subclasses to perform actions right after the acquisition.
    */
-  def onAcquire(): Unit = {
-    require(!holdResource, "The resource has already been acquired")
-    holdResource = true
+  protected[async] def onStart(pool: ResourcePool): Unit = {
+    require(Option(poolPtr).isEmpty, "The resource has already been acquired")
+    poolPtr = pool
   }
 
   /**
-   * This method is called when the acquired resource has been just released back into pool.
-   * It can be overridden by subclasses to perform actions right after the release.
+   * This method is called when the runner is being closed and its acquired resource is about to be
+   * released back into the pool. It can be overridden by subclasses to perform cleanup actions.
    */
-  def onRelease(): Unit = {
-    require(holdResource, "The resource has already been released")
-    holdResource = false
+  protected[async] def onClose(): Unit = {
+    poolPtr = null
   }
 
   // Cache the result for 2 purposes:
@@ -236,8 +267,6 @@ trait AsyncRunner[T] extends Callable[AsyncResult[T]] {
   // 2. Facilitate accessing the status of AsyncRunner inside ThreadExecutor after execution,
   //    specifically, to help with handling resource release in `RapidsFutureTask.releaseResource`.
   private[async] var result: Option[AsyncResult[T]] = None
-
-  protected[async] var releaseResourceCallback: () => Unit = () => {}
 
   private[async] lazy val metricsBuilder = new AsyncMetricsBuilder
 
@@ -248,26 +277,32 @@ trait AsyncRunner[T] extends Callable[AsyncResult[T]] {
    */
   def sparkTaskContext: Option[TaskContext] = None
 
-  // Label to indicate whether the runner is currently holding the resource.
-  def isHoldingResource: Boolean = holdResource
-
-  @volatile private var holdResource = false
+  // Pointer to the resource pool from which the resource is acquired.
+  @volatile protected var poolPtr: ResourcePool = _
 
   /**
    * Get the current state of the AsyncRunner, nonblocking method.
    */
-  def getState: AsyncRunnerState = state
+  private[async] def getState: AsyncRunnerState = state
 
   /**
    * Set the state of the AsyncRunner, blocking method.
+   * The state transition is only recommended to be done inside ResourcePool, in order to
+   * maintain the consistency between the state and resource allocation.
    */
-  def setState(newState: AsyncRunnerState): Unit = {
+  private[async] def setState(newState: AsyncRunnerState): Unit = {
     if (stateLock.isHeldByCurrentThread) {
-      state = newState
+      setStateInternal(newState)
     } else {
       withStateLock { _ =>
-        state = newState
+        setStateInternal(newState)
       }
+    }
+  }
+
+  private def setStateInternal(newState: AsyncRunnerState): Unit = {
+    if (newState != state) {
+      state = newState
     }
   }
 
@@ -307,7 +342,7 @@ trait AsyncRunner[T] extends Callable[AsyncResult[T]] {
  */
 abstract class UnboundedAsyncRunner[T] extends AsyncRunner[T] {
   // Unbounded tasks do not have a resource limit.
-  override val resource: AsyncRunResource = AsyncRunResource.newCpuResource(0L)
+  override val resource: AsyncRunResource = HostResource(0L)
 
   // Unbounded tasks have the highest priority.
   override val priority: Long = Long.MaxValue
@@ -327,14 +362,34 @@ abstract class UnboundedAsyncRunner[T] extends AsyncRunner[T] {
  * which makes runners from the same Spark task to be scheduled one after another. It is important
  * to avoid starvation of runners of the same Spark task which might depend on each other.
  */
-abstract class MemoryBoundedAsyncRunner[T] extends AsyncRunner[T] {
+abstract class MemoryBoundedAsyncRunner[T] extends AsyncRunner[T] with HostMemoryAllocator {
   // The memory requirement in bytes for the memory-bound runner.
   val requiredMemoryBytes: Long
 
+  // The base memory allocator from which the runner actually allocates memory.
+  val baseMemoryAllocator: HostMemoryAllocator
+
   final override def resource: AsyncRunResource = {
-    require(requiredMemoryBytes > 0,
-      "MemoryBoundedAsyncRunner should require an actual memory budget")
-    AsyncRunResource.newCpuResource(requiredMemoryBytes)
+    if (currentResource == null) {
+      require(requiredMemoryBytes > 0, s"requiredMemoryBytes($requiredMemoryBytes) should > 0")
+      currentResource = HostResource(requiredMemoryBytes)
+    }
+    currentResource
+  }
+
+  override protected[async] def tryFree: Option[AsyncRunResource] = {
+    require(isHoldingStateLock, s"The caller must hold the state lock: $this")
+
+    freeableMem match {
+      case 0 =>
+        None
+      case value if value < 0 =>
+        throw new RuntimeException(s"freeableMem($freeableMem) should never be negative: $this")
+      case value =>
+        freeableMem = 0L
+        currentResource = HostResource(currentResource.sizeInBytes - value)
+        Some(HostResource(value))
+    }
   }
 
   override def priority: Long = {
@@ -343,6 +398,93 @@ abstract class MemoryBoundedAsyncRunner[T] extends AsyncRunner[T] {
       case None => 0L
     }
   }
+
+  // AsyncRunner.close() operates on the virtual memory, while MemoryBoundedAsyncRunner is backed
+  // by actual host memory allocations, so super.close() cannot be called until all host buffers
+  // are actually closed.
+  // Also, we cannot close host buffers explicitly here as this would cause double-free errors,
+  // so we have no choice but waiting for all allocated buffers being closed.
+  override def close(): Unit = {
+    // wait until all allocated host memory buffers are actually closed
+    memAllocLock.lockInterruptibly()
+    try {
+      val localCapacity = currentResource.sizeInBytes - freeableMem
+      while (localPool < localCapacity) {
+        memAllocCond.await()
+      }
+    } finally {
+      memAllocLock.unlock()
+    }
+    // do the actual close operation
+    super.close()
+  }
+
+  override protected[async] def onStart(pool: ResourcePool): Unit = {
+    super.onStart(pool)
+    // Initialize the local memory pool when the resource is acquired
+    freeableMem = 0L
+    localPool = currentResource.sizeInBytes
+  }
+
+  override def allocate(size: Long, preferPinned: Boolean): HostMemoryBuffer = {
+    withRetryNoSplit[HostMemoryBuffer] {
+      // First check and update the local memory pool
+      memAllocLock.lockInterruptibly()
+      try {
+        if (localPool < size) {
+          // TODO: support borrowing memory from other runners
+          throw new OutOfMemoryError("Try to allocate excessive memory: " +
+              s"${bytesToString(size)} > ${bytesToString(localPool)} [$this]")
+        } else {
+          localPool -= size
+        }
+      } finally {
+        memAllocLock.unlock()
+      }
+      // Call the base allocator to allocate the actual buffer
+      val buf = baseMemoryAllocator.allocate(size, preferPinned)
+      // Register a close handler to return the memory back either to the local or global pool
+      HostAlloc.addEventHandler(buf, new OnCloseHandler(size))
+      buf
+    }
+  }
+
+  override def allocate(size: Long): HostMemoryBuffer = {
+    allocate(size, preferPinned = true)
+  }
+
+  private class OnCloseHandler(bufferSize: Long) extends MemoryBuffer.EventHandler {
+
+    def onClosed(refCount: Int): Unit = if (refCount == 0) {
+      // Return the memory back to the local pool if the runner is still running,
+      // otherwise return it back to the ResourcePool.
+      withStateLock[Unit] { rr =>
+        rr.getState match {
+          case Running =>
+            memAllocLock.lockInterruptibly()
+            try {
+              localPool += bufferSize
+              memAllocCond.signal()
+            } finally {
+              memAllocLock.unlock()
+            }
+          case _ =>
+            freeableMem += bufferSize
+            poolPtr.release(rr, forcefully = false)
+        }
+      }
+    }
+  }
+
+  private var currentResource: HostResource = _ // could be reduced by `tryFree` gradually
+
+  private var freeableMem: Long = _ // memory that can be freed from the current resource
+
+
+  private var localPool: Long = _ // remaining memory which is available for allocation
+
+  private val memAllocLock = new ReentrantLock()
+  private val memAllocCond = memAllocLock.newCondition()
 }
 
 /**

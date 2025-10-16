@@ -683,7 +683,7 @@ abstract class MultiFileCloudPartitionReaderBase(
 
   // Unwrap RunnerResult to facilitate the combination of file buffers.
   private def convertAsyncResult(taskRet: RunnerResult): BufferInfo = {
-    taskRet.releaseHook.foreach { callback =>
+    taskRet.closeHook.foreach { callback =>
       taskRet.data match {
         // If the task result is empty, call the release callback ASAP.
         case bufWithMeta if bufWithMeta.bytesRead == 0 =>

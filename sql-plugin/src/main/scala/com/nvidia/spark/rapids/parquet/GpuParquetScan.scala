@@ -1780,7 +1780,8 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       blocks: Seq[BlockMetaData],
       realStartOffset: Long,
       metrics: Map[String, GpuMetric],
-      compressCfg: CpuCompressionConfig): Seq[BlockMetaData] = {
+      compressCfg: CpuCompressionConfig,
+      allocator: HostMemoryAllocator): Seq[BlockMetaData] = {
     val outStartPos = out.getPos
     val writeTime = metrics.getOrElse(WRITE_BUFFER_TIME, NoopMetric)
     withResource(new BufferedFileInput(fileIO, filePath, blocks, metrics)) { in =>
@@ -1990,26 +1991,26 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
   protected def readPartFile(
       blocks: Seq[BlockMetaData],
       clippedSchema: MessageType,
-      filePath: Path): (SpillableHostBuffer, Seq[BlockMetaData]) = {
+      filePath: Path,
+      customAllocator: Option[HostMemoryAllocator] = None
+  ): (SpillableHostBuffer, Seq[BlockMetaData]) = {
+    val allocator = customAllocator.getOrElse(DefaultHostMemoryAllocator.get())
     withResource(new NvtxRange("Parquet buffer file split", NvtxColor.YELLOW)) { _ =>
-      // Track the actual read buffer size, since some columns or partitions may be pruned
-      execMetrics.get("readBufferSize").foreach { metric =>
-        blocks.foreach { block =>
-          block.getColumns.asScala.foreach { column =>
-            metric += column.getTotalSize
-          }
-        }
+      val estTotalSize = {
+        val sz = calculateParquetOutputSize(blocks, clippedSchema)
+        // Track the actual read buffer size, since some columns or partitions may be pruned
+        execMetrics.get("readBufferSize").foreach(_ += sz)
+        sz
       }
-
-      val estTotalSize = calculateParquetOutputSize(blocks, clippedSchema)
       val outHostBuf = withRetryNoSplit[HostMemoryBuffer] {
-        HostMemoryBuffer.allocate(estTotalSize)
+        allocator.allocate(estTotalSize)
       }
       closeOnExcept(outHostBuf) { hmb =>
         val out = new HostMemoryOutputStream(hmb)
         out.write(ParquetPartitionReader.PARQUET_MAGIC)
         val outputBlocks = if (compressCfg.decompressAnyCpu) {
-          copyAndUncompressBlocksData(filePath, out, blocks, out.getPos, metrics, compressCfg)
+          copyAndUncompressBlocksData(filePath,
+            out, blocks, out.getPos, metrics, compressCfg, allocator)
         } else {
           copyBlocksData(filePath, out, blocks, out.getPos, metrics)
         }
@@ -2266,7 +2267,8 @@ class MultiFileParquetPartitionReader(
         val outputBlocks = withResource(outhmb) { _ =>
           withResource(new HostMemoryOutputStream(outhmb)) { out =>
             if (compressCfg.decompressAnyCpu) {
-              copyAndUncompressBlocksData(file, out, blocks.toSeq, offset, metrics, compressCfg)
+              copyAndUncompressBlocksData(file, out, blocks.toSeq, offset, metrics, compressCfg,
+                DefaultHostMemoryAllocator.get())
             } else {
               copyBlocksData(file, out, blocks.toSeq, offset, metrics)
             }
@@ -2522,8 +2524,8 @@ class MultiFileCloudParquetPartitionReader(
             }
             val sliceOffset = if (buffers.isEmpty) 0 else PARQUET_MAGIC.size
             require(hmbInfo.hmbs.length == 1)
-            buffers += SpillableHostBuffer.sliceWithRetry(hmbInfo.hmbs.head, sliceOffset,
-              bytesToSlice)
+            buffers += SpillableHostBuffer.sliceAndCloseWithRetry(hmbInfo.hmbs.head,
+              sliceOffset, bytesToSlice)
           }
           val outputBlocks = computeBlockMetaData(hmbInfo.blockMeta, offset)
           allOutputBlocks ++= outputBlocks
@@ -2716,18 +2718,13 @@ class MultiFileCloudParquetPartitionReader(
     // before reading, so we just use the raw size as the resource requirement.
     override val requiredMemoryBytes: Long = file.length
 
+    override val baseMemoryAllocator: HostMemoryAllocator = DefaultHostMemoryAllocator.get()
+
     // BufferInfo will not be closed until it is transferred onto device side. So, builds
     // DecayReleaseResult with a release callback rather than FastReleaseResult.
     override protected def buildResult(resultData: BufferInfo,
         metrics: AsyncMetrics): RunnerResult = {
-      val releaseCallback: () => Unit = () => {
-        if (this.isHoldingResource) {
-          this.withStateLock { _ =>
-            this.releaseResourceCallback()
-          }
-        }
-      }
-      new DecayReleaseResult[BufferInfo](resultData, metrics, releaseCallback)
+      new DecayReleaseResult[BufferInfo](resultData, metrics, () => this.close())
     }
 
     private var blockChunkIter: BufferedIterator[BlockMetaData] = null
