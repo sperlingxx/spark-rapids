@@ -2570,10 +2570,6 @@ class MultiFileCloudParquetPartitionReader(
       newHmbMeta.setExecutionTime(filterTime, bufferTime)
       val scheduleTime = combinedMeta.toCombine.map(_.getScheduleTime).sum
       newHmbMeta.setScheduleTime(scheduleTime)
-      // Combine the release callbacks from all the parts
-      combinedMeta.toCombine.foreach { hmb =>
-        hmb.combineReleaseCallbacks(newHmbMeta)
-      }
       newHmbMeta
     }
     logDebug(s"Took ${(System.currentTimeMillis() - startCombineTime)} " +
@@ -2896,22 +2892,12 @@ class MultiFileCloudParquetPartitionReader(
     case buffer: HostMemoryBuffersWithMetaData =>
       val memBuffersAndSize = buffer.memBuffersAndSizes
       val hmbAndInfo = memBuffersAndSize.head
-      val batchIter = try {
-        readBufferToBatches(buffer.dateRebaseMode,
-          buffer.timestampRebaseMode, buffer.hasInt96Timestamps, buffer.clippedSchema,
-          buffer.readSchema, buffer.partitionedFile, hmbAndInfo.hmbs, buffer.allPartValues)
-      } finally {
-        // If there are more buffers, we will release the resource after reading all batches,
-        // in case of releasing the resource too early.
-        if (memBuffersAndSize.length == 1) {
-          // Release the virtual budget as closing the entire structure
-          buffer.close()
-        }
-      }
+      val batchIter = readBufferToBatches(buffer.dateRebaseMode,
+        buffer.timestampRebaseMode, buffer.hasInt96Timestamps, buffer.clippedSchema,
+        buffer.readSchema, buffer.partitionedFile, hmbAndInfo.hmbs, buffer.allPartValues)
       if (memBuffersAndSize.length > 1) {
         val updatedBuffers = memBuffersAndSize.drop(1)
         currentFileHostBuffers = Some(buffer.copy(memBuffersAndSizes = updatedBuffers))
-        buffer.combineReleaseCallbacks(currentFileHostBuffers.get)
       } else {
         currentFileHostBuffers = None
       }

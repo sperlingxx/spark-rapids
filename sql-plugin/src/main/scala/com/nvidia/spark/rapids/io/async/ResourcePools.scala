@@ -62,7 +62,13 @@ trait ResourcePool {
    */
   def finishUpRunner[T](runner: AsyncRunner[T]): Unit
 
-
+  /**
+   * Release resources held by the runner. If forcefully is true, release all resources regardless
+   * of what the runner actually holds. Otherwise, only release what the runner can free.
+   *
+   * NOTE: Although this method is NOT responsible for closing, it is recommended to close the
+   * runner if it is no longer holding any resources after the release, such as HostMemoryPool.
+   */
   def release[T](runner: AsyncRunner[T], forcefully: Boolean): Unit
 }
 
@@ -248,11 +254,12 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
     s"HostMemoryPool(maxHostMemoryBytes=${bytesToString(maxHostMemoryBytes)})"
   }
 
-  private def extractResource(task: AsyncRunner[_]): HostResource = {
-    task.resource match {
+  private def extractResource(rr: AsyncRunner[_]): HostResource = {
+    require(rr.isHoldingStateLock, s"The caller must hold the state lock: $this")
+    rr.resource match {
       case r: HostResource => r
-      case r => throw new InvalidResourceRequest(
-        s"Task ${task.getClass.getName} does not require HostResource, but got $r")
+      case r => throw new IllegalStateException(
+        s"Unexpected resource type ${r.getClass} in $this")
     }
   }
 }

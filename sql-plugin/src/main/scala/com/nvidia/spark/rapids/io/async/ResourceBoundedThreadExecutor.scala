@@ -51,7 +51,7 @@ class RapidsFutureTask[T](val runner: AsyncRunner[T])
         // quietly by FutureTask and recorded internally by `setException`.
         // Note: `super.isDone` is also true even if the task finished unsuccessfully. Therefore,
         // we need to check `rr.result` as well to determine if the task completed successfully
-        if (rr.result.nonEmpty && super.isDone) {
+        if (rr.result != null && super.isDone) {
           // runner.call has completed successfully
           rr.setState(Completed)
         } else if (runner.getState.isInstanceOf[ExecFailed]) {
@@ -252,7 +252,14 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
 
   override def afterExecute(r: Runnable, t: Throwable): Unit = {
     val futTask = parseFutureTask(r)
-
+    // Skip post-execution handling if the runner has already started closing.
+    // This is an optimization to avoid unnecessary blocking: the current thread
+    // would block waiting for the runner's state lock while the runner itself
+    // is blocked on a blocking OnClose callback (e.g., MemoryBoundedAsyncRunner.onClose)
+    if (!futTask.runner.tryToStartClose) {
+      return
+    }
+    // Post execution state handling
     futTask.runner.withStateLock { rr =>
       // Throw the unexpected exception if exists, since the FutureTask should have caught
       // and recorded the exception internally.
@@ -268,7 +275,6 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
         logError(s"Uncaught exception from $futTask: ${t.getMessage}", t)
       }
 
-      // Post execution state handling
       rr.getState match {
         case Cancelled | // very rare case: cancelled between execution and afterExecute
              ExecFailed(_) => // failed execution (ScheduleFailed should be cast to ExecFailed)
@@ -277,7 +283,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
 
         case Completed => // successful execution
           // release holding resource eagerly if the output does not hold the resource
-          rr.result match {
+          Option(rr.result) match {
             case None => // Fatal error
               throw new IllegalStateException(s"In Completed State but NO Result: $rr")
             case Some(_: FastReleaseResult[_]) => // eager release
