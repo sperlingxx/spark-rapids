@@ -2797,7 +2797,8 @@ class MultiFileCloudParquetPartitionReader(
                 val blocksToRead = populateCurrentBlockChunk(blockChunkIter,
                   maxReadBatchSizeRows, maxReadBatchSizeBytes, fileBlockMeta.readSchema)
                 val (dataBuffer, blockMeta) =
-                  readPartFile(blocksToRead, fileBlockMeta.schema, filePath)
+                  readPartFile(blocksToRead, fileBlockMeta.schema, filePath,
+                    customAllocator = Some(this))
                 val numRows = blocksToRead.map(_.getRowCount).sum.toInt
                 hostBuffers += SingleHMBAndMeta(Array(dataBuffer), dataBuffer.length,
                   numRows, blockMeta)

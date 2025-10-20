@@ -174,20 +174,21 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
   }
 
   override def release[T](rr: AsyncRunner[T], forcefully: Boolean): Unit = {
-    val freeAmount: Long = if (forcefully) {
-      extractResource(rr).sizeInBytes
-    } else {
-      rr.tryFree.map(_.asInstanceOf[HostResource].sizeInBytes).getOrElse(0L)
-    }
+    val freeAmount = rr.tryFree(forcefully).map {
+      _.asInstanceOf[HostResource].sizeInBytes
+    }.getOrElse(0L)
 
     if (freeAmount > 0L) {
       lock.lockInterruptibly()
       val canBeClosed: Boolean = try {
         // Return the budget and wake up waiters
         remaining += freeAmount
+        logDebug(s"Released ${bytesToString(freeAmount)}, remaining=" +
+            s"${bytesToString(remaining)}, AsyncRunners=$numRunnerInPool, " +
+            s"SparkTasks=${tasksInPool.size}")
         condition.signalAll()
         // Check if current runner can be closed
-        rr.getState != Running && extractResource(rr).sizeInBytes == 0L
+        rr.getState != Running && extractResource(rr).sizeInBytes == 0
       } finally {
         lock.unlock()
       }
@@ -226,6 +227,8 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
     runner.sparkTaskContext.foreach { ctx =>
       unregisterRunner(ctx)
     }
+    logInfo(s"Closed $runner, remaining=${bytesToString(remaining)}, " +
+        s"AsyncRunners=$numRunnerInPool, SparkTasks=${tasksInPool.size}")
   }
 
   private def registerRunner(ctx: TaskContext): Unit = {

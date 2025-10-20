@@ -256,7 +256,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
     // This is an optimization to avoid unnecessary blocking: the current thread
     // would block waiting for the runner's state lock while the runner itself
     // is blocked on a blocking OnClose callback (e.g., MemoryBoundedAsyncRunner.onClose)
-    if (!futTask.runner.tryToStartClose) {
+    if (futTask.runner.closeStarted.get()) {
       return
     }
     // Post execution state handling
@@ -288,7 +288,8 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
               throw new IllegalStateException(s"In Completed State but NO Result: $rr")
             case Some(_: FastReleaseResult[_]) => // eager release
               rr.close()
-            case _ =>
+            case _ => // try to release free resource
+              mgr.release(rr, forcefully = false)
           }
 
         case Pending => // timeout during resource acquisition
