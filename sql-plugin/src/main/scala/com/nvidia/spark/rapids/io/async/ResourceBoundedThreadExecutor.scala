@@ -39,7 +39,7 @@ import org.apache.spark.util.TaskCompletionListener
 class RapidsFutureTask[T](val runner: AsyncRunner[T])
     extends FutureTask[AsyncResult[T]](runner) with Logging {
 
-  override def run(): Unit = runner.withStateLock { rr =>
+  override def run(): Unit = runner.withStateLock(holdAnyway = true) { rr =>
     rr.getState match {
       case Running =>
         // Pass the schedule time to the task metrics builder
@@ -199,7 +199,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
   override def beforeExecute(t: Thread, r: Runnable): Unit = {
     val futTask = parseFutureTask(r)
 
-    futTask.runner.withStateLock { rr =>
+    futTask.runner.withStateLock(holdAnyway = true) { rr =>
       // Check if the Spark task has been interrupted before execution
       rr.sparkTaskContext.foreach {
         case ctx if ctx.isInterrupted() => rr.setState(Cancelled)
@@ -257,10 +257,12 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
     // would block waiting for the runner's state lock while the runner itself
     // is blocked on a blocking OnClose callback (e.g., MemoryBoundedAsyncRunner.onClose)
     if (futTask.runner.closeStarted.get()) {
-      return
+      futTask.runner.withStateLock(releaseAnyway = true) { _ =>
+        return
+      }
     }
     // Post execution state handling
-    futTask.runner.withStateLock { rr =>
+    futTask.runner.withStateLock(releaseAnyway = true) { rr =>
       // Throw the unexpected exception if exists, since the FutureTask should have caught
       // and recorded the exception internally.
       if (t != null) {
@@ -335,7 +337,7 @@ class ResourceBoundedThreadExecutor(mgr: ResourcePool,
             fut.cancel(true) // mayInterruptIfRunning = true
           }
           // 2. Convert the state to Cancelled if it is not in a terminal state yet
-          fut.runner.withStateLock { rr =>
+          fut.runner.withStateLock(holdAnyway = true) { rr =>
             rr.getState match {
               case Init(_) => rr.setState(Cancelled) // Init -> Cancelled
               case Pending => rr.setState(Cancelled) // Pending -> Cancelled

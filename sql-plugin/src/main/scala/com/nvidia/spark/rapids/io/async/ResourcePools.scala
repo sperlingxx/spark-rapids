@@ -52,7 +52,7 @@ trait ResourcePool {
    * Returns true if the task can be accepted, false otherwise.
    * TrafficController will block the task from being scheduled until this method returns true.
    */
-  def acquire[T](runner: AsyncRunner[T], timeout: Long): AcquireStatus
+  protected[async] def acquire[T](runner: AsyncRunner[T], timeout: Long): AcquireStatus
 
   /**
    * Closed a completed AsyncRunner (either successfully or failed) and cleanup its resources.
@@ -60,7 +60,7 @@ trait ResourcePool {
    * This method is typically called as a callback hooked to various completion events to handle
    * scenarios such as cancellation or end of lifecycle.
    */
-  def finishUpRunner[T](runner: AsyncRunner[T]): Unit
+  protected[async] def finishUpRunner[T](runner: AsyncRunner[T]): Unit
 
   /**
    * Release resources held by the runner. If forcefully is true, release all resources regardless
@@ -69,7 +69,7 @@ trait ResourcePool {
    * NOTE: Although this method is NOT responsible for closing, it is recommended to close the
    * runner if it is no longer holding any resources after the release, such as HostMemoryPool.
    */
-  def release[T](runner: AsyncRunner[T], forcefully: Boolean): Unit
+  protected[async] def release[T](runner: AsyncRunner[T], forcefully: Boolean): Unit
 }
 
 /**
@@ -84,7 +84,9 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
 
   private val lock = new ReentrantLock()
 
-  private val condition = lock.newCondition()
+  private val mainCondition = lock.newCondition()
+  private val borrowCondition = lock.newCondition()
+  @volatile private var numOfBorrowWaiters: Int = 0
 
   // Tracking running AsyncRunners which actually acquires host memory, which is mainly for deadlock
   // prevention for now.
@@ -98,7 +100,8 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
   // Map of TaskAttemptId -> number of active runners, use Java Long for nullability
   private val tasksInPool = new ConcurrentHashMap[Long, JLong](64)
 
-  override def acquire[T](runner: AsyncRunner[T], timeoutMs: Long): AcquireStatus = {
+  override protected[async] def acquire[T](runner: AsyncRunner[T],
+      timeoutMs: Long): AcquireStatus = {
     // step 1: extract the resource requirements and runner info
     val memoryRequire: Long = extractResource(runner).sizeInBytes
 
@@ -136,15 +139,19 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
             // When remaining < 0, the increment was done by the CAS above
             if (remaining >= 0L) {
               numRunnerInFlight.incrementAndGet()
+            } else {
+              // Mark the runner as bypassed, which is needed to be handled differently under
+              // certain scenarios such as excessive buffer allocation.
+              runner.setTag("isBypassed", "TRUE")
             }
             // register a post-hook to decrement it as soon as the runner is done
             runner.addPostHook(() => numRunnerInFlight.decrementAndGet())
           } else if (waitTimeNs > 0L) {
-            waitTimeNs = condition.awaitNanos(waitTimeNs)
+            waitTimeNs = mainCondition.awaitNanos(waitTimeNs)
           } else {
             isTimeout = true
             logWarning(s"Failed to acquire ${bytesToString(memoryRequire)}, remaining=" +
-                s"${bytesToString(remaining)}, AsyncRunners=$numRunnerInPool, " +
+                s"${if (remaining < 0) bytesToString(remaining)}, AsyncRunners=$numRunnerInPool, " +
                 s"SparkTasks=${tasksInPool.size}")
           }
         }
@@ -173,7 +180,7 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
     }
   }
 
-  override def release[T](rr: AsyncRunner[T], forcefully: Boolean): Unit = {
+  override protected[async] def release[T](rr: AsyncRunner[T], forcefully: Boolean): Unit = {
     val freeAmount = rr.tryFree(forcefully).map {
       _.asInstanceOf[HostResource].sizeInBytes
     }.getOrElse(0L)
@@ -186,23 +193,61 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
         logDebug(s"Released ${bytesToString(freeAmount)}, remaining=" +
             s"${bytesToString(remaining)}, AsyncRunners=$numRunnerInPool, " +
             s"SparkTasks=${tasksInPool.size}")
-        condition.signalAll()
+        // BorrowCondition has higher priority than mainCondition
+        if (lock.hasWaiters(borrowCondition)) {
+          borrowCondition.signalAll()
+        } else if (lock.hasWaiters(mainCondition)) {
+          mainCondition.signalAll()
+        }
         // Check if current runner can be closed
         rr.getState != Running && extractResource(rr).sizeInBytes == 0
       } finally {
         lock.unlock()
       }
-      if (canBeClosed) { // Close runner does NOT require the pool lock
+      // Close runner does NOT require the pool lock
+      if (canBeClosed &&
+          // Ensure we do NOT block multiple closings for the same runner
+          rr.closeStarted.compareAndSet(false, true)
+      ) {
         closeRunner(rr)
       }
     }
   }
 
-  override def finishUpRunner[T](runner: AsyncRunner[T]): Unit = {
+  override protected[async] def finishUpRunner[T](runner: AsyncRunner[T]): Unit = {
     if (extractResource(runner).sizeInBytes > 0) {
       release(runner, forcefully = true)
     } else {
       closeRunner(runner)
+    }
+  }
+
+  //
+  private[async] def borrowMemory(sizeInBytes: Long, byForce: Boolean = false): Unit = {
+    lock.lockInterruptibly()
+    var beAwakened = false
+    try {
+      if (!byForce) {
+        while (remaining < sizeInBytes) {
+          numOfBorrowWaiters += 1
+          borrowCondition.await()
+          beAwakened = true
+          numOfBorrowWaiters -= 1
+        }
+      }
+      remaining -= sizeInBytes
+
+      // Transfer the signal action triggered by memory release to mainCondition if needed:
+      // 1. beAwakened guarantees current thread was awakened by a release action
+      // 2. numOfBorrowWaiters == 0 ensures no other high-priority waiters are pending
+      // 3. remaining > 0L means mainCondition waiters can be satisfied
+      // 4. lock.hasWaiters(mainCondition) checks if there are mainCondition waiters
+      if (beAwakened && numOfBorrowWaiters == 0 &&
+          remaining > 0L && lock.hasWaiters(mainCondition)) {
+        mainCondition.signalAll()
+      }
+    } finally {
+      lock.unlock()
     }
   }
 
@@ -227,7 +272,7 @@ class HostMemoryPool(val maxHostMemoryBytes: Long) extends ResourcePool with Log
     runner.sparkTaskContext.foreach { ctx =>
       unregisterRunner(ctx)
     }
-    logInfo(s"Closed $runner, remaining=${bytesToString(remaining)}, " +
+    logDebug(s"Closed $runner, remaining=${bytesToString(remaining)}, " +
         s"AsyncRunners=$numRunnerInPool, SparkTasks=${tasksInPool.size}")
   }
 
