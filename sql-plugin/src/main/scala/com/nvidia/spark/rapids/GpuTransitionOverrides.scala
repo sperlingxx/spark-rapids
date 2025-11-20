@@ -243,6 +243,17 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
       p.withNewChildren(Array(newChild))
 
     case p =>
+      p match {
+        case objAgg: org.apache.spark.sql.execution.aggregate.ObjectHashAggregateExec =>
+          if (objAgg.getTagValue(GpuOverrides.postColToRowProjection).isEmpty) {
+            val injectedTag = objAgg.getTagValue(
+              GpuTypedImperativeSupportedAggregateExecMeta.bufferConverterInjected
+            ).getOrElse(false)
+            logWarning(s"[${objAgg.id}]ObjectHashAgg found without postC2rProj tag (with " +
+                s"injected tag: $injectedTag): $objAgg")
+          }
+        case _ =>
+      }
       p.withNewChildren(p.children.map(c => optimizeAdaptiveTransitions(c, Some(p))))
   }
 

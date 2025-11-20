@@ -1413,7 +1413,7 @@ abstract class GpuTypedImperativeSupportedAggregateExecMeta[INPUT <: BaseAggrega
     conf: RapidsConf,
     parent: Option[RapidsMeta[_, _, _]],
     rule: DataFromReplacementRule) extends GpuBaseAggregateMeta[INPUT](plan,
-  aggRequiredChildDistributionExpressions, conf, parent, rule) {
+  aggRequiredChildDistributionExpressions, conf, parent, rule) with Logging {
 
   private val mayNeedAggBufferConversion: Boolean =
     agg.aggregateExpressions.exists { expr =>
@@ -1451,6 +1451,15 @@ abstract class GpuTypedImperativeSupportedAggregateExecMeta[INPUT <: BaseAggrega
     // The binding also works when AQE is on, since it leverages the TreeNodeTag to cache buffer
     // converters.
     GpuTypedImperativeSupportedAggregateExecMeta.handleAggregationBuffer(this)
+
+    val hasInjectedProj = agg.getTagValue(GpuOverrides.postColToRowProjection).nonEmpty
+    val isInjected =
+      agg.getTagValue(GpuTypedImperativeSupportedAggregateExecMeta.bufferConverterInjected)
+          .getOrElse(false)
+    if (isInjected) {
+      logWarning(
+        s"[${agg.id}] Finalize TypeAggMeta (WithProj: $hasInjectedProj): $agg")
+    }
   }
 
   override def convertToGpu(): GpuExec = {
@@ -1538,10 +1547,13 @@ abstract class GpuTypedImperativeSupportedAggregateExecMeta[INPUT <: BaseAggrega
   }
 }
 
-object GpuTypedImperativeSupportedAggregateExecMeta {
+object GpuTypedImperativeSupportedAggregateExecMeta extends Logging {
 
-  private val bufferConverterInjected = TreeNodeTag[Boolean](
+  val bufferConverterInjected = TreeNodeTag[Boolean](
     "rapids.gpu.bufferConverterInjected")
+
+  private val debugTag = TreeNodeTag[Int](
+    "rapids.gpu.debugTypedImperativeAggregate")
 
   /**
    * The method will bind buffer converters (CPU Expressions) to certain CPU Plans if necessary,
@@ -1576,9 +1588,17 @@ object GpuTypedImperativeSupportedAggregateExecMeta {
     val needToCheck = containTypedImperativeAggregate(meta, Some(Final))
     if (!needToCheck) return
     // Avoid duplicated check and fallback.
-    val checked = meta.agg.getTagValue[Boolean](bufferConverterInjected).contains(true)
-    if (checked) return
-    meta.agg.setTagValue(bufferConverterInjected, true)
+    val checked = meta.agg.getTagValue[Boolean](bufferConverterInjected).getOrElse(false)
+    if (checked) {
+      val agg = meta.agg
+      agg.aggregateExpressions.map(_.mode).toArray
+      val hasInjectedProj = agg.getTagValue(GpuOverrides.postColToRowProjection).nonEmpty
+      val debugTagVal = agg.getTagValue(debugTag).getOrElse(0)
+      logWarning(
+        s"[${agg.id}] Detected Tag[bufferConverterInjected] on plan(projects " +
+            s"injected: $hasInjectedProj) (DebugTag: $debugTagVal): $agg")
+      return
+    }
 
     // Fetch AggregateMetas of all stages which belong to current Aggregate
     val stages = GpuBaseAggregateMeta.getAggregateOfAllStages(meta, meta.agg.logicalLink.get)
@@ -1596,7 +1616,12 @@ object GpuTypedImperativeSupportedAggregateExecMeta {
     }
 
     // Return if all internal aggregation buffers are compatible with GPU Overrides.
-    if (needBufferConversion.forall(!_)) return
+    if (needBufferConversion.forall(!_)) {
+      logWarning(s"[${meta.agg.id}] No need to inject buffer converters: ${meta.agg}")
+      return
+    }
+    // Mark the current AggregateMeta that buffer converters are injected.
+    meta.agg.setTagValue(bufferConverterInjected, true)
 
     // Fall back all GPU supported stages to CPU, if there exists TypedImperativeAggregate buffer
     // who doesn't support data format transition in runtime. Otherwise, build buffer converters
@@ -1649,9 +1674,14 @@ object GpuTypedImperativeSupportedAggregateExecMeta {
           // create postColumnarToRowTransition, and bind it to the parent node (CPU plan) of
           // GpuColumnarToRowExec
           case List(parent, _) =>
-            val parentPlan = parent.wrapped.asInstanceOf[SparkPlan]
+            val plan = parent.wrapped.asInstanceOf[SparkPlan]
             val expressions = createBufferConverter(stages(i), stages(i + 1), false)
-            parentPlan.setTagValue(GpuOverrides.postColToRowProjection, expressions)
+            plan.setTagValue(GpuOverrides.postColToRowProjection, expressions)
+            plan.setTagValue(debugTag, 1) // for debug purpose
+            val injectTag = plan.getTagValue(bufferConverterInjected).getOrElse(false)
+            logWarning(
+              s"[${plan.id}] Injecting postColToRowProjection (withInjectTag: $injectTag): " +
+                  s"${expressions.map(_.toString).mkString(", ")} into plan: $plan")
         }
       case _ =>
     }
