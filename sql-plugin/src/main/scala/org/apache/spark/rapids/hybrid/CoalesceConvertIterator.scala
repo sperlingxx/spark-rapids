@@ -16,6 +16,8 @@
 
 package org.apache.spark.rapids.hybrid
 
+import scala.collection.mutable
+
 import ai.rapids.cudf.NvtxColor
 import com.nvidia.spark.rapids.{GpuColumnVector, GpuMetric, GpuSemaphore, NvtxWithMetrics}
 import com.nvidia.spark.rapids.Arm._
@@ -172,6 +174,29 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
     prevDeckRows = curDeckRows
     curDeckRows = 0L
     scanOutputRows = 0L
+
+    // Special check for event_is_rem column to catch potential bugs in string handling
+    lazy val tid = TaskContext.get().taskAttemptId()
+    val tgtCol = columns(10).vector
+    require(tgtCol.getType == ai.rapids.cudf.DType.STRING,
+      s"event_is_rem type ${tgtCol.getType} is not STRING")
+    val errMsg = mutable.ArrayBuffer.empty[String]
+    var ri = 0
+    while (ri < tgtCol.getRowCount && errMsg.length < 100) {
+      val strStart = tgtCol.getStartListOffset(ri)
+      val strEnd = tgtCol.getEndListOffset(ri)
+      val strData = tgtCol.getJavaString(ri)
+      if (strData != "0") {
+        errMsg += s"[Task:$tid,row:$ri] Invalid strData: $strData, offset: [$strStart,$strEnd)"
+      }
+      ri += 1
+    }
+    if (errMsg.nonEmpty) {
+      val summary = s"[$tid] Found exception on the TARGET column:\n${errMsg.mkString("\n")}"
+      logError(summary)
+      throw new RuntimeException(summary)
+    }
+
     columns
   }
 }
