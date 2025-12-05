@@ -175,7 +175,7 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
     curDeckRows = 0L
     scanOutputRows = 0L
 
-    // Special check for event_is_rem column to catch potential bugs in string handling
+    // TEMP CODE: Special check for event_is_rem column to catch potential bugs
     lazy val tid = TaskContext.get().taskAttemptId()
     val tgtCol = columns(10).vector
     require(tgtCol.getType == ai.rapids.cudf.DType.STRING,
@@ -183,10 +183,10 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
     val errMsg = mutable.ArrayBuffer.empty[String]
     var ri = 0
     while (ri < tgtCol.getRowCount && errMsg.length < 100) {
-      val strStart = tgtCol.getStartListOffset(ri)
-      val strEnd = tgtCol.getEndListOffset(ri)
       val strData = tgtCol.getJavaString(ri)
       if (strData != "0") {
+        val strStart = tgtCol.getStartListOffset(ri)
+        val strEnd = tgtCol.getEndListOffset(ri)
         errMsg += s"[Task:$tid,row:$ri] Invalid strData: $strData, offset: [$strStart,$strEnd)"
       }
       ri += 1
@@ -195,6 +195,10 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
       val summary = s"[$tid] Found exception on the TARGET column:\n${errMsg.mkString("\n")}"
       logError(summary)
       throw new RuntimeException(summary)
+    } else {
+      val srcBatch = metrics("CpuReaderBatches").value
+      val dstBatch = metrics("CoalescedBatches").value
+      logInfo(s"[$tid] checked event_is_rem for $ri rows (numBatch: $srcBatch/$dstBatch)")
     }
 
     columns
@@ -260,6 +264,24 @@ object CoalesceConvertIterator extends Logging {
                 GpuColumnVector.from(hcv.copyToDevice(), dt)
               }
             }
+        }
+
+        // TEMP CODE: Brute-force check for event_is_rem column on Device
+        deviceVectors(10) match {
+          case gcv: GpuColumnVector =>
+            val nonZeroSum = gcv.getBase
+                .castTo(ai.rapids.cudf.DType.UINT32)
+                .sum(ai.rapids.cudf.DType.UINT64)
+                .getLong
+            val tID = TaskContext.get().taskAttemptId()
+            if (nonZeroSum != 0L) {
+              throw new IllegalStateException(
+                s"[$tID] Invalid data found in event_is_rem column on Device, " +
+                    s"the non-zero sum is $nonZeroSum")
+            } else {
+              logInfo(s"[$tID] checked event_is_rem on Device, non-zero sum is $nonZeroSum")
+            }
+          case _ =>
         }
 
         new ColumnarBatch(deviceVectors, rowCount)
