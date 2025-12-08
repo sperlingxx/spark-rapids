@@ -2546,6 +2546,12 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
       .bytesConf(ByteUnit.BYTE)
       .createWithDefault(2L * 1024 * 1024 * 1024)
 
+  val GPU_FILTER_DISABLE = conf("spark.rapids.sql.gpufilter.disable")
+      .doc("Disable GPU acceleration for filter operator. This is mainly for testing purposes.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   private def printSectionHeader(category: String): Unit =
     println(s"\n### $category")
 
@@ -3294,6 +3300,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
       }
     }
   }
+
+  lazy val isGpuFilterDisabled: Boolean = get(GPU_FILTER_DISABLE)
 
   def isUCXShuffleManagerMode: Boolean =
     RapidsShuffleManagerMode
