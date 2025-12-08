@@ -1110,6 +1110,13 @@ case class GpuFilterExecMeta(
   rule: DataFromReplacementRule
 ) extends SparkPlanMeta[FilterExec](filter, conf, parentMetaOpt, rule) {
   override def convertToGpu(): GpuExec = {
+    // TEMP CODE: only for debugging purpose
+    if (conf.isGpuFilterDisabled) {
+      val c2r = GpuColumnarToRowExec(childPlans.head.convertIfNeeded())
+      val filtered = FilterExec(filter.condition, c2r)
+      return GpuRowToColumnarExec(filtered, TargetSize(conf.gpuTargetBatchSizeBytes))
+    }
+
     GpuFilterExec(childExprs.head.convertToGpu(),
       childPlans.head.convertIfNeeded())()
   }
