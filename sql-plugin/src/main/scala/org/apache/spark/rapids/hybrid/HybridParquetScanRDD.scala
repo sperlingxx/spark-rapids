@@ -31,6 +31,7 @@ class HybridParquetScanRDD(scanRDD: RDD[ColumnarBatch],
                            coalesceGoal: CoalesceSizeGoal,
                            preloadedCapacity: Int,
                            metrics: Map[String, GpuMetric],
+                           debugEventIsRemCheckEnabled: Boolean = false,
                          ) extends RDD[InternalRow](scanRDD.sparkContext, Nil) {
 
   override protected def getPartitions: Array[Partition] = scanRDD.partitions
@@ -43,7 +44,8 @@ class HybridParquetScanRDD(scanRDD: RDD[ColumnarBatch],
       StructField(ar.name, ar.dataType, ar.nullable)
     })
     val coalesceConverter = new CoalesceConvertIterator(
-      hybridScanIter, coalesceGoal.targetSizeBytes.toInt, schema, metrics)
+      hybridScanIter, coalesceGoal.targetSizeBytes.toInt, schema, metrics,
+      debugEventIsRemCheckEnabled)
 
     val hostProducer: RapidsHostBatchProducer = if (preloadedCapacity > 0) {
       // prefetches the result of ParquetScan via an asynchronous producer
@@ -58,7 +60,8 @@ class HybridParquetScanRDD(scanRDD: RDD[ColumnarBatch],
       new SyncHostBatchProducer(coalesceConverter)
     }
 
-    val deviceIter = CoalesceConvertIterator.hostToDevice(hostProducer, outputAttr, metrics)
+    val deviceIter = CoalesceConvertIterator.hostToDevice(hostProducer, outputAttr, metrics,
+      debugEventIsRemCheckEnabled)
 
     // TODO: SPARK-25083 remove the type erasure hack in data source scan
     new InterruptibleIterator(context, deviceIter.asInstanceOf[Iterator[InternalRow]])

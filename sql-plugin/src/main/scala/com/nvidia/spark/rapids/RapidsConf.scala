@@ -2550,7 +2550,14 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
       .doc("Disable GPU acceleration for filter operator. This is mainly for testing purposes.")
       .internal()
       .booleanConf
-      .createWithDefault(false)
+      .createWithDefault(true)
+
+  val HYBRID_DEBUG_EVENT_IS_REM_CHECK = conf("spark.rapids.sql.hybrid.debug.eventIsRemCheck")
+      .doc("Enable brute-force validation checks for event_is_rem column in hybrid scan. " +
+        "This is a temporary debug config for development purposes only.")
+      .internal()
+      .booleanConf
+      .createWithDefault(true)
 
   private def printSectionHeader(category: String): Unit =
     println(s"\n### $category")
@@ -3302,6 +3309,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   }
 
   lazy val isGpuFilterDisabled: Boolean = get(GPU_FILTER_DISABLE)
+
+  lazy val isHybridDebugEventIsRemCheckEnabled: Boolean = get(HYBRID_DEBUG_EVENT_IS_REM_CHECK)
 
   def isUCXShuffleManagerMode: Boolean =
     RapidsShuffleManagerMode

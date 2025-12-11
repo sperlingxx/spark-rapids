@@ -100,7 +100,8 @@ case class HybridFileSourceScanExec(originPlan: FileSourceScanExec
       originPlan.requiredSchema,
       TargetSize(coalesceSizeGoal),
       rapidsConf.hybridParquetPreloadBatches,
-      embeddedMetrics
+      embeddedMetrics,
+      rapidsConf.isHybridDebugEventIsRemCheckEnabled
     )
   }
 

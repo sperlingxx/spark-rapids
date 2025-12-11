@@ -38,7 +38,8 @@ import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
                               targetBatchSizeInBytes: Long,
                               schema: StructType,
-                              metrics: Map[String, GpuMetric])
+                              metrics: Map[String, GpuMetric],
+                              debugEventIsRemCheckEnabled: Boolean = false)
   extends Iterator[Array[RapidsHostColumn]] with Logging {
 
   private var converterImpl: NativeConverter = _
@@ -176,34 +177,36 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
     scanOutputRows = 0L
 
     // TEMP CODE: Special check for event_is_rem column to catch potential bugs
-    lazy val tid = TaskContext.get().taskAttemptId()
-    val tgtCol = columns(10).vector
-    val tgtColData = tgtCol.getData
-    require(tgtCol.getType == ai.rapids.cudf.DType.STRING,
-      s"event_is_rem type ${tgtCol.getType} is not STRING")
-    val errMsg = mutable.ArrayBuffer.empty[String]
-    var ri = 0
-    while (ri < tgtCol.getRowCount && errMsg.length < 100) {
-      if (tgtCol.isNull(ri)) {
-        errMsg += s"[Task:$tid,row:$ri] Invalid strData (~NULL~) in event_is_rem column"
-      } else {
-        val strStart = tgtCol.getStartListOffset(ri)
-        val strEnd = tgtCol.getEndListOffset(ri)
-        if (strEnd - strStart != 1 || tgtColData.getByte(strStart) != '0') {
-          val str = tgtCol.getJavaString(ri)
-          errMsg += s"[Task:$tid,row:$ri] Invalid strData: $str, offset: [$strStart,$strEnd)"
+    if (debugEventIsRemCheckEnabled) {
+      lazy val tid = TaskContext.get().taskAttemptId()
+      val tgtCol = columns(10).vector
+      val tgtColData = tgtCol.getData
+      require(tgtCol.getType == ai.rapids.cudf.DType.STRING,
+        s"event_is_rem type ${tgtCol.getType} is not STRING")
+      val errMsg = mutable.ArrayBuffer.empty[String]
+      var ri = 0
+      while (ri < tgtCol.getRowCount && errMsg.length < 100) {
+        if (tgtCol.isNull(ri)) {
+          errMsg += s"[Task:$tid,row:$ri] Invalid strData (~NULL~) in event_is_rem column"
+        } else {
+          val strStart = tgtCol.getStartListOffset(ri)
+          val strEnd = tgtCol.getEndListOffset(ri)
+          if (strEnd - strStart != 1 || tgtColData.getByte(strStart) != '0') {
+            val str = tgtCol.getJavaString(ri)
+            errMsg += s"[Task:$tid,row:$ri] Invalid strData: $str, offset: [$strStart,$strEnd)"
+          }
         }
+        ri += 1
       }
-      ri += 1
-    }
-    if (errMsg.nonEmpty) {
-      val summary = s"[$tid] Found exception on the TARGET column:\n${errMsg.mkString("\n")}"
-      logError(summary)
-      throw new RuntimeException(summary)
-    } else {
-      val srcBatch = metrics("CpuReaderBatches").value
-      val dstBatch = metrics("CoalescedBatches").value
-      logInfo(s"[$tid] checked event_is_rem for $ri rows (numBatch: $srcBatch/$dstBatch)")
+      if (errMsg.nonEmpty) {
+        val summary = s"[$tid] Found exception on the TARGET column:\n${errMsg.mkString("\n")}"
+        logError(summary)
+        throw new RuntimeException(summary)
+      } else {
+        val srcBatch = metrics("CpuReaderBatches").value
+        val dstBatch = metrics("CoalescedBatches").value
+        logInfo(s"[$tid] checked event_is_rem for $ri rows (numBatch: $srcBatch/$dstBatch)")
+      }
     }
 
     columns
@@ -216,7 +219,8 @@ object CoalesceConvertIterator extends Logging {
    */
   def hostToDevice(hostProducer: RapidsHostBatchProducer,
                    outputAttr: Seq[Attribute],
-                   metrics: Map[String, GpuMetric]): Iterator[ColumnarBatch] = {
+                   metrics: Map[String, GpuMetric],
+                   debugEventIsRemCheckEnabled: Boolean = false): Iterator[ColumnarBatch] = {
     new Iterator[ColumnarBatch] {
 
       private val dataTypes = outputAttr.map(_.dataType).toArray
@@ -272,25 +276,27 @@ object CoalesceConvertIterator extends Logging {
         }
 
         // TEMP CODE: Brute-force check for event_is_rem column on Device
-        deviceVectors(10) match {
-          case gcv: GpuColumnVector =>
-            val intCol = withResource(gcv.getBase.castTo(DType.INT32)) { c =>
-              withResource(GpuScalar.from(100, DataTypes.IntegerType)) { s =>
-                GpuNvl(c, s)
+        if (debugEventIsRemCheckEnabled) {
+          deviceVectors(10) match {
+            case gcv: GpuColumnVector =>
+              val intCol = withResource(gcv.getBase.castTo(DType.INT32)) { c =>
+                withResource(GpuScalar.from(100, DataTypes.IntegerType)) { s =>
+                  GpuNvl(c, s)
+                }
               }
-            }
-            val nonZeroSum = withResource(intCol) { _ =>
-              intCol.sum(DType.INT64).getLong
-            }
-            val tID = TaskContext.get().taskAttemptId()
-            if (nonZeroSum != 0L) {
-              throw new IllegalStateException(
-                s"[$tID] Invalid data found in event_is_rem column on Device, " +
-                    s"the non-zero sum is $nonZeroSum")
-            } else {
-              logInfo(s"[$tID] checked event_is_rem on Device, non-zero sum is $nonZeroSum")
-            }
-          case _ =>
+              val nonZeroSum = withResource(intCol) { _ =>
+                withResource(intCol.sum(DType.INT64))(_.getLong)
+              }
+              val tID = TaskContext.get().taskAttemptId()
+              if (nonZeroSum != 0L) {
+                throw new IllegalStateException(
+                  s"[$tID] Invalid data found in event_is_rem column on Device, " +
+                      s"the non-zero sum is $nonZeroSum")
+              } else {
+                logInfo(s"[$tID] checked event_is_rem on Device, non-zero sum is $nonZeroSum")
+              }
+            case _ =>
+          }
         }
 
         new ColumnarBatch(deviceVectors, rowCount)

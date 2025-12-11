@@ -39,7 +39,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, RangePartitioning, SinglePartition, UnknownPartitioning}
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, SampleExec, SparkPlan}
-import org.apache.spark.sql.rapids.{GpuCreateArray, GpuCreateMap, GpuCreateNamedStruct, GpuPartitionwiseSampledRDD, GpuPoissonSampler}
+import org.apache.spark.sql.rapids.{DebugFilterExec, GpuCreateArray, GpuCreateMap, GpuCreateNamedStruct, GpuPartitionwiseSampledRDD, GpuPoissonSampler}
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
@@ -1113,7 +1113,7 @@ case class GpuFilterExecMeta(
     // TEMP CODE: only for debugging purpose
     if (conf.isGpuFilterDisabled) {
       val c2r = GpuColumnarToRowExec(childPlans.head.convertIfNeeded())
-      val filtered = FilterExec(filter.condition, c2r)
+      val filtered = DebugFilterExec(filter.condition, c2r)
       return GpuRowToColumnarExec(filtered, TargetSize(conf.gpuTargetBatchSizeBytes))
     }
 
