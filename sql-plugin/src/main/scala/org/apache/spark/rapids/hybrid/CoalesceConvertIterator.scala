@@ -18,8 +18,8 @@ package org.apache.spark.rapids.hybrid
 
 import scala.collection.mutable
 
-import ai.rapids.cudf.NvtxColor
-import com.nvidia.spark.rapids.{GpuColumnVector, GpuMetric, GpuSemaphore, NvtxWithMetrics}
+import ai.rapids.cudf.{DType, NvtxColor}
+import com.nvidia.spark.rapids.{GpuColumnVector, GpuMetric, GpuNvl, GpuScalar, GpuSemaphore, NvtxWithMetrics}
 import com.nvidia.spark.rapids.Arm._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.hybrid.{CoalesceBatchConverter => NativeConverter, HybridHostRetryAllocator, RapidsHostColumn}
@@ -27,7 +27,7 @@ import com.nvidia.spark.rapids.hybrid.{CoalesceBatchConverter => NativeConverter
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{DataTypes, StructType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 /**
@@ -178,16 +178,21 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
     // TEMP CODE: Special check for event_is_rem column to catch potential bugs
     lazy val tid = TaskContext.get().taskAttemptId()
     val tgtCol = columns(10).vector
+    val tgtColData = tgtCol.getData
     require(tgtCol.getType == ai.rapids.cudf.DType.STRING,
       s"event_is_rem type ${tgtCol.getType} is not STRING")
     val errMsg = mutable.ArrayBuffer.empty[String]
     var ri = 0
     while (ri < tgtCol.getRowCount && errMsg.length < 100) {
-      val strData = tgtCol.getJavaString(ri)
-      if (strData != "0") {
+      if (tgtCol.isNull(ri)) {
+        errMsg += s"[Task:$tid,row:$ri] Invalid strData (~NULL~) in event_is_rem column"
+      } else {
         val strStart = tgtCol.getStartListOffset(ri)
         val strEnd = tgtCol.getEndListOffset(ri)
-        errMsg += s"[Task:$tid,row:$ri] Invalid strData: $strData, offset: [$strStart,$strEnd)"
+        if (strEnd - strStart != 1 || tgtColData.getByte(strStart) != '0') {
+          val str = tgtCol.getJavaString(ri)
+          errMsg += s"[Task:$tid,row:$ri] Invalid strData: $str, offset: [$strStart,$strEnd)"
+        }
       }
       ri += 1
     }
@@ -269,10 +274,14 @@ object CoalesceConvertIterator extends Logging {
         // TEMP CODE: Brute-force check for event_is_rem column on Device
         deviceVectors(10) match {
           case gcv: GpuColumnVector =>
-            val nonZeroSum = gcv.getBase
-                .castTo(ai.rapids.cudf.DType.UINT32)
-                .sum(ai.rapids.cudf.DType.UINT64)
-                .getLong
+            val intCol = withResource(gcv.getBase.castTo(DType.INT32)) { c =>
+              withResource(GpuScalar.from(100, DataTypes.IntegerType)) { s =>
+                GpuNvl(c, s)
+              }
+            }
+            val nonZeroSum = withResource(intCol) { _ =>
+              intCol.sum(DType.INT64).getLong
+            }
             val tID = TaskContext.get().taskAttemptId()
             if (nonZeroSum != 0L) {
               throw new IllegalStateException(
