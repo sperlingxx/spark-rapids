@@ -2550,7 +2550,7 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
       .doc("Disable GPU acceleration for filter operator. This is mainly for testing purposes.")
       .internal()
       .booleanConf
-      .createWithDefault(true)
+      .createWithDefault(false)
 
   val HYBRID_DEBUG_EVENT_IS_REM_CHECK = conf("spark.rapids.sql.hybrid.debug.eventIsRemCheck")
       .doc("Enable brute-force validation checks for event_is_rem column in hybrid scan. " +

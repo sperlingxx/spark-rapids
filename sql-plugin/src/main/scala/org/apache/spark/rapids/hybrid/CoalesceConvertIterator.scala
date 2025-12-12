@@ -19,7 +19,7 @@ package org.apache.spark.rapids.hybrid
 import scala.collection.mutable
 
 import ai.rapids.cudf.{DType, NvtxColor}
-import com.nvidia.spark.rapids.{GpuColumnVector, GpuMetric, GpuNvl, GpuScalar, GpuSemaphore, NvtxWithMetrics}
+import com.nvidia.spark.rapids.{GpuColumnVector, GpuMetric, GpuSemaphore, NvtxWithMetrics}
 import com.nvidia.spark.rapids.Arm._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.hybrid.{CoalesceBatchConverter => NativeConverter, HybridHostRetryAllocator, RapidsHostColumn}
@@ -27,7 +27,7 @@ import com.nvidia.spark.rapids.hybrid.{CoalesceBatchConverter => NativeConverter
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.types.{DataTypes, StructType}
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 /**
@@ -49,9 +49,9 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
   private val converterMetrics = Map(
     "C2COutputSize" -> GpuMetric.unwrap(metrics("C2COutputSize")))
 
-  private var scanOutputRows = 0L
-  private var prevDeckRows = 0L
-  private var curDeckRows = 0L
+  private var inputBatches = 0L
+  private var outputBatches = 0L
+  private var outputRows = 0L
 
   private def upstreamHasNext(): Boolean = {
     val startTime = System.nanoTime()
@@ -63,7 +63,7 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
   private def upstreamNext(): ColumnarBatch = {
     val startTime = System.nanoTime()
     val batch = cpuScanIter.next()
-    scanOutputRows += batch.numRows()
+    inputBatches += 1
     metrics("HybridScanTime") += System.nanoTime() - startTime
     batch
   }
@@ -129,7 +129,6 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
         // the flush of working targetVectors
         val scanOutBatch = upstreamNext()
         if (!converterImpl.tryAppendBatch(scanOutBatch)) {
-          curDeckRows = scanOutBatch.numRows() // the batch left on the deck
           needFlush = true
         }
       } else {
@@ -147,7 +146,11 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
           converterImpl.setupTargetVectors()
         }
         // break the while loop
-        return checkOutput(rapidsHostBatch)
+        return if (debugEventIsRemCheckEnabled) {
+          checkOutput(rapidsHostBatch)
+        } else {
+          rapidsHostBatch
+        }
       }
     }
 
@@ -156,59 +159,34 @@ class CoalesceConvertIterator(cpuScanIter: Iterator[ColumnarBatch],
 
   // Check the row count for each batch, to detect potential bugs as early as possible.
   private def checkOutput(columns: Array[RapidsHostColumn]): Array[RapidsHostColumn] = {
-    require(columns.length == schema.length)
-    // The output batch contains the remaining data of previous batch on the deck, but does not
-    // include the data newly placed on the deck.
-    val expect = prevDeckRows + scanOutputRows - curDeckRows
-    columns.indices.foreach { i =>
-      val rowCnt = columns(i).vector.getRowCount
-      if (rowCnt != expect) {
-        throw new IllegalStateException(
-          s"[Field($i) ${schema(i)}] rowCount $rowCnt mismatches the expected value $expect! " +
-              s"[prevDeckRows: $prevDeckRows, curDeckRows: $curDeckRows, " +
-              s"scanOutputRows: $scanOutputRows), " +
-              s"InputBatches: ${metrics("CpuReaderBatches").value}, " +
-              s"OutputBatches: ${metrics("CoalescedBatches").value}]")
-      }
-    }
-    // Reset the counters for next output batch
-    prevDeckRows = curDeckRows
-    curDeckRows = 0L
-    scanOutputRows = 0L
-
-    // TEMP CODE: Special check for event_is_rem column to catch potential bugs
-    if (debugEventIsRemCheckEnabled) {
-      lazy val tid = TaskContext.get().taskAttemptId()
-      val tgtCol = columns(10).vector
-      val tgtColData = tgtCol.getData
-      require(tgtCol.getType == ai.rapids.cudf.DType.STRING,
-        s"event_is_rem type ${tgtCol.getType} is not STRING")
-      val errMsg = mutable.ArrayBuffer.empty[String]
-      var ri = 0
-      while (ri < tgtCol.getRowCount && errMsg.length < 100) {
-        if (tgtCol.isNull(ri)) {
-          errMsg += s"[Task:$tid,row:$ri] Invalid strData (~NULL~) in event_is_rem column"
-        } else {
-          val strStart = tgtCol.getStartListOffset(ri)
-          val strEnd = tgtCol.getEndListOffset(ri)
-          if (strEnd - strStart != 1 || tgtColData.getByte(strStart) != '0') {
-            val str = tgtCol.getJavaString(ri)
-            errMsg += s"[Task:$tid,row:$ri] Invalid strData: $str, offset: [$strStart,$strEnd)"
-          }
+    val tid = TaskContext.get().taskAttemptId()
+    val tgtCol = columns(10).vector
+    require(tgtCol.getType == DType.STRING, s"TARGET_COLUMN is not STRING ${tgtCol.getType}")
+    val nullBuffer = tgtCol.getValidity
+    val nullMaskLen = nullBuffer.getLength
+    require(nullMaskLen % 8 == 0, s"Unexpected nullMaskLen $nullMaskLen for TARGET_COLUMN")
+    val rowCnt = tgtCol.getRowCount.toInt
+    val errMsg = mutable.ArrayBuffer.empty[String]
+    var dirtyBytes: Long = 0
+    (0 until (rowCnt >> 3)).foreach { i =>
+      val byteVal = nullBuffer.getByte(i)
+      if (byteVal != 0xFF.toByte) {
+        dirtyBytes += 1L
+        if (dirtyBytes <= 100) {
+          errMsg += s"[Task:$tid,BitIndex:$i] Invalid nullBitMask: $byteVal"
         }
-        ri += 1
-      }
-      if (errMsg.nonEmpty) {
-        val summary = s"[$tid] Found exception on the TARGET column:\n${errMsg.mkString("\n")}"
-        logError(summary)
-        throw new RuntimeException(summary)
-      } else {
-        val srcBatch = metrics("CpuReaderBatches").value
-        val dstBatch = metrics("CoalescedBatches").value
-        logInfo(s"[$tid] checked event_is_rem for $ri rows (numBatch: $srcBatch/$dstBatch)")
       }
     }
-
+    if (dirtyBytes > 0) {
+      val head = s"[$tid] rows=[$outputRows,${outputRows + rowCnt}), " +
+          s"batches=${inputBatches}/${outputBatches + 1} : " +
+          s"Found ($dirtyBytes) dirty BitMasks:\n${errMsg.mkString("\n")}"
+      throw new RuntimeException(head)
+    }
+    outputBatches += 1
+    outputRows += rowCnt
+    logInfo(s"[$tid] checked event_is_rem for " +
+        s"$rowCnt/$outputRows rows ($inputBatches/$outputBatches batches)")
     columns
   }
 }
@@ -219,8 +197,7 @@ object CoalesceConvertIterator extends Logging {
    */
   def hostToDevice(hostProducer: RapidsHostBatchProducer,
                    outputAttr: Seq[Attribute],
-                   metrics: Map[String, GpuMetric],
-                   debugEventIsRemCheckEnabled: Boolean = false): Iterator[ColumnarBatch] = {
+                   metrics: Map[String, GpuMetric]): Iterator[ColumnarBatch] = {
     new Iterator[ColumnarBatch] {
 
       private val dataTypes = outputAttr.map(_.dataType).toArray
@@ -273,30 +250,6 @@ object CoalesceConvertIterator extends Logging {
                 GpuColumnVector.from(hcv.copyToDevice(), dt)
               }
             }
-        }
-
-        // TEMP CODE: Brute-force check for event_is_rem column on Device
-        if (debugEventIsRemCheckEnabled) {
-          deviceVectors(10) match {
-            case gcv: GpuColumnVector =>
-              val intCol = withResource(gcv.getBase.castTo(DType.INT32)) { c =>
-                withResource(GpuScalar.from(100, DataTypes.IntegerType)) { s =>
-                  GpuNvl(c, s)
-                }
-              }
-              val nonZeroSum = withResource(intCol) { _ =>
-                withResource(intCol.sum(DType.INT64))(_.getLong)
-              }
-              val tID = TaskContext.get().taskAttemptId()
-              if (nonZeroSum != 0L) {
-                throw new IllegalStateException(
-                  s"[$tID] Invalid data found in event_is_rem column on Device, " +
-                      s"the non-zero sum is $nonZeroSum")
-              } else {
-                logInfo(s"[$tID] checked event_is_rem on Device, non-zero sum is $nonZeroSum")
-              }
-            case _ =>
-          }
         }
 
         new ColumnarBatch(deviceVectors, rowCount)

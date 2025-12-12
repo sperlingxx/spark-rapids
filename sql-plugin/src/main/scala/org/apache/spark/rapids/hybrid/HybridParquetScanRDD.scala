@@ -60,8 +60,7 @@ class HybridParquetScanRDD(scanRDD: RDD[ColumnarBatch],
       new SyncHostBatchProducer(coalesceConverter)
     }
 
-    val deviceIter = CoalesceConvertIterator.hostToDevice(hostProducer, outputAttr, metrics,
-      debugEventIsRemCheckEnabled)
+    val deviceIter = CoalesceConvertIterator.hostToDevice(hostProducer, outputAttr, metrics)
 
     // TODO: SPARK-25083 remove the type erasure hack in data source scan
     new InterruptibleIterator(context, deviceIter.asInstanceOf[Iterator[InternalRow]])
