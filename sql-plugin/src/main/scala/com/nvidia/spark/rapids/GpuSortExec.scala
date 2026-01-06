@@ -88,11 +88,13 @@ case class GpuSortExec(
     gpuSortOrder: Seq[SortOrder],
     global: Boolean,
     child: SparkPlan,
-    sortType: SortExecType)(
+    sortType: SortExecType,
+    useCudfMerge: Boolean = true)(
     cpuSortOrder: Seq[SortOrder], writeTrackers: Option[Seq[GpuWriteJobStatsTracker]] = None)
   extends ShimUnaryExecNode with GpuExec {
 
-  override def otherCopyArgs: Seq[AnyRef] = cpuSortOrder :: writeTrackers :: Nil
+  override def otherCopyArgs: Seq[AnyRef] =
+    cpuSortOrder :: writeTrackers :: useCudfMerge.asInstanceOf[AnyRef] :: Nil
 
   override def childrenCoalesceGoal: Seq[CoalesceGoal] = sortType match {
     case FullSortSingleBatch => Seq(RequireSingleBatch)
@@ -128,7 +130,7 @@ case class GpuSortExec(
   private lazy val targetSize = GpuSortExec.targetSize(conf)
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val sorter = new GpuSorter(gpuSortOrder, output, allMetrics)
+    val sorter = new GpuSorter(gpuSortOrder, output, allMetrics, useCudfMerge)
 
     val sortTime = gpuLongMetric(SORT_TIME)
     val opTime = gpuLongMetric(OP_TIME_LEGACY)

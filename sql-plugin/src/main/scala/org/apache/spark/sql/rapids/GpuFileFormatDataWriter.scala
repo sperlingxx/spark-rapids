@@ -788,7 +788,7 @@ class GpuDynamicPartitionDataConcurrentWriter(
         }.getOrElse((NoopMetric, NoopMetric))
 
       val sortIter = GpuOutOfCoreSortIterator(pendingCbsIter ++ iterator,
-        new GpuSorter(spec.sortOrder, spec.output, Map.empty[String, GpuMetric]),
+        new GpuSorter(spec.sortOrder, spec.output, Map.empty[String, GpuMetric], spec.useCudfMerge),
         GpuSortExec.targetSize(spec.batchSize),
         sortOpTime, sortMetric, NoopMetric, NoopMetric)
       while (sortIter.hasNext) {

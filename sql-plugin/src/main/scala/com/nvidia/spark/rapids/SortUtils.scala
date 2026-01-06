@@ -67,7 +67,8 @@ object SortUtils {
 class GpuSorter(
     val sortOrder: Seq[SortOrder],
     inputSchema: Array[Attribute],
-    metrics: Map[String, GpuMetric]) extends Serializable {
+    metrics: Map[String, GpuMetric],
+    useCudfMerge: Boolean = true) extends Serializable {
 
   /**
    * A class that provides convenience methods for sorting batches of data
@@ -77,7 +78,11 @@ class GpuSorter(
    */
   def this(sortOrder: Seq[SortOrder], inputSchema: Seq[Attribute],
       metrics: Map[String, GpuMetric]) =
-    this(sortOrder, inputSchema.toArray, metrics)
+    this(sortOrder, inputSchema.toArray, metrics, true)
+
+  def this(sortOrder: Seq[SortOrder], inputSchema: Seq[Attribute],
+      metrics: Map[String, GpuMetric], useCudfMerge: Boolean) =
+    this(sortOrder, inputSchema.toArray, metrics, useCudfMerge)
 
   private[this] val boundSortOrder =
     GpuBindReferences.bindReferences(sortOrder, inputSchema.toSeq, metrics)
@@ -236,7 +241,7 @@ class GpuSorter(
       if (spillableBatches.size == 1) {
         // Single batch no need for a merge sort
         spillableBatches.pop()
-      } else { // spillableBatches.size > 1
+      } else if (useCudfMerge) { // spillableBatches.size > 1
         // Use efficient Table.merge for all types.
         // cudf::merge now supports nested types for both key and ride-along columns.
         closeOnExcept(spillableBatches.toSeq) { _ =>
@@ -275,6 +280,25 @@ class GpuSorter(
               }
             }
             batchesToMerge.pop()
+          }
+        }
+      } else { // !useCudfMerge - concatenate and sort instead
+        val merged = RmmRapidsRetryIterator.withRetryNoSplit(spillableBatches.toSeq) { attempt =>
+          val tablesToMerge = attempt.safeMap { sb =>
+            withResource(sb.getColumnarBatch()) { cb =>
+              GpuColumnVector.from(cb)
+            }
+          }
+          val concatenated = withResource(tablesToMerge) { _ =>
+            Table.concatenate(tablesToMerge: _*)
+          }
+          withResource(concatenated) { _ =>
+            concatenated.orderBy(cudfOrdering: _*)
+          }
+        }
+        withResource(merged) { _ =>
+          closeOnExcept(GpuColumnVector.from(merged, projectedBatchTypes)) { b =>
+            SpillableColumnarBatch(b, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
           }
         }
       }

@@ -784,6 +784,14 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(false)
 
+  val ENABLE_CUDF_MERGE_SORT = conf("spark.rapids.sql.sort.cudfMerge.enabled")
+      .doc("When set to true, use the efficient cudf::merge for merge sorting multiple sorted " +
+          "batches. cudf::merge supports nested types for both key and ride-along columns. " +
+          "When set to false, batches will be concatenated and sorted together instead.")
+      .internal()
+      .booleanConf
+      .createWithDefault(true)
+
   val FILE_SCAN_PRUNE_PARTITION_ENABLED = conf("spark.rapids.sql.fileScanPrunePartition.enabled")
     .doc("Enable or disable the partition column pruning for v1 file scan. Spark always asks " +
         "for all the partition columns even a query doesn't need them. Generation of " +
@@ -3180,6 +3188,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val sizedJoinPartitionAmplification: Double = get(SIZED_JOIN_PARTITION_AMPLIFICATION)
 
   lazy val stableSort: Boolean = get(STABLE_SORT)
+
+  lazy val isCudfMergeSortEnabled: Boolean = get(ENABLE_CUDF_MERGE_SORT)
 
   lazy val isFileScanPrunePartitionEnabled: Boolean = get(FILE_SCAN_PRUNE_PARTITION_ENABLED)
 

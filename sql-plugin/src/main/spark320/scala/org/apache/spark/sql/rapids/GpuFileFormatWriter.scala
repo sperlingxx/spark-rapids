@@ -74,7 +74,7 @@ object GpuFileFormatWriter extends Logging {
 
   /** Describes how concurrent output writers should be executed. */
   case class GpuConcurrentOutputWriterSpec(maxWriters: Int, output: Seq[Attribute],
-      batchSize: Long, sortOrder: Seq[SortOrder])
+      batchSize: Long, sortOrder: Seq[SortOrder], useCudfMerge: Boolean = true)
 
   /**
    * Basic work flow of this command is:
@@ -216,9 +216,10 @@ object GpuFileFormatWriter extends Logging {
               .map(attr => SortOrder(attr, Ascending)), finalOutputSpec.outputColumns)
         if (concurrentWritersEnabled) {
           val batchSize = RapidsConf.GPU_BATCH_SIZE_BYTES.get(sparkSession.sessionState.conf)
+          val useCudfMerge = RapidsConf.ENABLE_CUDF_MERGE_SORT.get(sparkSession.sessionState.conf)
           (empty2NullPlan.executeColumnar(),
               Some(GpuConcurrentOutputWriterSpec(maxWriters, empty2NullPlan.output, batchSize,
-                orderingExpr)))
+                orderingExpr, useCudfMerge)))
         } else {
           val sortType = if (useStableSort) {
             FullSortSingleBatch
@@ -228,11 +229,13 @@ object GpuFileFormatWriter extends Logging {
           // TODO: Using a GPU ordering as a CPU ordering here. Should be OK for now since we do not
           //       support bucket expressions yet and the rest should be simple attributes.
           val sortTrackers = statsTrackers.filter(_.isInstanceOf[GpuWriteJobStatsTracker])
+          val useCudfMerge = RapidsConf.ENABLE_CUDF_MERGE_SORT.get(sparkSession.sessionState.conf)
           val sort = GpuSortExec(
             orderingExpr,
             global = false,
             child = empty2NullPlan,
-            sortType = sortType
+            sortType = sortType,
+            useCudfMerge = useCudfMerge
           )(orderingExpr, Some(sortTrackers.asInstanceOf[Seq[GpuWriteJobStatsTracker]]))
           (sort.executeColumnar(), None)
         }
