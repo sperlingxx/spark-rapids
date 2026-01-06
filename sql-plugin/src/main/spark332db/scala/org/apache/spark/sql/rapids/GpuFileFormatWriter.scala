@@ -190,10 +190,12 @@ trait GpuFileFormatWriterBase extends Serializable with Logging {
         // this sort plan does not execute, only use its output
         val batchSize = RapidsConf.GPU_BATCH_SIZE_BYTES.get(sparkSession.sessionState.conf)
         val useCudfMerge = RapidsConf.ENABLE_CUDF_MERGE_SORT.get(sparkSession.sessionState.conf)
+        val targetBatchSizeDivisor =
+          RapidsConf.OUT_OF_CORE_SORT_BATCH_DIVISOR.get(sparkSession.sessionState.conf)
         val sortPlan = createSortPlan(plan, orderingExpr, useStableSort, statsTrackers,
-          useCudfMerge)
+          useCudfMerge, targetBatchSizeDivisor)
         GpuWriteFiles.createConcurrentOutputWriterSpec(sparkSession, sortColumns,
-          sortPlan.output, batchSize, orderingExpr, useCudfMerge)
+          sortPlan.output, batchSize, orderingExpr, useCudfMerge, targetBatchSizeDivisor)
       }
       val writeSpec = GpuWriteFilesSpec(
         description = description,
@@ -247,8 +249,11 @@ trait GpuFileFormatWriterBase extends Serializable with Logging {
             .map(attr => SortOrder(attr, Ascending)), outputSpec.outputColumns)
         val batchSize = RapidsConf.GPU_BATCH_SIZE_BYTES.get(sparkSession.sessionState.conf)
         val useCudfMerge = RapidsConf.ENABLE_CUDF_MERGE_SORT.get(sparkSession.sessionState.conf)
+        val targetBatchSizeDivisor =
+          RapidsConf.OUT_OF_CORE_SORT_BATCH_DIVISOR.get(sparkSession.sessionState.conf)
         val concurrentOutputWriterSpec = GpuWriteFiles.createConcurrentOutputWriterSpec(
-          sparkSession, sortColumns, empty2NullPlan.output, batchSize, orderingExpr, useCudfMerge)
+          sparkSession, sortColumns, empty2NullPlan.output, batchSize, orderingExpr, useCudfMerge,
+          targetBatchSizeDivisor)
 
         if (concurrentOutputWriterSpec.isDefined) {
           // concurrent write
@@ -256,7 +261,7 @@ trait GpuFileFormatWriterBase extends Serializable with Logging {
         } else {
           // sort, then write
           val sortPlan = createSortPlan(empty2NullPlan, orderingExpr, useStableSort,
-            description.statsTrackers, useCudfMerge)
+            description.statsTrackers, useCudfMerge, targetBatchSizeDivisor)
           val sort = sortPlan.executeColumnar()
           (sort, concurrentOutputWriterSpec) // concurrentOutputWriterSpec is None
         }
@@ -375,7 +380,8 @@ trait GpuFileFormatWriterBase extends Serializable with Logging {
       orderingExpr: Seq[SortOrder],
       useStableSort: Boolean,
       statsTrackers: Seq[ColumnarWriteJobStatsTracker],
-      useCudfMerge: Boolean = true): GpuSortExec = {
+      useCudfMerge: Boolean = true,
+      targetBatchSizeDivisor: Int = 8): GpuSortExec = {
     // SPARK-21165: the `requiredOrdering` is based on the attributes from analyzed plan, and
     // the physical plan may have different attribute ids due to optimizer removing some
     // aliases. Here we bind the expression ahead to avoid potential attribute ids mismatch.
@@ -384,7 +390,7 @@ trait GpuFileFormatWriterBase extends Serializable with Logging {
     val sortType = if (useStableSort) {
       FullSortSingleBatch
     } else {
-      OutOfCoreSort
+      OutOfCoreSort(useCudfMerge, targetBatchSizeDivisor)
     }
     // TODO: Using a GPU ordering as a CPU ordering here. Should be OK for now since we do not
     //       support bucket expressions yet and the rest should be simple attributes.
@@ -393,8 +399,7 @@ trait GpuFileFormatWriterBase extends Serializable with Logging {
       orderingExpr,
       global = false,
       child = child,
-      sortType = sortType,
-      useCudfMerge = useCudfMerge
+      sortType = sortType
     )(orderingExpr, Some(sortTrackers.asInstanceOf[Seq[GpuWriteJobStatsTracker]]))
   }
 
@@ -518,7 +523,8 @@ trait GpuFileFormatWriterBase extends Serializable with Logging {
 object GpuFileFormatWriter extends GpuFileFormatWriterBase {
   /** Describes how concurrent output writers should be executed. */
   case class GpuConcurrentOutputWriterSpec(maxWriters: Int, output: Seq[Attribute],
-      batchSize: Long, sortOrder: Seq[SortOrder], useCudfMerge: Boolean = true)
+      batchSize: Long, sortOrder: Seq[SortOrder], useCudfMerge: Boolean = true,
+      targetBatchSizeDivisor: Int = 8)
 
   def createTaskAttemptContext(description: GpuWriteJobDescription,
       hadoopConf: Configuration,

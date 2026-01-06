@@ -74,7 +74,8 @@ object GpuFileFormatWriter extends Logging {
 
   /** Describes how concurrent output writers should be executed. */
   case class GpuConcurrentOutputWriterSpec(maxWriters: Int, output: Seq[Attribute],
-      batchSize: Long, sortOrder: Seq[SortOrder], useCudfMerge: Boolean = true)
+      batchSize: Long, sortOrder: Seq[SortOrder], useCudfMerge: Boolean = true,
+      targetBatchSizeDivisor: Int = 8)
 
   /**
    * Basic work flow of this command is:
@@ -217,25 +218,28 @@ object GpuFileFormatWriter extends Logging {
         if (concurrentWritersEnabled) {
           val batchSize = RapidsConf.GPU_BATCH_SIZE_BYTES.get(sparkSession.sessionState.conf)
           val useCudfMerge = RapidsConf.ENABLE_CUDF_MERGE_SORT.get(sparkSession.sessionState.conf)
+          val targetBatchSizeDivisor =
+            RapidsConf.OUT_OF_CORE_SORT_BATCH_DIVISOR.get(sparkSession.sessionState.conf)
           (empty2NullPlan.executeColumnar(),
               Some(GpuConcurrentOutputWriterSpec(maxWriters, empty2NullPlan.output, batchSize,
-                orderingExpr, useCudfMerge)))
+                orderingExpr, useCudfMerge, targetBatchSizeDivisor)))
         } else {
+          val useCudfMerge = RapidsConf.ENABLE_CUDF_MERGE_SORT.get(sparkSession.sessionState.conf)
+          val targetBatchSizeDivisor =
+            RapidsConf.OUT_OF_CORE_SORT_BATCH_DIVISOR.get(sparkSession.sessionState.conf)
           val sortType = if (useStableSort) {
             FullSortSingleBatch
           } else {
-            OutOfCoreSort
+            OutOfCoreSort(useCudfMerge, targetBatchSizeDivisor)
           }
           // TODO: Using a GPU ordering as a CPU ordering here. Should be OK for now since we do not
           //       support bucket expressions yet and the rest should be simple attributes.
           val sortTrackers = statsTrackers.filter(_.isInstanceOf[GpuWriteJobStatsTracker])
-          val useCudfMerge = RapidsConf.ENABLE_CUDF_MERGE_SORT.get(sparkSession.sessionState.conf)
           val sort = GpuSortExec(
             orderingExpr,
             global = false,
             child = empty2NullPlan,
-            sortType = sortType,
-            useCudfMerge = useCudfMerge
+            sortType = sortType
           )(orderingExpr, Some(sortTrackers.asInstanceOf[Seq[GpuWriteJobStatsTracker]]))
           (sort.executeColumnar(), None)
         }
