@@ -183,11 +183,13 @@ object GpuWriteFiles {
       sortColumns: Seq[Attribute],
       output: Seq[Attribute],
       batchSize: Long,
-      sortOrder: Seq[SortOrder]): Option[GpuConcurrentOutputWriterSpec] = {
+      sortOrder: Seq[SortOrder],
+      targetBatchSizeDivisor: Int = 8): Option[GpuConcurrentOutputWriterSpec] = {
     val maxWriters = sparkSession.sessionState.conf.maxConcurrentOutputFileWriters
     val concurrentWritersEnabled = maxWriters > 0 && sortColumns.isEmpty
     if (concurrentWritersEnabled) {
-      Some(GpuConcurrentOutputWriterSpec(maxWriters, output, batchSize, sortOrder))
+      Some(GpuConcurrentOutputWriterSpec(maxWriters, output, batchSize, sortOrder,
+        targetBatchSizeDivisor))
     } else {
       None
     }

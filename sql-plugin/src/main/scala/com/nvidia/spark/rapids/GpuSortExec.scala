@@ -41,7 +41,20 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 
 sealed trait SortExecType extends Serializable
 
-object OutOfCoreSort extends SortExecType
+/**
+ * Out-of-core sort type with configurable parameters.
+ * @param targetBatchSizeDivisor The divisor used to calculate the target batch size for
+ *                               splitting sorted data. The target batch size is calculated
+ *                               as targetSize / divisor.
+ */
+case class OutOfCoreSort(
+    targetBatchSizeDivisor: Int = 8) extends SortExecType
+
+object OutOfCoreSort {
+  /** Default instance for backward compatibility */
+  val default: OutOfCoreSort = OutOfCoreSort()
+}
+
 object FullSortSingleBatch extends SortExecType
 object SortEachBatch extends SortExecType
 
@@ -63,10 +76,15 @@ class GpuSortMeta(
     childPlans.head.availableRuntimeDataTransition
 
   override def convertToGpu(): GpuExec = {
+    val sortType = if (conf.stableSort) {
+      FullSortSingleBatch
+    } else {
+      OutOfCoreSort(conf.outOfCoreSortBatchDivisor)
+    }
     GpuSortExec(childExprs.map(_.convertToGpu()).asInstanceOf[Seq[SortOrder]],
       sort.global,
       childPlans.head.convertIfNeeded(),
-      if (conf.stableSort) FullSortSingleBatch else OutOfCoreSort
+      sortType
     )(sort.sortOrder)
   }
 }
@@ -96,7 +114,7 @@ case class GpuSortExec(
 
   override def childrenCoalesceGoal: Seq[CoalesceGoal] = sortType match {
     case FullSortSingleBatch => Seq(RequireSingleBatch)
-    case OutOfCoreSort | SortEachBatch => Seq(null)
+    case _: OutOfCoreSort | SortEachBatch => Seq(null)
     case t => throw new IllegalArgumentException(s"Unexpected Sort Type $t")
   }
 
@@ -128,26 +146,26 @@ case class GpuSortExec(
   private lazy val targetSize = GpuSortExec.targetSize(conf)
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val sorter = new GpuSorter(gpuSortOrder, output, allMetrics)
-
     val sortTime = gpuLongMetric(SORT_TIME)
     val opTime = gpuLongMetric(OP_TIME_LEGACY)
     val outputBatch = gpuLongMetric(NUM_OUTPUT_BATCHES)
     val outputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
-    val outOfCore = sortType == OutOfCoreSort
     val singleBatch = sortType == FullSortSingleBatch
     child.executeColumnar().mapPartitions { cbIter =>
       val taskTrackers = writeTrackers.map { tcs =>
         tcs.map(_.newTaskInstance().asInstanceOf[GpuWriteTaskStatsTracker])
       }
-      val finalIter = if (outOfCore) {
-        val iter = GpuOutOfCoreSortIterator(cbIter, sorter,
-          targetSize, opTime, sortTime, outputBatch, outputRows)
-        onTaskCompletion(iter.close())
-        iter
-      } else {
-        GpuSortEachBatchIterator(cbIter, sorter, singleBatch,
-          opTime, sortTime, outputBatch, outputRows)
+      val finalIter = sortType match {
+        case OutOfCoreSort(targetBatchSizeDivisor) =>
+          val sorter = new GpuSorter(gpuSortOrder, output, allMetrics)
+          val iter = GpuOutOfCoreSortIterator(cbIter, sorter,
+            targetSize, opTime, sortTime, outputBatch, outputRows, targetBatchSizeDivisor)
+          onTaskCompletion(iter.close())
+          iter
+        case _ =>
+          val sorter = new GpuSorter(gpuSortOrder, output, allMetrics)
+          GpuSortEachBatchIterator(cbIter, sorter, singleBatch,
+            opTime, sortTime, outputBatch, outputRows)
       }
       if (taskTrackers.exists(_.nonEmpty)) {
         finalIter.map { cb =>
@@ -302,7 +320,8 @@ case class GpuOutOfCoreSortIterator(
     opTime: GpuMetric,
     sortTime: GpuMetric,
     outputBatches: GpuMetric,
-    outputRows: GpuMetric) extends Iterator[ColumnarBatch]
+    outputRows: GpuMetric,
+    targetBatchSizeDivisor: Int = 8) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
   /**
@@ -370,8 +389,8 @@ case class GpuOutOfCoreSortIterator(
     // We need to figure out how to split up the data into reasonable batches. We could try and do
     // something really complicated and figure out how much data get per batch, but in practice
     // we really only expect to see one or two batches worth of data come in, so lets optimize
-    // for that case and set the targetBatchSize to always be 1/8th the targetSize.
-    val targetBatchSize = targetSize / 8
+    // for that case and set the targetBatchSize to be targetSize / targetBatchSizeDivisor.
+    val targetBatchSize = targetSize / targetBatchSizeDivisor
     val rows = sortedTbl.getRowCount.toInt
     val memSize = GpuColumnVector.getTotalDeviceMemoryUsed(sortedTbl)
     val averageRowSize = memSize.toDouble/rows

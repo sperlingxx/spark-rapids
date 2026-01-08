@@ -784,6 +784,17 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(false)
 
+  val OUT_OF_CORE_SORT_BATCH_DIVISOR = conf("spark.rapids.sql.sort.outOfCore.batchSizeDivisor")
+      .doc("The divisor used to calculate the target batch size for splitting sorted data " +
+          "in out-of-core sort. The target batch size is calculated as targetSize / divisor. " +
+          "A smaller divisor results in larger batches, while a larger divisor results in " +
+          "smaller batches. The default value of 8 means the target batch size is 1/8th of " +
+          "the target size.")
+      .internal()
+      .integerConf
+      .checkValue(v => v >= 1, "The divisor must be at least 1")
+      .createWithDefault(8)
+
   val FILE_SCAN_PRUNE_PARTITION_ENABLED = conf("spark.rapids.sql.fileScanPrunePartition.enabled")
     .doc("Enable or disable the partition column pruning for v1 file scan. Spark always asks " +
         "for all the partition columns even a query doesn't need them. Generation of " +
@@ -3180,6 +3191,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val sizedJoinPartitionAmplification: Double = get(SIZED_JOIN_PARTITION_AMPLIFICATION)
 
   lazy val stableSort: Boolean = get(STABLE_SORT)
+
+  lazy val outOfCoreSortBatchDivisor: Int = get(OUT_OF_CORE_SORT_BATCH_DIVISOR)
 
   lazy val isFileScanPrunePartitionEnabled: Boolean = get(FILE_SCAN_PRUNE_PARTITION_ENABLED)
 
