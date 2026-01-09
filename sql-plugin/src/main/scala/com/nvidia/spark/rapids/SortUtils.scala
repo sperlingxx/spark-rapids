@@ -206,11 +206,11 @@ class GpuSorter(
    * Sort a batch of data that is the output of `appendProjectedColumns`. Be careful because
    * a batch with no columns/only rows will cause errors and should be special cased.
    * @param inputBatch the batch to sort
-   * @param sortTime metric for the sort time
+   * @param metrics metrics for the sort time
    * @return a sorted table.
    */
-  final def sort(inputBatch: ColumnarBatch, sortTime: GpuMetric): Table = {
-    NvtxIdWithMetrics(NvtxRegistry.SORT, sortTime) {
+  final def sort(inputBatch: ColumnarBatch, metrics: GpuMetric*): Table = {
+    NvtxIdWithMetrics(NvtxRegistry.SORT, metrics: _*) {
       withResource(GpuColumnVector.from(inputBatch)) { toSortTbl =>
         toSortTbl.orderBy(cudfOrdering: _*)
       }
@@ -326,6 +326,98 @@ class GpuSorter(
   }
 
   /**
+   * Merge multiple batches together. All of these batches should be the output of
+   * `appendProjectedColumns` and the output of this will also be in that same format.
+   * This overload accepts an additional detailed metric for tracking merge sort time separately.
+   *
+   * After this function is called, the argument `spillableBatches` should not be used.
+   *
+   * @param spillableBatches the spillable batches to sort
+   * @param sortMetrics metrics to track merge sort time (can include overall and detailed metrics)
+   * @return the sorted data.
+   */
+  final def mergeSortAndCloseWithRetry(
+      spillableBatches: RapidsStack[SpillableColumnarBatch],
+      sortMetrics: Seq[GpuMetric]): SpillableColumnarBatch = {
+    closeOnExcept(spillableBatches.toSeq) { _ =>
+      assert(spillableBatches.nonEmpty)
+    }
+    def doMergeSort(): SpillableColumnarBatch = {
+      if (spillableBatches.size == 1) {
+        // Single batch no need for a merge sort
+        spillableBatches.pop()
+      } else { // spillableBatches.size > 1
+        // In the current version of cudf merge does not work for lists and maps.
+        // This should be fixed by https://github.com/rapidsai/cudf/issues/8050
+        // Nested types in sort key columns is not supported either.
+        if (hasNestedInKeyColumns || hasUnsupportedNestedInRideColumns) {
+          // so as a work around we concatenate all of the data together and then sort it.
+          // It is slower, but it works
+          val merged = RmmRapidsRetryIterator.withRetryNoSplit(spillableBatches.toSeq) {
+            attempt =>
+              val tablesToMerge = attempt.safeMap { sb =>
+                withResource(sb.getColumnarBatch()) { cb =>
+                  GpuColumnVector.from(cb)
+                }
+              }
+              val concatenated = withResource(tablesToMerge) { _ =>
+                Table.concatenate(tablesToMerge: _*)
+              }
+              withResource(concatenated) { _ =>
+                concatenated.orderBy(cudfOrdering: _*)
+              }
+          }
+          withResource(merged) { _ =>
+            closeOnExcept(GpuColumnVector.from(merged, projectedBatchTypes)) { b =>
+              SpillableColumnarBatch(b, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+            }
+          }
+        } else {
+          closeOnExcept(spillableBatches.toSeq) { _ =>
+            val batchesToMerge = new RapidsStack[SpillableColumnarBatch]()
+            closeOnExcept(batchesToMerge.toSeq) { _ =>
+              while (spillableBatches.nonEmpty || batchesToMerge.size > 1) {
+                // pop a spillable batch if there is one, and add it to `batchesToMerge`.
+                if (spillableBatches.nonEmpty) {
+                  batchesToMerge.push(spillableBatches.pop())
+                }
+                if (batchesToMerge.size > 1) {
+                  val merged = RmmRapidsRetryIterator.withRetryNoSplit[Table] {
+                    val tablesToMerge = batchesToMerge.toSeq.safeMap { sb =>
+                      withResource(sb.getColumnarBatch()) { cb =>
+                        GpuColumnVector.from(cb)
+                      }
+                    }
+                    withResource(tablesToMerge) { _ =>
+                      Table.merge(tablesToMerge.toArray, cudfOrdering: _*)
+                    }
+                  }
+
+                  // we no longer care about the old batches, we closed them
+                  closeOnExcept(merged) { _ =>
+                    batchesToMerge.toSeq.safeClose()
+                    batchesToMerge.clear()
+                  }
+
+                  // add the result to be merged with the next spillable batch
+                  withResource(merged) { _ =>
+                    closeOnExcept(GpuColumnVector.from(merged, projectedBatchTypes)) { b =>
+                      batchesToMerge.push(
+                        SpillableColumnarBatch(b, SpillPriorities.ACTIVE_ON_DECK_PRIORITY))
+                    }
+                  }
+                }
+              }
+              batchesToMerge.pop()
+            }
+          }
+        }
+      }
+    }
+    NvtxIdWithMetrics(NvtxRegistry.MERGE_SORT, sortMetrics: _*)(doMergeSort())
+  }
+
+  /**
    * Get the sort order for a batch of data that is the output of `appendProjectedColumns`.
    * Be careful because a batch with no columns/only rows will cause errors and should be special
    * cased.
@@ -357,9 +449,9 @@ class GpuSorter(
    * @param sortTime metric for the sort time
    * @return a sorted table.
    */
-  final def appendProjectedAndSort(inputBatch: ColumnarBatch, sortTime: GpuMetric): Table = {
+  final def appendProjectedAndSort(inputBatch: ColumnarBatch, metrics: GpuMetric*): Table = {
     withResource(appendProjectedColumns(inputBatch)) { toSort =>
-      sort(toSort, sortTime)
+      sort(toSort, metrics: _*)
     }
   }
 

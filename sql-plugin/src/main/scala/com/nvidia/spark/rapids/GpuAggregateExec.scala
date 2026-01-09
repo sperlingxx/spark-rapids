@@ -2214,13 +2214,15 @@ class DynamicGpuPartialAggregateIterator(
       inputIter
     } else {
       val sorter = new GpuSorter(ordering, inputAttrs, allMetrics)
+      val timeMetrics = OocSortTimeMetrics(
+        sortTime = metrics.sortTime,
+        opTime = metrics.opTime)
       GpuOutOfCoreSortIterator(inputIter,
         sorter,
         configuredTargetBatchSize,
-        opTime = metrics.opTime,
-        sortTime = metrics.sortTime,
         outputBatches = NoopMetric,
-        outputRows = NoopMetric)
+        outputRows = NoopMetric,
+        timeMetrics = timeMetrics)
     }
 
     // After sorting we want to split the input for the project so that

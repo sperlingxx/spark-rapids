@@ -58,6 +58,91 @@ object OutOfCoreSort {
 object FullSortSingleBatch extends SortExecType
 object SortEachBatch extends SortExecType
 
+/**
+ * Base trait for sort time metrics.
+ * Contains the required sortTime and opTime metrics that are common to all sort operations.
+ */
+trait SortTimeMetrics {
+  def sortTime: GpuMetric
+  def opTime: GpuMetric
+}
+
+/**
+ * Time metrics for stable sort (single batch sort).
+ * Contains only the required sortTime and opTime metrics.
+ *
+ * @param sortTime Overall sort time metric
+ * @param opTime Operation time metric
+ */
+case class StableSortTimeMetrics(
+    sortTime: GpuMetric,
+    opTime: GpuMetric) extends SortTimeMetrics
+
+object StableSortTimeMetrics {
+  /**
+   * Create time metrics from a metrics map.
+   * @param allMetrics the metrics map from GpuExec
+   * @return StableSortTimeMetrics with required metrics
+   */
+  def fromMetrics(allMetrics: Map[String, GpuMetric]): StableSortTimeMetrics = {
+    StableSortTimeMetrics(
+      sortTime = allMetrics.getOrElse(GpuMetric.SORT_TIME, NoopMetric),
+      opTime = allMetrics.getOrElse(GpuMetric.OP_TIME_LEGACY, NoopMetric)
+    )
+  }
+}
+
+/**
+ * A container class for time metrics of the out-of-core sort iterator.
+ * Contains the required sortTime and opTime metrics, plus optional detailed metrics
+ * for tracking time spent in each stage of the out-of-core sort algorithm.
+ *
+ * @param sortTime Overall sort time metric (required)
+ * @param opTime Operation time metric (required)
+ * @param firstPassSortTime Time spent sorting individual batches in the first pass (optional)
+ * @param firstPassSplitTime Time spent splitting sorted batches in the first pass (optional)
+ * @param mergeSortTime Time spent in merge sort operations (optional)
+ * @param mergeSortSplitTime Time spent splitting after merge sort (optional)
+ * @param sortConcatTime Time spent concatenating sorted output batches (optional)
+ */
+case class OocSortTimeMetrics(
+    sortTime: GpuMetric,
+    opTime: GpuMetric,
+    firstPassSortTime: Option[GpuMetric] = None,
+    firstPassSplitTime: Option[GpuMetric] = None,
+    mergeSortTime: Option[GpuMetric] = None,
+    mergeSortSplitTime: Option[GpuMetric] = None,
+    sortConcatTime: Option[GpuMetric] = None) extends SortTimeMetrics
+
+object OocSortTimeMetrics {
+  /**
+   * Create time metrics from a metrics map.
+   * @param allMetrics the metrics map from GpuExec
+   * @param detailedMetricsEnabled whether detailed metrics are enabled
+   * @return OocSortTimeMetrics with required metrics and optional detailed metrics
+   */
+  def fromMetrics(
+      allMetrics: Map[String, GpuMetric],
+      detailedMetricsEnabled: Boolean): OocSortTimeMetrics = {
+    val sortTime = allMetrics.getOrElse(GpuMetric.SORT_TIME, NoopMetric)
+    val opTime = allMetrics.getOrElse(GpuMetric.OP_TIME_LEGACY, NoopMetric)
+
+    if (detailedMetricsEnabled) {
+      OocSortTimeMetrics(
+        sortTime = sortTime,
+        opTime = opTime,
+        firstPassSortTime = allMetrics.get(GpuMetric.FIRST_PASS_SORT_TIME),
+        firstPassSplitTime = allMetrics.get(GpuMetric.FIRST_PASS_SPLIT_TIME),
+        mergeSortTime = allMetrics.get(GpuMetric.MERGE_SORT_TIME),
+        mergeSortSplitTime = allMetrics.get(GpuMetric.MERGE_SORT_SPLIT_TIME),
+        sortConcatTime = allMetrics.get(GpuMetric.SORT_CONCAT_TIME)
+      )
+    } else {
+      OocSortTimeMetrics(sortTime = sortTime, opTime = opTime)
+    }
+  }
+}
+
 class GpuSortMeta(
     sort: SortExec,
     conf: RapidsConf,
@@ -138,16 +223,32 @@ case class GpuSortExec(
   override def doExecute(): RDD[InternalRow] =
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
-  override lazy val additionalMetrics: Map[String, GpuMetric] =
-    Map(
+  override lazy val additionalMetrics: Map[String, GpuMetric] = {
+    val baseMetrics = Map(
       OP_TIME_LEGACY -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_OP_TIME_LEGACY),
       SORT_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_SORT_TIME))
 
+    if (detailedMetricsEnabled) {
+      baseMetrics ++ Map(
+        FIRST_PASS_SORT_TIME -> createNanoTimingMetric(DEBUG_LEVEL,
+          DESCRIPTION_FIRST_PASS_SORT_TIME),
+        FIRST_PASS_SPLIT_TIME -> createNanoTimingMetric(DEBUG_LEVEL,
+          DESCRIPTION_FIRST_PASS_SPLIT_TIME),
+        MERGE_SORT_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_MERGE_SORT_TIME),
+        MERGE_SORT_SPLIT_TIME -> createNanoTimingMetric(DEBUG_LEVEL,
+          DESCRIPTION_MERGE_SORT_SPLIT_TIME),
+        SORT_CONCAT_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_SORT_CONCAT_TIME))
+    } else {
+      baseMetrics
+    }
+  }
+
   private lazy val targetSize = GpuSortExec.targetSize(conf)
+  private lazy val detailedMetricsEnabled = {
+    new RapidsConf(conf).isOutOfCoreSortDetailedMetricsEnabled
+  }
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val sortTime = gpuLongMetric(SORT_TIME)
-    val opTime = gpuLongMetric(OP_TIME_LEGACY)
     val outputBatch = gpuLongMetric(NUM_OUTPUT_BATCHES)
     val outputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val singleBatch = sortType == FullSortSingleBatch
@@ -155,23 +256,25 @@ case class GpuSortExec(
       val taskTrackers = writeTrackers.map { tcs =>
         tcs.map(_.newTaskInstance().asInstanceOf[GpuWriteTaskStatsTracker])
       }
-      val finalIter = sortType match {
+      val (finalIter, timeMetrics: SortTimeMetrics) = sortType match {
         case OutOfCoreSort(targetBatchSizeDivisor) =>
+          val oocMetrics = OocSortTimeMetrics.fromMetrics(allMetrics, detailedMetricsEnabled)
           val sorter = new GpuSorter(gpuSortOrder, output, allMetrics)
           val iter = GpuOutOfCoreSortIterator(cbIter, sorter,
-            targetSize, opTime, sortTime, outputBatch, outputRows, targetBatchSizeDivisor)
+            targetSize, outputBatch, outputRows, targetBatchSizeDivisor, oocMetrics)
           onTaskCompletion(iter.close())
-          iter
+          (iter, oocMetrics)
         case _ =>
+          val stableMetrics = StableSortTimeMetrics.fromMetrics(allMetrics)
           val sorter = new GpuSorter(gpuSortOrder, output, allMetrics)
-          GpuSortEachBatchIterator(cbIter, sorter, singleBatch,
-            opTime, sortTime, outputBatch, outputRows)
+          val iter = GpuSortEachBatchIterator(cbIter, sorter, singleBatch,
+            stableMetrics.opTime, stableMetrics.sortTime, outputBatch, outputRows)
+          (iter, stableMetrics)
       }
       if (taskTrackers.exists(_.nonEmpty)) {
         finalIter.map { cb =>
           taskTrackers.get.foreach { tc =>
-            tc.setSortTime(sortTime.value)
-            tc.setSortOpTime(opTime.value)
+            tc.setSortTimeMetrics(timeMetrics)
           }
           cb
         }
@@ -223,7 +326,7 @@ object GpuSpillableProjectedSortEachBatchIterator {
       iter: Iterator[ColumnarBatch],
       sorter: GpuSorter,
       opTime: GpuMetric = NoopMetric,
-      sortTime: GpuMetric = NoopMetric): Iterator[SpillableColumnarBatch] = {
+      sortMetrics: Seq[GpuMetric] = Seq.empty): Iterator[SpillableColumnarBatch] = {
     val spillableIter = iter.flatMap { cb =>
         // Filter out empty batches and make them spillable
         if (cb.numRows() > 0) {
@@ -238,7 +341,7 @@ object GpuSpillableProjectedSortEachBatchIterator {
       withRetry(scb, splitSpillableInHalfByRows) { attemptScb =>
         opTime.ns {
           val sortedTbl = withResource(attemptScb.getColumnarBatch()) { attemptCb =>
-            sorter.appendProjectedAndSort(attemptCb, sortTime)
+            sorter.appendProjectedAndSort(attemptCb, sortMetrics: _*)
           }
           withResource(sortedTbl) { _ =>
             closeOnExcept(GpuColumnVector.from(sortedTbl, sorter.projectedBatchTypes)) { cb =>
@@ -317,18 +420,24 @@ case class GpuOutOfCoreSortIterator(
     iter: Iterator[ColumnarBatch],
     sorter: GpuSorter,
     targetSize: Long,
-    opTime: GpuMetric,
-    sortTime: GpuMetric,
     outputBatches: GpuMetric,
     outputRows: GpuMetric,
-    targetBatchSizeDivisor: Int = 8) extends Iterator[ColumnarBatch]
+    targetBatchSizeDivisor: Int = 8,
+    timeMetrics: OocSortTimeMetrics) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
   /**
    * This has already sorted the data, and it still has the projected columns in it that need to
    * be removed before it is returned.
    */
-  val alreadySortedIter = GpuSpillableProjectedSortEachBatchIterator(iter, sorter, opTime, sortTime)
+  val alreadySortedIter = GpuSpillableProjectedSortEachBatchIterator(
+    iter,
+    sorter,
+    timeMetrics.opTime,
+    sortMetrics = timeMetrics.firstPassSortTime match {
+      case Some(op) => timeMetrics.sortTime :: op :: Nil
+      case None => timeMetrics.sortTime :: Nil
+    })
 
   private val cpuOrd = new LazilyGeneratedOrdering(sorter.cpuOrdering)
   // A priority queue of data that is not merged yet.
@@ -483,7 +592,11 @@ case class GpuOutOfCoreSortIterator(
    * merging.
    */
   private final def splitOneSortedBatch(scb: SpillableColumnarBatch): Unit = {
-    NvtxIdWithMetrics(NvtxRegistry.SPLIT_INPUT_BATCH, opTime) {
+    val metrics = timeMetrics.firstPassSplitTime match {
+      case Some(op) => Seq(timeMetrics.opTime, op)
+      case None => Seq(timeMetrics.opTime)
+    }
+    NvtxIdWithMetrics(NvtxRegistry.SPLIT_INPUT_BATCH, metrics: _*) {
       val ret = withRetryNoSplit(scb) { attempt =>
         onFirstPassSplit()
         splitAfterSort(attempt)
@@ -524,7 +637,8 @@ case class GpuOutOfCoreSortIterator(
         }
       }
 
-      val mergedSpillBatch = sorter.mergeSortAndCloseWithRetry(pendingSort, sortTime)
+      val mergedSpillBatch = sorter.mergeSortAndCloseWithRetry(
+        pendingSort, Seq(timeMetrics.sortTime) ++ timeMetrics.mergeSortTime.toSeq)
       val (retBatch, sortedOffset) = closeOnExcept(mergedSpillBatch) { _ =>
         // First we want figure out what is fully sorted from what is not
         val sortSplitOffset = if (pending.isEmpty) {
@@ -570,9 +684,14 @@ case class GpuOutOfCoreSortIterator(
         mergedSpillBatch.close()
         return retBatch
       } else {
-        val splitResult = withRetryNoSplit(mergedSpillBatch) { attempt =>
-          onMergeSortSplit()
-          splitAfterSort(attempt, sortedOffset)
+        val splitMetrics = timeMetrics.mergeSortSplitTime.toSeq
+        val splitResult = {
+          NvtxIdWithMetrics(NvtxRegistry.SPLIT_INPUT_BATCH, splitMetrics: _*) {
+            withRetryNoSplit(mergedSpillBatch) { attempt =>
+              onMergeSortSplit()
+              splitAfterSort(attempt, sortedOffset)
+            }
+          }
         }
         saveSplitResult(splitResult)
       }
@@ -597,31 +716,38 @@ case class GpuOutOfCoreSortIterator(
         spillCbs += tmp
       }
     }
+    val concatMetrics = timeMetrics.sortConcatTime.toSeq
     if (spillCbs.length == 1) {
       // We cannot concat a single table
-      withRetryNoSplit(spillCbs.head) { attemptSp =>
-        onConcatOutput()
-        withResource(attemptSp.getColumnarBatch()) { attemptCb =>
-          withResource(GpuColumnVector.from(attemptCb)) { attemptTbl =>
-            sorter.removeProjectedColumns(attemptTbl)
+      def doConcat(): ColumnarBatch = {
+        withRetryNoSplit(spillCbs.head) { attemptSp =>
+          onConcatOutput()
+          withResource(attemptSp.getColumnarBatch()) { attemptCb =>
+            withResource(GpuColumnVector.from(attemptCb)) { attemptTbl =>
+              sorter.removeProjectedColumns(attemptTbl)
+            }
           }
         }
       }
+      NvtxIdWithMetrics(NvtxRegistry.SORT_CONCAT_OUTPUT, concatMetrics: _*)(doConcat())
     } else {
       // withRetryNoSplit will take over the batches.
-      withRetryNoSplit(spillCbs.toSeq) { attempt =>
-        onConcatOutput()
-        val tables = attempt.safeMap { sp =>
-          withResource(sp.getColumnarBatch())(GpuColumnVector.from)
-        }
-        withResource(tables) { _ =>
-          withResource(Table.concatenate(tables: _*)) { combined =>
-            // ignore the output of removing the columns because it is just dropping columns
-            // so it will be smaller than this with not added memory
-            sorter.removeProjectedColumns(combined)
+      def doConcat(): ColumnarBatch = {
+        withRetryNoSplit(spillCbs.toSeq) { attempt =>
+          onConcatOutput()
+          val tables = attempt.safeMap { sp =>
+            withResource(sp.getColumnarBatch())(GpuColumnVector.from)
+          }
+          withResource(tables) { _ =>
+            withResource(Table.concatenate(tables: _*)) { combined =>
+              // ignore the output of removing the columns because it is just dropping columns
+              // so it will be smaller than this with not added memory
+              sorter.removeProjectedColumns(combined)
+            }
           }
         }
       }
+      NvtxIdWithMetrics(NvtxRegistry.SORT_CONCAT_OUTPUT, concatMetrics: _*)(doConcat())
     }
   }
 
@@ -633,6 +759,10 @@ case class GpuOutOfCoreSortIterator(
         scb.getColumnarBatch()
       }
     } else {
+      // timeMetrics.opTime consists of 3 parts:
+      // 1. time spent in firstPassSort (inside alreadySortedIter)
+      // 2. time spent in splitAfterFirstPassSort (firstPassReadBatches)
+      // 3. time spent in mergeSort (mergeSortEnoughToOutput)
       if (pending.isEmpty && sorted.isEmpty) {
         closeOnExcept(alreadySortedIter.next()) { scb =>
           if (!alreadySortedIter.hasNext) {
@@ -642,7 +772,7 @@ case class GpuOutOfCoreSortIterator(
           }
         }
       }
-      NvtxIdWithMetrics(NvtxRegistry.SORT_NEXT_OUTPUT_BATCH, opTime) {
+      NvtxIdWithMetrics(NvtxRegistry.SORT_NEXT_OUTPUT_BATCH, timeMetrics.opTime) {
         val ret = mergeSortEnoughToOutput().getOrElse(concatOutput())
 
         outputBatches += 1

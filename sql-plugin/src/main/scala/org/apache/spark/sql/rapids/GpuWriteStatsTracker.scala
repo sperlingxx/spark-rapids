@@ -16,7 +16,7 @@
 
 package org.apache.spark.sql.rapids
 
-import com.nvidia.spark.rapids.{GpuDataWritingCommand, GpuMetric, GpuMetricFactory, MetricsLevel, RapidsConf}
+import com.nvidia.spark.rapids.{GpuDataWritingCommand, GpuMetric, GpuMetricFactory, MetricsLevel, NoopMetric, OocSortTimeMetrics, RapidsConf, SortTimeMetrics}
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.SparkContext
@@ -35,13 +35,57 @@ class GpuWriteTaskStatsTracker(
     taskMetrics(GpuWriteJobStatsTracker.GPU_TIME_KEY) += nanos
   }
 
-  def sortTime: GpuMetric = taskMetrics(GpuWriteJobStatsTracker.SORT_TIME_KEY)
+  /**
+   * Set sort time metrics from a SortTimeMetrics instance.
+   * This handles both basic metrics (sortTime, opTime) and optional detailed metrics
+   * when OocSortTimeMetrics is provided.
+   */
+  def setSortTimeMetrics(metrics: SortTimeMetrics): Unit = {
+    taskMetrics(GpuWriteJobStatsTracker.SORT_TIME_KEY).set(metrics.sortTime.value)
+    taskMetrics(GpuWriteJobStatsTracker.SORT_OP_TIME_KEY).set(metrics.opTime.value)
 
-  def sortOpTime: GpuMetric = taskMetrics(GpuWriteJobStatsTracker.SORT_OP_TIME_KEY)
+    // Handle detailed metrics if OocSortTimeMetrics is provided
+    metrics match {
+      case ooc: OocSortTimeMetrics =>
+        ooc.firstPassSortTime.foreach { m =>
+          taskMetrics.get(GpuWriteJobStatsTracker.FIRST_PASS_SORT_TIME_KEY)
+              .foreach(_.set(m.value))
+        }
+        ooc.firstPassSplitTime.foreach { m =>
+          taskMetrics.get(GpuWriteJobStatsTracker.FIRST_PASS_SPLIT_TIME_KEY)
+              .foreach(_.set(m.value))
+        }
+        ooc.mergeSortTime.foreach { m =>
+          taskMetrics.get(GpuWriteJobStatsTracker.MERGE_SORT_TIME_KEY)
+              .foreach(_.set(m.value))
+        }
+        ooc.mergeSortSplitTime.foreach { m =>
+          taskMetrics.get(GpuWriteJobStatsTracker.MERGE_SORT_SPLIT_TIME_KEY)
+              .foreach(_.set(m.value))
+        }
+        ooc.sortConcatTime.foreach { m =>
+          taskMetrics.get(GpuWriteJobStatsTracker.SORT_CONCAT_TIME_KEY)
+              .foreach(_.set(m.value))
+        }
+      case _ => // No detailed metrics for other SortTimeMetrics implementations
+    }
+  }
 
-  def setSortTime(nanos: Long): Unit = sortTime.set(nanos)
-
-  def setSortOpTime(nanos: Long): Unit = sortOpTime.set(nanos)
+  /**
+   * Get an OocSortTimeMetrics instance from the task metrics.
+   * This returns metrics that can be used with GpuOutOfCoreSortIterator.
+   */
+  def getSortTimeMetrics: OocSortTimeMetrics = {
+    OocSortTimeMetrics(
+      sortTime = taskMetrics.getOrElse(GpuWriteJobStatsTracker.SORT_TIME_KEY, NoopMetric),
+      opTime = taskMetrics.getOrElse(GpuWriteJobStatsTracker.SORT_OP_TIME_KEY, NoopMetric),
+      firstPassSortTime = taskMetrics.get(GpuWriteJobStatsTracker.FIRST_PASS_SORT_TIME_KEY),
+      firstPassSplitTime = taskMetrics.get(GpuWriteJobStatsTracker.FIRST_PASS_SPLIT_TIME_KEY),
+      mergeSortTime = taskMetrics.get(GpuWriteJobStatsTracker.MERGE_SORT_TIME_KEY),
+      mergeSortSplitTime = taskMetrics.get(GpuWriteJobStatsTracker.MERGE_SORT_SPLIT_TIME_KEY),
+      sortConcatTime = taskMetrics.get(GpuWriteJobStatsTracker.SORT_CONCAT_TIME_KEY)
+    )
+  }
 
   def addWriteTime(nanos: Long): Unit = {
     taskMetrics(GpuWriteJobStatsTracker.WRITE_TIME_KEY) += nanos
@@ -89,6 +133,11 @@ object GpuWriteJobStatsTracker {
   val WRITE_TIME_KEY = "writeTime"
   val SORT_TIME_KEY = "writeSortTime"
   val SORT_OP_TIME_KEY = "writeSortOpTime"
+  val FIRST_PASS_SORT_TIME_KEY = "writeFirstPassSortTime"
+  val FIRST_PASS_SPLIT_TIME_KEY = "writeFirstPassSplitTime"
+  val MERGE_SORT_TIME_KEY = "writeMergeSortTime"
+  val MERGE_SORT_SPLIT_TIME_KEY = "writeMergeSortSplitTime"
+  val SORT_CONCAT_TIME_KEY = "writeSortConcatTime"
   val WRITE_IO_TIME_KEY = "writeIOTime"
   val OP_TIME_NEW_KEY = "operatorTime"
   val ASYNC_WRITE_TOTAL_THROTTLE_TIME_KEY = "asyncWriteTotalThrottleTime"
@@ -103,7 +152,8 @@ object GpuWriteJobStatsTracker {
     val metricsConf = MetricsLevel(sparkContext.conf.get(RapidsConf.METRICS_LEVEL.key,
       RapidsConf.METRICS_LEVEL.defaultValue))
     val metricFactory = new GpuMetricFactory(metricsConf, sparkContext)
-    Map(
+
+    val commonMetrics = Map(
       GPU_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.ESSENTIAL_LEVEL,
         "GPU encode and buffer time"),
       WRITE_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.ESSENTIAL_LEVEL,
@@ -111,11 +161,11 @@ object GpuWriteJobStatsTracker {
       SORT_OP_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.MODERATE_LEVEL,
         "GPU sort op time"),
       SORT_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.DEBUG_LEVEL,
-        "GPU sort time"),
+        GpuMetric.DESCRIPTION_SORT_TIME),
       WRITE_IO_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.DEBUG_LEVEL,
         "write I/O time"),
       OP_TIME_NEW_KEY -> metricFactory.createNanoTiming(GpuMetric.MODERATE_LEVEL,
-        "op time"),
+        GpuMetric.DESCRIPTION_OP_TIME_NEW),
       TASK_COMMIT_TIME -> basicMetrics(TASK_COMMIT_TIME),
       ASYNC_WRITE_TOTAL_THROTTLE_TIME_KEY -> metricFactory.createNanoTiming(
         GpuMetric.DEBUG_LEVEL, "total throttle time"),
@@ -126,6 +176,26 @@ object GpuWriteJobStatsTracker {
       ASYNC_WRITE_MAX_THROTTLE_TIME_KEY -> metricFactory.createNanoTiming(
         GpuMetric.DEBUG_LEVEL, "max throttle time per async write")
     )
+
+    val detailedMetricsEnabled = sparkContext.conf.getBoolean(
+      RapidsConf.OUT_OF_CORE_SORT_DETAILED_METRICS.key,
+      RapidsConf.OUT_OF_CORE_SORT_DETAILED_METRICS.defaultValue)
+    if (detailedMetricsEnabled) {
+      commonMetrics ++ Map(
+        FIRST_PASS_SORT_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.DEBUG_LEVEL,
+          GpuMetric.DESCRIPTION_FIRST_PASS_SORT_TIME),
+        FIRST_PASS_SPLIT_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.DEBUG_LEVEL,
+          GpuMetric.DESCRIPTION_FIRST_PASS_SPLIT_TIME),
+        MERGE_SORT_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.DEBUG_LEVEL,
+          GpuMetric.DESCRIPTION_MERGE_SORT_TIME),
+        MERGE_SORT_SPLIT_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.DEBUG_LEVEL,
+          GpuMetric.DESCRIPTION_MERGE_SORT_SPLIT_TIME),
+        SORT_CONCAT_TIME_KEY -> metricFactory.createNanoTiming(GpuMetric.DEBUG_LEVEL,
+          GpuMetric.DESCRIPTION_SORT_CONCAT_TIME)
+      )
+    } else {
+      commonMetrics
+    }
   }
 
   def apply(serializableHadoopConf: SerializableConfiguration,

@@ -795,6 +795,16 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v >= 1, "The divisor must be at least 1")
       .createWithDefault(8)
 
+  val OUT_OF_CORE_SORT_DETAILED_METRICS = conf("spark.rapids.sql.sort.outOfCore.detailedMetrics")
+      .doc("When enabled, detailed metrics for each stage of the out-of-core sort iterator " +
+          "will be collected. This includes first pass sort time, first pass split time, " +
+          "merge sort time, merge sort split time, and concat output time. " +
+          "These metrics are useful for debugging performance issues in large sorts.")
+      .internal()
+      .startupOnly()
+      .booleanConf
+      .createWithDefault(false)
+
   val FILE_SCAN_PRUNE_PARTITION_ENABLED = conf("spark.rapids.sql.fileScanPrunePartition.enabled")
     .doc("Enable or disable the partition column pruning for v1 file scan. Spark always asks " +
         "for all the partition columns even a query doesn't need them. Generation of " +
@@ -3193,6 +3203,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val stableSort: Boolean = get(STABLE_SORT)
 
   lazy val outOfCoreSortBatchDivisor: Int = get(OUT_OF_CORE_SORT_BATCH_DIVISOR)
+
+  lazy val isOutOfCoreSortDetailedMetricsEnabled: Boolean = get(OUT_OF_CORE_SORT_DETAILED_METRICS)
 
   lazy val isFileScanPrunePartitionEnabled: Boolean = get(FILE_SCAN_PRUNE_PARTITION_ENABLED)
 

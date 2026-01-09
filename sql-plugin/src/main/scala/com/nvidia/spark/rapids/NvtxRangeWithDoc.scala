@@ -371,6 +371,9 @@ object NvtxRegistry {
   val SORT_NEXT_OUTPUT_BATCH: NvtxId = NvtxId("Sort next output batch", NvtxColor.CYAN,
     "Fetching next sorted output batch")
 
+  val SORT_CONCAT_OUTPUT: NvtxId = NvtxId("Sort concat output", NvtxColor.CYAN,
+    "Concatenating sorted batches for final output")
+
   // Join operations
   val HASH_JOIN_GATHER_MAP: NvtxId = NvtxId("hash join gather map", NvtxColor.ORANGE,
     "Gathering hash join results using gather map")
@@ -773,6 +776,7 @@ object NvtxRegistry {
     register(GATHER_SORT)
     register(SPLIT_INPUT_BATCH)
     register(SORT_NEXT_OUTPUT_BATCH)
+    register(SORT_CONCAT_OUTPUT)
     register(HASH_JOIN_GATHER_MAP)
     register(FULL_HASH_JOIN_GATHER_MAP)
     register(UPDATE_TRACKING_MASK)
