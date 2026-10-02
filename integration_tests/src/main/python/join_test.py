@@ -23,7 +23,8 @@ from conftest import is_dataproc_runtime, is_dataproc_serverless_runtime, is_emr
 from data_gen import *
 from marks import (allow_non_gpu, disable_ansi_mode, ignore_order, incompat,
                    validate_execs_in_gpu_plan)
-from spark_session import with_cpu_session, is_databricks_runtime, is_spark_400_or_later, is_spark_411_or_later
+from spark_session import (with_cpu_session, is_databricks_runtime, is_spark_340_or_later,
+                           is_spark_400_or_later, is_spark_411_or_later, is_spark_420_or_later)
 from src.main.python.spark_session import with_gpu_session
 
 # mark this test as ci_1 for mvn verify sanity check in pre-merge CI
@@ -202,6 +203,62 @@ def test_broadcast_hash_join_constant_keys(join_type):
     assert_gpu_and_cpu_row_counts_equal(do_join, conf={
         'spark.sql.adaptive.enabled': 'true',
     })
+
+
+@ignore_order(local=True)
+@allow_non_gpu('RDDScanExec')
+@pytest.mark.skipif(is_databricks_runtime() or not is_spark_340_or_later() or is_spark_420_or_later(),
+                   reason="Native shuffle broadcast uses the OSS Spark 3.4 through 4.1 shim")
+@pytest.mark.parametrize('build_side', ['left', 'right'])
+@pytest.mark.parametrize('with_residual', [True, False])
+def test_native_broadcast_extracted_condition_projection(build_side, with_residual):
+    """Q19-shaped residuals must be materialized on the broadcast build side.
+
+    Mixed payload types expose stale key ordinals; duplicate/null keys and a cross-side OR
+    also check that gathering and residual evaluation preserve the CPU result multiset.
+    """
+    def do_join(spark):
+        left = spark.createDataFrame([
+            (1, 5.0), (1, 11.0), (2, 15.0), (3, 25.0), (4, 5.0),
+            (5, 5.0), (6, 35.0), (None, 5.0), (7, 5.0), (8, 5.0), (1, None)
+        ], 'lk long, quantity double')
+        right = spark.createDataFrame([
+            (1, 'A', 3, 'SM BOX'), (1, 'A', 3, 'SM BOX'), (2, 'B', 7, 'MED BAG'),
+            (3, 'C', 12, 'LG BOX'), (4, 'A', 3, 'LG BOX'), (5, 'B', 7, 'MED BAG'),
+            (6, 'C', 12, 'LG BOX'), (None, 'A', 3, 'SM BOX'),
+            (7, None, 3, 'SM BOX'), (8, 'A', 3, None)
+        ], 'rk long, brand string, size int, container string')
+        condition = left.lk == right.rk
+        if with_residual:
+            condition = condition & (
+                ((right.brand == 'A') & right.container.isin('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+                 & left.quantity.between(1.0, 11.0) & right['size'].between(1, 5)) |
+                ((right.brand == 'B') & right.container.isin('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
+                 & left.quantity.between(10.0, 20.0) & right['size'].between(1, 10)) |
+                ((right.brand == 'C') & right.container.isin('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
+                 & left.quantity.between(20.0, 30.0) & right['size'].between(1, 15)))
+        if build_side == 'left':
+            left = broadcast(left)
+        else:
+            right = broadcast(right)
+        return left.join(right, condition)
+
+    def check_plan(plan):
+        text = plan.toString()
+        assert 'GpuBuild' + build_side.title() in text
+        if with_residual:
+            assert '_agpu_non_ast_' in text
+
+    assert_cpu_and_gpu_are_equal_collect_with_capture(do_join,
+        exist_classes='GpuShuffleBroadcastHashJoinExec', require_non_empty=True,
+        gpu_plan_assertion=check_plan, conf={
+            'spark.sql.adaptive.enabled': 'false',
+            'spark.sql.cbo.enabled': 'true',
+            'spark.rapids.shuffle.broadcast.enabled': 'true',
+            'spark.rapids.shuffle.broadcast.trustSparkPlan.enabled': 'true',
+            'spark.rapids.sql.join.strategy': 'INNER_HASH_WITH_POST',
+            'spark.rapids.sql.join.buildSide': 'FIXED',
+        })
 
 
 # local sort because of https://github.com/NVIDIA/spark-rapids/issues/84

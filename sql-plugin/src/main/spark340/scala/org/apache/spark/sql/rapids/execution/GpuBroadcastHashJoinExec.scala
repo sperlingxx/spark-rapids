@@ -89,13 +89,21 @@ class GpuBroadcastHashJoinMeta(
         GpuBroadcastHashJoinMeta.rewriteBuildToShuffle(left, right, buildSide)
       val extractedCondition = GpuHashJoin.extractJoinConditionIfNeeded(
         conditionMeta, join.joinType, newLeft, newRight)
+      val (projectedLeft, projectedRight) = buildSide match {
+        case GpuBuildLeft =>
+          (GpuBroadcastHashJoinMeta.projectBeforeShuffle(extractedCondition.left),
+            extractedCondition.right)
+        case GpuBuildRight =>
+          (extractedCondition.left,
+            GpuBroadcastHashJoinMeta.projectBeforeShuffle(extractedCondition.right))
+      }
       val joinExec = GpuShuffleBroadcastHashJoinExec(
         leftKeys.map(_.convertToGpu()),
         rightKeys.map(_.convertToGpu()),
         join.joinType,
         buildSide,
         extractedCondition.joinCondition,
-        extractedCondition.left, extractedCondition.right,
+        projectedLeft, projectedRight,
         join.isNullAwareAntiJoin)
       val filteredJoinExec = extractedCondition.filterCondition
         .map(c => GpuFilterExec(c, joinExec)()).getOrElse(joinExec)
@@ -119,6 +127,15 @@ class GpuBroadcastHashJoinMeta(
 }
 
 object GpuBroadcastHashJoinMeta extends Logging {
+
+  /** The native broadcast consumer reads the exchange directly. Materialize extracted
+   *  condition expressions before that exchange so its batches match the join's bound ordinals.
+   *  This is called immediately after condition extraction, before transition wrappers exist. */
+  private[execution] def projectBeforeShuffle(plan: SparkPlan): SparkPlan = plan match {
+    case project @ GpuProjectExec(_, exchange: GpuShuffleExchangeExec, _) =>
+      exchange.withNewChildren(Seq(project.withNewChildren(Seq(exchange.child))))
+    case _ => plan
+  }
 
   /** Emit a one-line diagnostic describing whether we will rewrite this BHJ
    *  through the native shuffle-broadcast path. */
